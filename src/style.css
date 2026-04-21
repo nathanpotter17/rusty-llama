@@ -182,7 +182,7 @@ body {
   padding: 10px 16px;
   border-bottom: 1px solid var(--border);
   background-color: var(--bg-surface);
-  min-height: 48px;
+  min-height: 60px;
   flex-shrink: 0;
 }
 
@@ -260,6 +260,8 @@ body {
 .desc-input,
 .code-input {
   width: 100%;
+  font-size: 14px;
+  font-family: var(--font-mono);
   resize: none;
   background-color: var(--bg);
   color: var(--text);
@@ -270,8 +272,6 @@ body {
 }
 
 .desc-input {
-  font-family: var(--font-body);
-  font-size: 14px;
   line-height: 1.6;
   flex: none;
   border-bottom: 1px solid var(--border-subtle);
@@ -291,8 +291,6 @@ body {
 
 .code-input {
   flex: 1;
-  font-family: var(--font-mono);
-  font-size: 13px;
   line-height: 1.7;
   tab-size: 4;
 }
@@ -308,9 +306,10 @@ body {
 
 .placeholder-msg {
   color: var(--text-muted);
-  font-family: var(--font-body);
+  font-family: var(--font-mono);
   font-weight: 300;
   font-size: 14px;
+  font-style: italic;
   display: flex;
   align-items: center;
   justify-content: center;
