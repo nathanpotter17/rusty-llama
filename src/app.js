@@ -370,10 +370,12 @@
   $('#load-btn').onclick = async () => {
     const model = $('#model-select').value;
     if (!model) return;
-    const draftModel = $('#draft-select').value; // empty string = disabled
+    const draftModel = $('#draft-select').value;
     updateBadge({ status: 'starting' });
     const draftLabel = draftModel ? ` + draft ${draftModel.replace('.gguf', '')}` : '';
-    $('#llama-status').textContent = `Loading model${draftLabel}... (may take 1-2 minutes)`;
+    $('#llama-status').textContent = `Loading model${draftLabel}...`;
+    $('#load-btn').disabled = true;
+
     try {
       const d = await fetch('/api/load', {
         method: 'POST',
@@ -391,20 +393,60 @@
           gpu_layers_draft: +$('#p-draft-ngl').value,
         }),
       }).then((r) => r.json());
-      updateBadge(d.llama || { status: d.error ? 'error' : 'stopped' });
-      updateLlamaStatus(d.llama);
-      if (d.error) $('#llama-status').textContent = d.error;
-      // Sync ctx and model name from what was just loaded
+
+      if (d.error) {
+        updateBadge({ status: 'error' });
+        $('#llama-status').textContent = d.error;
+        $('#load-btn').disabled = false;
+        return;
+      }
+
+      // Sync immediately
       modelCtx = +$('#p-ctx').value || 4096;
       const sel = $('#model-select');
       modelName = sel.options[sel.selectedIndex]?.textContent || model.split('.')[0];
       updateDraftInfo(draftModel, +$('#p-draft-max').value);
       updateBudget();
+
+      // Poll /api/status until ready or error
+      pollUntilReady();
     } catch (e) {
       updateBadge({ status: 'error' });
       $('#llama-status').textContent = String(e);
+      $('#load-btn').disabled = false;
     }
   };
+
+  function pollUntilReady() {
+    let elapsed = 0;
+    const iv = setInterval(async () => {
+      elapsed++;
+      try {
+        const d = await fetch('/api/status').then((r) => r.json());
+        const status = d.llama?.status;
+        updateBadge(d.llama);
+        updateLlamaStatus(d.llama);
+
+        if (status === 'ready') {
+          clearInterval(iv);
+          $('#load-btn').disabled = false;
+          if (d.ctx) { modelCtx = d.ctx; updateBudget(); }
+        } else if (status === 'error' || status === 'stopped') {
+          clearInterval(iv);
+          $('#load-btn').disabled = false;
+        } else {
+          $('#llama-status').textContent += `\nWaiting... (${elapsed}s)`;
+        }
+      } catch (_) {}
+
+      // Safety cap: stop polling after 3 minutes
+      if (elapsed >= 180) {
+        clearInterval(iv);
+        $('#load-btn').disabled = false;
+        $('#llama-status').textContent += '\nPoll timeout — check server logs';
+      }
+    }, 1000);
+  }
 
   $('#stop-btn').onclick = async () => {
     await fetch('/api/stop', { method: 'POST' });

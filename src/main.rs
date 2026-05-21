@@ -234,7 +234,7 @@ fn estimate_tokens(s: &str) -> u64 {
 
 // ── Llama server management ─────────────────────────────────
 
-#[derive(Clone, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum LlamaStatus { Stopped, Starting, Ready, Error(String) }
 
@@ -747,7 +747,6 @@ fn handle_load(st: &Shared, body: &str) -> serde_json::Value {
     };
 
     apply_model_params(&mut cfg, &model);
-    // Override with request-specific params
     if let Some(v) = req.ngl { cfg.ngl = v; }
     if let Some(v) = req.ctx { cfg.ctx = v.max(2048); }
     if let Some(v) = req.flash_attn { cfg.flash_attn = v; }
@@ -755,28 +754,89 @@ fn handle_load(st: &Shared, body: &str) -> serde_json::Value {
     if let Some(v) = req.top_k { cfg.top_k = v; }
     if let Some(v) = req.top_p { cfg.top_p = v; }
     if let Some(v) = req.repeat_penalty { cfg.repeat_penalty = v; }
-    // Draft model — empty string disables speculative decoding
     if let Some(v) = req.draft_model { cfg.draft_model = v; }
     if let Some(v) = req.draft_max { cfg.draft_max = v; }
     if let Some(v) = req.gpu_layers_draft { cfg.gpu_layers_draft = v; }
 
-    // Stop current, start new (hold lock briefly)
+    // Stop current model
     st.lock().unwrap().llama.stop();
 
+    // Start new process
     let mut llama = LlamaServer::new();
     if let Err(e) = llama.start(&cfg, &model) {
         st.lock().unwrap().cfg.active_model.clear();
         return serde_json::json!({"error": e});
     }
 
-    let ok = llama.wait_ready(cfg.llama_port, cfg.startup_timeout);
+    // Store the starting state and config immediately (brief lock)
     let status = llama.status_json();
     {
         let mut s = st.lock().unwrap();
         s.llama = llama;
-        s.cfg = cfg;
+        s.cfg = cfg.clone();
     }
-    serde_json::json!({"ok": ok, "llama": status})
+
+    // Background thread: poll health endpoint without holding the mutex
+    let bg_st = Arc::clone(st);
+    let llama_port = cfg.llama_port;
+    let timeout = cfg.startup_timeout;
+    std::thread::spawn(move || {
+        let url = format!("http://127.0.0.1:{llama_port}/health");
+        let deadline = Instant::now() + Duration::from_secs(timeout);
+        std::thread::sleep(Duration::from_millis(500));
+
+        loop {
+            if Instant::now() >= deadline {
+                let mut s = bg_st.lock().unwrap();
+                s.llama.status = LlamaStatus::Error(format!("timeout ({timeout}s)"));
+                eprintln!("[load] timeout after {timeout}s");
+                return;
+            }
+
+            // Check if process died (brief lock)
+            {
+                let mut s = bg_st.lock().unwrap();
+                if let Some(ref mut c) = s.llama.child {
+                    match c.try_wait() {
+                        Ok(Some(st_code)) => {
+                            s.llama.status = LlamaStatus::Error(format!("exited: {st_code}"));
+                            s.llama.child = None;
+                            eprintln!("[load] process exited: {st_code}");
+                            return;
+                        }
+                        Err(e) => {
+                            s.llama.status = LlamaStatus::Error(format!("wait: {e}"));
+                            eprintln!("[load] wait error: {e}");
+                            return;
+                        }
+                        Ok(None) => {} // still running
+                    }
+                } else {
+                    s.llama.status = LlamaStatus::Error("process gone".into());
+                    return;
+                }
+            }
+
+            // Probe health (no lock held)
+            if let Ok(out) = Command::new(curl_cmd())
+                .args(["-s", "--max-time", "2", &url])
+                .output()
+            {
+                let body = String::from_utf8_lossy(&out.stdout);
+                if out.status.success() && (body.contains("ok") || body.contains("\"status\"")) {
+                    let mut s = bg_st.lock().unwrap();
+                    s.llama.status = LlamaStatus::Ready;
+                    eprintln!("[load] ready");
+                    return;
+                }
+            }
+
+            std::thread::sleep(Duration::from_millis(800));
+        }
+    });
+
+    // Return immediately — frontend polls /api/status for readiness
+    serde_json::json!({"ok": true, "loading": true, "llama": status})
 }
 
 fn handle_stop(st: &Shared) -> serde_json::Value {
