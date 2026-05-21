@@ -289,7 +289,24 @@ fn pretty_name(f: &str) -> String {
 // ── Token estimation ────────────────────────────────────────
 
 fn estimate_tokens(s: &str) -> u64 {
-    (s.len() as f64 / 3.2).ceil() as u64
+    estimate_tokens_lang(s, "")
+}
+
+/// Per-language token estimation — code-heavy languages pack more tokens
+/// per character due to operators, short identifiers, and punctuation.
+fn estimate_tokens_lang(s: &str, lang: &str) -> u64 {
+    let ratio = match lang {
+        "rust" | "c" | "c++" | "cpp" | "java" | "csharp" => 2.6,
+        "go" | "swift" | "kotlin" | "zig" => 2.8,
+        "javascript" | "typescript" => 2.9,
+        "python" | "ruby" | "lua" => 3.4,
+        "html" | "xml" | "css" | "scss" => 3.0,
+        "sql" | "graphql" => 3.0,
+        "bash" | "sh" => 3.0,
+        "markdown" | "md" | "text" => 3.8,
+        _ => 3.2,
+    };
+    (s.len() as f64 / ratio).ceil() as u64
 }
 
 // ── RAG: Text chunking ─────────────────────────────────────
@@ -312,46 +329,71 @@ fn chunk_code_file(name: &str, content: &str, chunk_size: usize, overlap: usize)
 
 // ── RAG: Embedding via dedicated embed server ───────────────
 
+/// Parse "http://host:port/path" into components.
+fn parse_endpoint(endpoint: &str) -> Result<(&str, u16, String), String> {
+    let without_scheme = endpoint.strip_prefix("http://")
+        .ok_or_else(|| format!("bad endpoint: {endpoint}"))?;
+    let (host_port, path) = match without_scheme.find('/') {
+        Some(i) => (&without_scheme[..i], &without_scheme[i..]),
+        None => (without_scheme, "/"),
+    };
+    let (host, port_str) = host_port.split_once(':')
+        .ok_or_else(|| format!("no port in endpoint: {endpoint}"))?;
+    let port: u16 = port_str.parse()
+        .map_err(|_| format!("bad port: {port_str}"))?;
+    Ok((host, port, path.to_string()))
+}
+
 fn get_embedding(endpoint: &str, text: &str) -> Result<Vec<f32>, String> {
+    let (host, port, path) = parse_endpoint(endpoint)?;
     let req_body = serde_json::json!({
         "input": text,
         "model": "local"
     });
-    let tmp = format!("/tmp/cw_emb_{}.json", std::process::id());
-    fs::write(&tmp, req_body.to_string()).map_err(|e| format!("write tmp: {e}"))?;
-
-    let output = Command::new(curl_cmd())
-        .args([
-            "-s", "-X", "POST", endpoint,
-            "-H", "content-type: application/json",
-            "--max-time", "60",
-            "-d", &format!("@{tmp}"),
-        ])
-        .output()
-        .map_err(|e| { let _ = fs::remove_file(&tmp); format!("curl: {e}") })?;
-
-    let _ = fs::remove_file(&tmp);
-
-    if !output.status.success() {
-        return Err(format!("curl exit: {}", output.status));
-    }
-
-    let body = String::from_utf8_lossy(&output.stdout);
-    let resp: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| format!("parse: {e} — body: {}", &body[..body.len().min(200)]))?;
-
-    // OpenAI-compatible: { "data": [{ "embedding": [...] }] }
-    if let Some(arr) = resp["data"][0]["embedding"].as_array() {
-        return Ok(arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect());
-    }
-    // Legacy: { "embedding": [...] }
-    if let Some(arr) = resp["embedding"].as_array() {
-        return Ok(arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect());
-    }
-    Err(format!("no embedding in response: {}", &body[..body.len().min(300)]))
+    let body_str = req_body.to_string();
+    let resp_body = http_post_json(host, port, &path, &body_str, 60)?;
+    let resp: serde_json::Value = serde_json::from_str(&resp_body)
+        .map_err(|e| format!("parse: {e} — body: {}", &resp_body[..resp_body.len().min(200)]))?;
+    parse_single_embedding(&resp)
 }
 
+/// Send all texts in a single batched request: { "input": [...], "model": "local" }.
+/// Falls back to sequential if the server doesn't support batch input.
 fn get_embeddings_batch(endpoint: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+    if texts.is_empty() { return Ok(Vec::new()); }
+    if texts.len() == 1 {
+        return get_embedding(endpoint, &texts[0]).map(|v| vec![v]);
+    }
+
+    let (host, port, path) = parse_endpoint(endpoint)?;
+
+    // Try batched request first
+    let req_body = serde_json::json!({
+        "input": texts,
+        "model": "local"
+    });
+    let body_str = req_body.to_string();
+    let resp_body = http_post_json(host, port, &path, &body_str, 120)?;
+    let resp: serde_json::Value = serde_json::from_str(&resp_body)
+        .map_err(|e| format!("parse: {e} — body: {}", &resp_body[..resp_body.len().min(200)]))?;
+
+    // OpenAI-compatible batch: { "data": [{ "embedding": [...] }, ...] }
+    if let Some(data) = resp["data"].as_array() {
+        if data.len() == texts.len() {
+            let mut results = Vec::with_capacity(data.len());
+            for (i, item) in data.iter().enumerate() {
+                if let Some(arr) = item["embedding"].as_array() {
+                    results.push(arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect());
+                } else {
+                    return Err(format!("missing embedding at index {i}"));
+                }
+            }
+            return Ok(results);
+        }
+    }
+
+    // Batch not supported — fall back to sequential (still using direct HTTP, not curl)
+    eprintln!("[embed] batch response didn't match, falling back to sequential");
     let mut results = Vec::with_capacity(texts.len());
     for (i, text) in texts.iter().enumerate() {
         match get_embedding(endpoint, text) {
@@ -360,6 +402,19 @@ fn get_embeddings_batch(endpoint: &str, texts: &[String]) -> Result<Vec<Vec<f32>
         }
     }
     Ok(results)
+}
+
+fn parse_single_embedding(resp: &serde_json::Value) -> Result<Vec<f32>, String> {
+    // OpenAI-compatible: { "data": [{ "embedding": [...] }] }
+    if let Some(arr) = resp["data"][0]["embedding"].as_array() {
+        return Ok(arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect());
+    }
+    // Legacy: { "embedding": [...] }
+    if let Some(arr) = resp["embedding"].as_array() {
+        return Ok(arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect());
+    }
+    let s = resp.to_string();
+    Err(format!("no embedding in response: {}", &s[..s.len().min(300)]))
 }
 
 // ── RAG: In-memory vector store ─────────────────────────────
@@ -396,17 +451,10 @@ impl RagStore {
         store
     }
 
-    /// Index files: chunk → embed → store in Vec. Replaces any existing index.
-    fn index_files(
-        &mut self,
-        files: &[FileEntry],
-        embedding_endpoint: &str,
-    ) -> Result<usize, String> {
-        if files.is_empty() { return Ok(0); }
-
+    /// Prepare chunks from files (no network, safe to call under lock).
+    fn prepare_chunks(&self, files: &[FileEntry]) -> (Vec<String>, Vec<String>) {
         let mut all_chunks: Vec<String> = Vec::new();
         let mut all_sources: Vec<String> = Vec::new();
-
         for f in files {
             let chunks = chunk_code_file(
                 &f.name, &f.content,
@@ -417,69 +465,81 @@ impl RagStore {
                 all_chunks.push(text);
             }
         }
+        (all_chunks, all_sources)
+    }
 
-        if all_chunks.is_empty() { return Ok(0); }
-
-        eprintln!("[rag] embedding {} chunks from {} files...", all_chunks.len(), files.len());
-        let t0 = Instant::now();
-
-        let vectors = get_embeddings_batch(embedding_endpoint, &all_chunks)?;
-        if vectors.is_empty() { return Err("no embeddings returned".into()); }
-
+    /// Store pre-computed embeddings. Call this under lock after embedding completes.
+    fn store_embeddings(
+        &mut self,
+        chunks: Vec<String>,
+        sources: Vec<String>,
+        vectors: Vec<Vec<f32>>,
+        file_names: Vec<String>,
+    ) -> Result<usize, String> {
+        if vectors.is_empty() { return Err("no embeddings".into()); }
         let dim = vectors[0].len();
         if dim == 0 { return Err("embedding dimension is 0".into()); }
 
-        eprintln!("[rag] {} embeddings (dim={}) in {:.1}s",
-            vectors.len(), dim, t0.elapsed().as_secs_f64());
-
-        // Build the index
         self.chunks.clear();
-        for i in 0..all_chunks.len() {
-            self.chunks.push(VecChunk {
-                text: all_chunks[i].clone(),
-                source: all_sources[i].clone(),
-                vector: vectors[i].clone(),
-            });
+        self.chunks.reserve(chunks.len());
+        let iter = chunks.into_iter()
+            .zip(sources.into_iter())
+            .zip(vectors.into_iter());
+        for ((text, source), vector) in iter {
+            self.chunks.push(VecChunk { text, source, vector });
         }
-        self.indexed_files = files.iter().map(|f| f.name.clone()).collect();
+        self.indexed_files = file_names;
 
-        // Persist to disk
         if let Err(e) = self.save() {
             eprintln!("[rag] save warning: {e}");
         }
-
-        eprintln!("[rag] indexed {} chunks (persisted to {})", self.chunks.len(), self.cfg.db_path);
+        eprintln!("[rag] indexed {} chunks (dim={}, persisted to {})", self.chunks.len(), dim, self.cfg.db_path);
         Ok(self.chunks.len())
     }
 
-    /// Brute-force cosine similarity search. Returns Vec<(source, text, similarity)>.
-    fn search(
+    /// Search with pre-filtering: skip chunks whose source file doesn't match
+    /// any word in the query, unless that would eliminate all candidates.
+    fn search_local(
         &self,
-        query: &str,
-        embedding_endpoint: &str,
+        query_vec: &[f32],
         limit: usize,
-    ) -> Result<Vec<(String, String, f32)>, String> {
-        if self.chunks.is_empty() { return Ok(Vec::new()); }
+        query_hint: &str,
+    ) -> Vec<(String, String, f32)> {
+        if self.chunks.is_empty() { return Vec::new(); }
 
-        let query_vec = get_embedding(embedding_endpoint, query)?;
-
-        // Score every chunk
-        let mut scored: Vec<(usize, f32)> = self.chunks.iter().enumerate()
-            .map(|(i, c)| (i, cosine_similarity(&query_vec, &c.vector)))
+        // Pre-filter: extract keywords from query, match against source filenames
+        let hint_words: Vec<String> = query_hint.to_lowercase()
+            .split_whitespace()
+            .filter(|w| w.len() > 2)
+            .map(|s| s.to_string())
             .collect();
 
-        // Sort descending by similarity
+        let candidates: Vec<usize> = if hint_words.is_empty() {
+            (0..self.chunks.len()).collect()
+        } else {
+            let filtered: Vec<usize> = self.chunks.iter().enumerate()
+                .filter(|(_, c)| {
+                    let src = c.source.to_lowercase();
+                    hint_words.iter().any(|w| src.contains(w.as_str()) || c.text.contains(w.as_str()))
+                })
+                .map(|(i, _)| i)
+                .collect();
+            // Fall back to all if pre-filter is too aggressive
+            if filtered.len() < limit { (0..self.chunks.len()).collect() } else { filtered }
+        };
+
+        let mut scored: Vec<(usize, f32)> = candidates.iter()
+            .map(|&i| (i, cosine_similarity(query_vec, &self.chunks[i].vector)))
+            .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        let hits: Vec<(String, String, f32)> = scored.iter()
+        scored.iter()
             .take(limit)
             .map(|(i, sim)| {
                 let c = &self.chunks[*i];
                 (c.source.clone(), c.text.clone(), *sim)
             })
-            .collect();
-
-        Ok(hits)
+            .collect()
     }
 
     fn clear(&mut self) -> Result<(), String> {
@@ -490,25 +550,61 @@ impl RagStore {
         Ok(())
     }
 
-    /// Persist index to a JSON file.
+    /// Persist index in compact binary format:
+    ///   [u32 chunk_count] [u32 vector_dim]
+    ///   for each chunk:
+    ///     [u32 source_len] [source_bytes]
+    ///     [u32 text_len] [text_bytes]
+    ///     [f32 * dim]
     fn save(&self) -> Result<(), String> {
         if let Some(parent) = Path::new(&self.cfg.db_path).parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let json = serde_json::to_string(&self.chunks)
-            .map_err(|e| format!("serialize: {e}"))?;
-        fs::write(&self.cfg.db_path, json)
+        let dim = self.chunks.first().map(|c| c.vector.len()).unwrap_or(0) as u32;
+        let count = self.chunks.len() as u32;
+
+        // Estimate capacity: header + per-chunk overhead
+        let mut buf = Vec::with_capacity(8 + self.chunks.len() * (8 + 200 + dim as usize * 4));
+        buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend_from_slice(&dim.to_le_bytes());
+
+        for c in &self.chunks {
+            let src = c.source.as_bytes();
+            let txt = c.text.as_bytes();
+            buf.extend_from_slice(&(src.len() as u32).to_le_bytes());
+            buf.extend_from_slice(src);
+            buf.extend_from_slice(&(txt.len() as u32).to_le_bytes());
+            buf.extend_from_slice(txt);
+            for &v in &c.vector {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+
+        fs::write(&self.cfg.db_path, &buf)
             .map_err(|e| format!("write {}: {e}", self.cfg.db_path))
     }
 
-    /// Load persisted index from disk.
+    /// Load persisted index from disk (binary or legacy JSON fallback).
     fn load(&mut self) -> Result<(), String> {
         let path = Path::new(&self.cfg.db_path);
         if !path.exists() { return Ok(()); }
-        let data = fs::read_to_string(path)
+        let data = fs::read(path)
             .map_err(|e| format!("read {}: {e}", self.cfg.db_path))?;
-        self.chunks = serde_json::from_str(&data)
-            .map_err(|e| format!("parse: {e}"))?;
+
+        if data.is_empty() { return Ok(()); }
+
+        // Detect format: binary starts with u32 count, JSON starts with '['
+        if data[0] == b'[' {
+            // Legacy JSON format — migrate on next save
+            let text = String::from_utf8_lossy(&data);
+            self.chunks = serde_json::from_str(&text)
+                .map_err(|e| format!("parse json: {e}"))?;
+            eprintln!("[rag] loaded {} chunks from JSON (will migrate to binary on next save)", self.chunks.len());
+        } else {
+            // Binary format
+            self.load_binary(&data)?;
+        }
+
         // Reconstruct indexed_files from chunk sources
         let mut files: Vec<String> = self.chunks.iter()
             .map(|c| c.source.split(':').next().unwrap_or("").to_string())
@@ -517,6 +613,44 @@ impl RagStore {
         files.dedup();
         self.indexed_files = files;
         eprintln!("[rag] loaded {} chunks from {}", self.chunks.len(), self.cfg.db_path);
+        Ok(())
+    }
+
+    fn load_binary(&mut self, data: &[u8]) -> Result<(), String> {
+        if data.len() < 8 { return Err("binary index too short".into()); }
+        let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let dim = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+        let mut pos = 8;
+        self.chunks.clear();
+        self.chunks.reserve(count);
+
+        for i in 0..count {
+            if pos + 4 > data.len() { return Err(format!("truncated at chunk {i} (source len)")); }
+            let src_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+            pos += 4;
+            if pos + src_len > data.len() { return Err(format!("truncated at chunk {i} (source)")); }
+            let source = String::from_utf8_lossy(&data[pos..pos+src_len]).to_string();
+            pos += src_len;
+
+            if pos + 4 > data.len() { return Err(format!("truncated at chunk {i} (text len)")); }
+            let txt_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+            pos += 4;
+            if pos + txt_len > data.len() { return Err(format!("truncated at chunk {i} (text)")); }
+            let text = String::from_utf8_lossy(&data[pos..pos+txt_len]).to_string();
+            pos += txt_len;
+
+            let vec_bytes = dim * 4;
+            if pos + vec_bytes > data.len() { return Err(format!("truncated at chunk {i} (vector)")); }
+            let vector: Vec<f32> = (0..dim)
+                .map(|j| {
+                    let o = pos + j * 4;
+                    f32::from_le_bytes(data[o..o+4].try_into().unwrap())
+                })
+                .collect();
+            pos += vec_bytes;
+
+            self.chunks.push(VecChunk { text, source, vector });
+        }
         Ok(())
     }
 
@@ -581,7 +715,6 @@ impl EmbedServer {
     }
 
     fn wait_ready(&mut self, timeout_secs: u64) -> bool {
-        let url = format!("http://127.0.0.1:{}/health", self.port);
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
         std::thread::sleep(Duration::from_millis(400));
 
@@ -604,16 +737,10 @@ impl EmbedServer {
                 return false;
             }
 
-            if let Ok(out) = Command::new(curl_cmd())
-                .args(["-s", "--max-time", "2", &url])
-                .output()
-            {
-                let body = String::from_utf8_lossy(&out.stdout);
-                if out.status.success() && (body.contains("ok") || body.contains("\"status\"")) {
-                    eprintln!("[embed] ready (pid {:?})", self.pid);
-                    self.status = LlamaStatus::Ready;
-                    return true;
-                }
+            if check_health(self.port) {
+                eprintln!("[embed] ready (pid {:?})", self.pid);
+                self.status = LlamaStatus::Ready;
+                return true;
             }
             std::thread::sleep(Duration::from_millis(600));
         }
@@ -732,7 +859,6 @@ impl LlamaServer {
     }
 
     fn wait_ready(&mut self, port: u16, timeout_secs: u64) -> bool {
-        let url = format!("http://127.0.0.1:{port}/health");
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
         std::thread::sleep(Duration::from_millis(500));
 
@@ -755,16 +881,10 @@ impl LlamaServer {
                 return false;
             }
 
-            if let Ok(out) = Command::new(curl_cmd())
-                .args(["-s", "--max-time", "2", &url])
-                .output()
-            {
-                let body = String::from_utf8_lossy(&out.stdout);
-                if out.status.success() && (body.contains("ok") || body.contains("\"status\"")) {
-                    eprintln!("[llama] ready (pid {:?})", self.pid);
-                    self.status = LlamaStatus::Ready;
-                    return true;
-                }
+            if check_health(port) {
+                eprintln!("[llama] ready (pid {:?})", self.pid);
+                self.status = LlamaStatus::Ready;
+                return true;
             }
             std::thread::sleep(Duration::from_millis(800));
         }
@@ -809,6 +929,93 @@ impl Drop for LlamaServer {
 
 fn curl_cmd() -> &'static str {
     if cfg!(windows) { "curl.exe" } else { "curl" }
+}
+
+// ── Direct HTTP client (replaces curl for non-streaming) ────
+
+/// Simple HTTP GET via raw TcpStream. Returns response body or error.
+fn http_get(host: &str, port: u16, path: &str, timeout_secs: u64) -> Result<String, String> {
+    let addr = format!("{host}:{port}");
+    let mut stream = TcpStream::connect(&addr)
+        .map_err(|e| format!("connect {addr}: {e}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(timeout_secs))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).map_err(|e| format!("write: {e}"))?;
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).map_err(|e| format!("read: {e}"))?;
+    let raw = String::from_utf8_lossy(&buf);
+    extract_http_body(&raw)
+}
+
+/// Simple HTTP POST with JSON body via raw TcpStream. Returns response body.
+fn http_post_json(host: &str, port: u16, path: &str, body: &str, timeout_secs: u64) -> Result<String, String> {
+    let addr = format!("{host}:{port}");
+    let mut stream = TcpStream::connect(&addr)
+        .map_err(|e| format!("connect {addr}: {e}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(timeout_secs))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
+
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).map_err(|e| format!("write: {e}"))?;
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).map_err(|e| format!("read: {e}"))?;
+    let raw = String::from_utf8_lossy(&buf);
+    extract_http_body(&raw)
+}
+
+/// Extract body from raw HTTP response, handling both Content-Length and chunked TE.
+fn extract_http_body(raw: &str) -> Result<String, String> {
+    let Some(split) = raw.find("\r\n\r\n") else {
+        return Err("malformed HTTP response (no header boundary)".into());
+    };
+    let headers = &raw[..split].to_lowercase();
+    let body = &raw[split + 4..];
+
+    if headers.contains("transfer-encoding: chunked") {
+        // Decode chunked transfer encoding
+        let mut decoded = String::new();
+        let mut pos = 0;
+        let bytes = body.as_bytes();
+        loop {
+            // Skip whitespace / newlines between chunks
+            while pos < bytes.len() && (bytes[pos] == b'\r' || bytes[pos] == b'\n') {
+                pos += 1;
+            }
+            if pos >= bytes.len() { break; }
+            // Read chunk size (hex)
+            let size_end = body[pos..].find("\r\n").unwrap_or(body.len() - pos);
+            let size_str = &body[pos..pos + size_end];
+            let chunk_size = usize::from_str_radix(size_str.trim(), 16).unwrap_or(0);
+            if chunk_size == 0 { break; }
+            pos += size_end + 2; // skip size line + \r\n
+            if pos + chunk_size <= body.len() {
+                decoded.push_str(&body[pos..pos + chunk_size]);
+            }
+            pos += chunk_size;
+        }
+        Ok(decoded)
+    } else {
+        Ok(body.to_string())
+    }
+}
+
+/// Health-check a local server: returns true if /health responds with "ok" or "status".
+fn check_health(port: u16) -> bool {
+    match http_get("127.0.0.1", port, "/health", 3) {
+        Ok(body) => body.contains("ok") || body.contains("\"status\""),
+        Err(_) => false,
+    }
 }
 
 fn find_llama_binary(models_dir: &str) -> String {
@@ -1222,7 +1429,6 @@ fn handle_load(st: &Shared, body: &str) -> serde_json::Value {
     let llama_port = cfg.llama_port;
     let timeout = cfg.startup_timeout;
     std::thread::spawn(move || {
-        let url = format!("http://127.0.0.1:{llama_port}/health");
         let deadline = Instant::now() + Duration::from_secs(timeout);
         std::thread::sleep(Duration::from_millis(500));
 
@@ -1249,16 +1455,11 @@ fn handle_load(st: &Shared, body: &str) -> serde_json::Value {
                     return;
                 }
             }
-            if let Ok(out) = Command::new(curl_cmd())
-                .args(["-s", "--max-time", "2", &url]).output()
-            {
-                let body = String::from_utf8_lossy(&out.stdout);
-                if out.status.success() && (body.contains("ok") || body.contains("\"status\"")) {
-                    let mut s = bg_st.lock().unwrap();
-                    s.llama.status = LlamaStatus::Ready;
-                    eprintln!("[load] ready");
-                    return;
-                }
+            if check_health(llama_port) {
+                let mut s = bg_st.lock().unwrap();
+                s.llama.status = LlamaStatus::Ready;
+                eprintln!("[load] ready");
+                return;
             }
             std::thread::sleep(Duration::from_millis(800));
         }
@@ -1323,7 +1524,6 @@ fn handle_embed_start(st: &Shared) -> serde_json::Value {
     let bg_st = Arc::clone(st);
     let embed_port = embed_cfg.port;
     std::thread::spawn(move || {
-        let url = format!("http://127.0.0.1:{embed_port}/health");
         let deadline = Instant::now() + Duration::from_secs(timeout);
         std::thread::sleep(Duration::from_millis(400));
 
@@ -1350,16 +1550,11 @@ fn handle_embed_start(st: &Shared) -> serde_json::Value {
                     return;
                 }
             }
-            if let Ok(out) = Command::new(curl_cmd())
-                .args(["-s", "--max-time", "2", &url]).output()
-            {
-                let body_str = String::from_utf8_lossy(&out.stdout);
-                if out.status.success() && (body_str.contains("ok") || body_str.contains("\"status\"")) {
-                    let mut s = bg_st.lock().unwrap();
-                    s.embed.status = LlamaStatus::Ready;
-                    eprintln!("[embed] ready via API start");
-                    return;
-                }
+            if check_health(embed_port) {
+                let mut s = bg_st.lock().unwrap();
+                s.embed.status = LlamaStatus::Ready;
+                eprintln!("[embed] ready via API start");
+                return;
             }
             std::thread::sleep(Duration::from_millis(600));
         }
@@ -1393,17 +1588,38 @@ fn handle_rag_index(st: &Shared, body: &str) -> serde_json::Value {
         return serde_json::json!({"error": "no files to index"});
     }
 
-    let (embed_ready, endpoint) = {
+    // Phase 1: lock briefly to check state and prepare chunks
+    let (embed_ready, endpoint, all_chunks, all_sources) = {
         let s = st.lock().unwrap();
-        (s.embed.is_ready(), s.cfg.embedding_endpoint())
+        let ready = s.embed.is_ready();
+        let ep = s.cfg.embedding_endpoint();
+        let (chunks, sources) = s.rag.prepare_chunks(&req.files);
+        (ready, ep, chunks, sources)
     };
+    // Lock released here — other API calls can proceed
 
     if !embed_ready {
         return serde_json::json!({"error": "embed server not ready — start it from settings"});
     }
+    if all_chunks.is_empty() {
+        return serde_json::json!({"error": "no chunks produced from files"});
+    }
 
+    // Phase 2: embedding call (network I/O, no lock held)
+    eprintln!("[rag] embedding {} chunks from {} files...", all_chunks.len(), req.files.len());
+    let t0 = Instant::now();
+
+    let vectors = match get_embeddings_batch(&endpoint, &all_chunks) {
+        Ok(v) => v,
+        Err(e) => return serde_json::json!({"error": e}),
+    };
+
+    eprintln!("[rag] {} embeddings in {:.1}s", vectors.len(), t0.elapsed().as_secs_f64());
+
+    // Phase 3: lock briefly to store results
+    let file_names: Vec<String> = req.files.iter().map(|f| f.name.clone()).collect();
     let mut s = st.lock().unwrap();
-    match s.rag.index_files(&req.files, &endpoint) {
+    match s.rag.store_embeddings(all_chunks, all_sources, vectors, file_names) {
         Ok(count) => serde_json::json!({
             "ok": true,
             "chunks_indexed": count,
@@ -1419,22 +1635,30 @@ fn handle_rag_search(st: &Shared, body: &str) -> serde_json::Value {
         Err(e) => return serde_json::json!({"error": e.to_string()}),
     };
 
-    let (endpoint, search_limit) = {
+    // Phase 1: lock briefly to get config
+    let (endpoint, search_limit, has_chunks) = {
         let s = st.lock().unwrap();
-        (s.cfg.embedding_endpoint(), s.rag.cfg.search_results)
+        (s.cfg.embedding_endpoint(), s.rag.cfg.search_results, !s.rag.chunks.is_empty())
     };
 
-    let limit = req.limit.unwrap_or(search_limit);
-    let s = st.lock().unwrap();
-    match s.rag.search(&req.query, &endpoint, limit) {
-        Ok(hits) => {
-            let results: Vec<serde_json::Value> = hits.iter().map(|(src, text, dist)| {
-                serde_json::json!({"source": src, "text": text, "distance": dist})
-            }).collect();
-            serde_json::json!({"ok": true, "results": results})
-        }
-        Err(e) => serde_json::json!({"error": e}),
+    if !has_chunks {
+        return serde_json::json!({"ok": true, "results": []});
     }
+
+    // Phase 2: embed query (no lock)
+    let limit = req.limit.unwrap_or(search_limit);
+    let query_vec = match get_embedding(&endpoint, &req.query) {
+        Ok(v) => v,
+        Err(e) => return serde_json::json!({"error": e}),
+    };
+
+    // Phase 3: lock briefly for similarity search (CPU only, fast)
+    let s = st.lock().unwrap();
+    let hits = s.rag.search_local(&query_vec, limit, &req.query);
+    let results: Vec<serde_json::Value> = hits.iter().map(|(src, text, dist)| {
+        serde_json::json!({"source": src, "text": text, "distance": dist})
+    }).collect();
+    serde_json::json!({"ok": true, "results": results})
 }
 
 fn handle_rag_clear(st: &Shared) -> serde_json::Value {
@@ -1506,7 +1730,7 @@ fn assemble_context(
         let f = &files[*idx];
         let lang_tag = if f.language.is_empty() { "text" } else { &f.language };
         let block = format!("\n--- {} ---\n```{}\n{}\n```\n", f.name, lang_tag, f.content);
-        let cost = estimate_tokens(&block);
+        let cost = estimate_tokens_lang(&block, lang_tag);
 
         if files_used + cost <= file_budget {
             result.context_block.push_str(&block);
@@ -1515,13 +1739,21 @@ fn assemble_context(
         } else if files_used < file_budget {
             let remaining = file_budget - files_used;
             if remaining > 15 {
-                let max_chars = ((remaining - 15) as f64 * 3.2) as usize;
+                // Use per-language ratio for truncation char budget
+                let ratio = match lang_tag {
+                    "rust" | "c" | "c++" | "java" | "csharp" => 2.6,
+                    "go" | "swift" | "kotlin" | "zig" => 2.8,
+                    "javascript" | "typescript" => 2.9,
+                    "python" | "ruby" | "lua" => 3.4,
+                    _ => 3.2,
+                };
+                let max_chars = ((remaining - 15) as f64 * ratio) as usize;
                 let truncated = if max_chars < f.content.len() {
                     let slice = &f.content[..max_chars.min(f.content.len())];
                     slice.rfind('\n').map(|nl| &f.content[..nl + 1]).unwrap_or(slice)
                 } else { &f.content };
                 let block = format!("\n--- {} (truncated) ---\n```{}\n{}\n```\n", f.name, lang_tag, truncated);
-                files_used += estimate_tokens(&block);
+                files_used += estimate_tokens_lang(&block, lang_tag);
                 result.context_block.push_str(&block);
                 result.files_truncated.push(f.name.clone());
             } else {
@@ -1578,32 +1810,43 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
 
     let is_review = req.mode == "review";
 
-    // ── RAG retrieval ──
+    // ── RAG retrieval (lock-free embedding) ──
     let mut rag_context = String::new();
     let mut rag_chunks_used = 0usize;
     if req.use_rag {
-        let s = st.lock().unwrap();
-        if !s.rag.chunks.is_empty() && s.rag.cfg.enabled && s.embed.is_ready() {
-            let endpoint = cfg.embedding_endpoint();
-            let limit = s.rag.cfg.search_results;
-            match s.rag.search(&req.description, &endpoint, limit) {
-                Ok(hits) if !hits.is_empty() => {
-                    rag_context.push_str("\n--- retrieved context (RAG) ---\n");
-                    for (source, text, dist) in &hits {
-                        rag_context.push_str(&format!("# {} (distance: {:.4})\n{}\n\n", source, dist, text));
-                    }
-                    rag_chunks_used = hits.len();
-                    eprintln!("[rag] retrieved {} chunks for query", hits.len());
-                    send_sse(stream, &serde_json::json!({
-                        "rag_info": {
-                            "chunks_retrieved": hits.len(),
-                            "sources": hits.iter().map(|(s, _, d)| {
-                                serde_json::json!({"source": s, "distance": d})
-                            }).collect::<Vec<_>>(),
+        // Phase 1: lock briefly to check state
+        let (should_search, endpoint, search_limit) = {
+            let s = st.lock().unwrap();
+            let ok = !s.rag.chunks.is_empty() && s.rag.cfg.enabled && s.embed.is_ready();
+            (ok, cfg.embedding_endpoint(), s.rag.cfg.search_results)
+        };
+
+        if should_search {
+            // Phase 2: embed query (no lock)
+            match get_embedding(&endpoint, &req.description) {
+                Ok(query_vec) => {
+                    // Phase 3: lock briefly for similarity (CPU only)
+                    let s = st.lock().unwrap();
+                    let hits = s.rag.search_local(&query_vec, search_limit, &req.description);
+                    drop(s); // release immediately
+
+                    if !hits.is_empty() {
+                        rag_context.push_str("\n--- retrieved context (RAG) ---\n");
+                        for (source, text, dist) in &hits {
+                            rag_context.push_str(&format!("# {} (distance: {:.4})\n{}\n\n", source, dist, text));
                         }
-                    }));
+                        rag_chunks_used = hits.len();
+                        eprintln!("[rag] retrieved {} chunks for query", hits.len());
+                        send_sse(stream, &serde_json::json!({
+                            "rag_info": {
+                                "chunks_retrieved": hits.len(),
+                                "sources": hits.iter().map(|(s, _, d)| {
+                                    serde_json::json!({"source": s, "distance": d})
+                                }).collect::<Vec<_>>(),
+                            }
+                        }));
+                    }
                 }
-                Ok(_) => {}
                 Err(e) => {
                     eprintln!("[rag] search error: {e}");
                     send_sse(stream, &serde_json::json!({"rag_info": {"error": e}}));
@@ -1676,7 +1919,7 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
         }
     };
 
-    let actual_input = estimate_tokens(&system) + estimate_tokens(&user);
+    let actual_input = estimate_tokens(&system) + estimate_tokens_lang(&user, &req.language);
     let max_tokens = (cfg.ctx as u64).saturating_sub(actual_input);
 
     if max_tokens < MIN_OUTPUT_TOKENS {
