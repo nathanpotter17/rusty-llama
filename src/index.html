@@ -11,6 +11,7 @@
   <header id="toolbar">
     <span class="logo"><span class="logo-dot"></span>CodeWriter</span>
     <div class="toolbar-right">
+      <span id="rag-badge" class="badge badge-idle" title="RAG index status">RAG off</span>
       <span id="model-badge" class="badge badge-idle">No model</span>
       <button id="settings-btn" class="icon-btn" title="Settings">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -43,6 +44,10 @@
           <button class="mode-btn active" data-mode="write">Write</button>
           <button class="mode-btn" data-mode="review">Review</button>
         </div>
+        <label class="rag-toggle" id="rag-toggle" title="Use RAG: retrieve relevant code chunks from the index before generating">
+          <input type="checkbox" id="rag-checkbox">
+          <span class="rag-toggle-label">RAG</span>
+        </label>
         <button id="write-btn" class="primary-btn">Write &rarr;</button>
       </div>
       <textarea id="write-desc" class="desc-input" placeholder="Describe what you need..." rows="4" spellcheck="false"></textarea>
@@ -50,6 +55,10 @@
       <!-- File upload zone -->
       <div id="file-zone" class="file-zone">
         <div id="drop-area" class="drop-area">
+          <div class="drop-dest-toggle">
+            <button class="dest-btn active" data-dest="context">Context</button>
+            <button class="dest-btn" data-dest="rag">RAG Index</button>
+          </div>
           <svg class="drop-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
             <polyline points="17 8 12 3 7 8"></polyline>
@@ -60,7 +69,7 @@
           <input type="file" id="file-input" multiple accept=".ts,.tsx,.js,.jsx,.rs,.c,.cpp,.h,.hpp,.py,.go,.java,.html,.css,.sql,.sh,.bash,.toml,.yaml,.yml,.json,.md,.txt,.rb,.swift,.kt,.cs,.lua,.zig,.asm,.s,.vue,.svelte,.astro,.graphql,.gql,.proto,.cmake,.mk,.makefile,.dockerfile,.xml,.ini,.cfg,.conf,.env,.gitignore,.hbs,.ejs,.pug,.scss,.sass,.less,.styl,.wasm,.wat">
         </div>
 
-        <!-- Budget bar -->
+        <!-- Budget bar (context files only) -->
         <div id="budget-bar" class="budget-bar hidden">
           <div class="budget-row">
             <div class="budget-track">
@@ -71,8 +80,31 @@
           <div id="budget-detail" class="budget-detail"></div>
         </div>
 
-        <!-- File list -->
-        <div id="file-list" class="file-list"></div>
+        <!-- Context file list -->
+        <div id="context-file-section" class="file-section hidden">
+          <div class="file-section-header">
+            <span class="file-section-label">Context</span>
+            <span class="file-section-hint">sent with prompt</span>
+          </div>
+          <div id="context-file-list" class="file-list"></div>
+        </div>
+
+        <!-- RAG file list -->
+        <div id="rag-file-section" class="file-section hidden">
+          <div class="file-section-header">
+            <span class="file-section-label rag-label">RAG</span>
+            <span class="file-section-hint">indexed for semantic search</span>
+            <button id="rag-index-btn" class="small-btn rag-index-btn" title="Index files into vector store">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="8"></circle>
+                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+              </svg>
+              Index
+            </button>
+            <span id="rag-index-status" class="rag-index-status"></span>
+          </div>
+          <div id="rag-file-list" class="file-list"></div>
+        </div>
       </div>
 
       <textarea id="write-ctx" class="code-input" placeholder="Paste additional code context here (optional)..." spellcheck="false"></textarea>
@@ -126,6 +158,21 @@
             <label>Draft GPU Layers<input id="p-draft-ngl" type="number" value="99" min="0" max="99"></label>
           </div>
           <div id="draft-info" class="status-line" style="margin-top:10px"></div>
+        </section>
+        <section>
+          <h4>Embed Server</h4>
+          <div id="embed-status" class="status-line"></div>
+          <div class="model-actions" style="margin-top:10px">
+            <button id="embed-start-btn" class="primary-btn">Start</button>
+            <button id="embed-stop-btn" class="danger-btn">Stop</button>
+          </div>
+        </section>
+        <section>
+          <h4>RAG Index</h4>
+          <div id="rag-settings-status" class="status-line"></div>
+          <div class="model-actions" style="margin-top:10px">
+            <button id="rag-clear-btn" class="danger-btn">Clear Index</button>
+          </div>
         </section>
         <section>
           <h4>Parameters</h4>

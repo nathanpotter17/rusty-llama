@@ -24,34 +24,47 @@ top_k = 40
 top_p = 0.9
 repeat_penalty = 1.1
 
-# KV cache quantization — shrinks VRAM usage for the context window.
-# Valid values: "f16" (default), "q8_0", "q4_0", "q4_1"
-# KV cache precision is INDEPENDENT of model weight quantization.
-# The cache stores FP16 attention outputs regardless of weight quant.
-# f16 = lossless (best quality), q8_0 = safe (~halves cache VRAM),
-# q4_0/q4_1 = measurable degradation at long contexts, avoid for code.
-# Leave empty for f16. Use q8_0 only if you need VRAM headroom.
+# KV cache quantization
 cache_type_k = "q8_0"
 cache_type_v = "q8_0"
 
-# Speculative decoding — a small draft model proposes tokens that the
-# main model verifies in a single pass. Highly effective for code where
-# token sequences are predictable (boilerplate, closing braces, etc).
-# draft_model must be a .gguf filename inside models_dir.
-# draft_max = how many tokens the draft model proposes per step (2-16).
-# gpu_layers_draft = GPU layers for the draft model (-1 = full offload).
-# qwen2.5-0.5b-instruct-q8_0.gguf
+# Speculative decoding
 draft_model = ""
 draft_max = 10
 gpu_layers_draft = 99
 
-# ── Models ──────────────────────────────────────────────────
-# Each [[models]] maps a .gguf filename to tuned params.
-# Unknown .gguf files in models_dir still load with [defaults].
+# ── Embed Server ────────────────────────────────────────────
+# A second llama-server process dedicated to embeddings.
+# Runs on a separate port so the main model can generate while
+# the embed model produces vectors. Both PIDs are managed by
+# the main binary — start/stop from the settings panel or
+# automatically on boot.
+
+[embed]
+enabled = true
+model = "embeddinggemma-300m-Q8_0.gguf"
+port = 8078
+gpu_layers = 99           # full offload — only ~329 MB
+context_size = 2048       # plenty for code chunks
+parallel_slots = 1
+startup_timeout = 30      # loads fast at 300M params
+
+# ── RAG (Retrieval-Augmented Generation) ────────────────────
+# Indexes uploaded files into a local LanceDB vector store using
+# the embed server. Semantic search retrieves relevant code chunks
+# and injects them into the prompt before generation.
 #
-# Context sizes are increased to support uploading full code files.
-# KV cache VRAM at q8_0 ≈ 2 × layers × heads × head_dim × ctx × 1B.
-# Increase gpu_layers alongside ctx if your GPU has the VRAM headroom.
+# chunk_size = lines per chunk for code files
+# chunk_overlap = overlapping lines between consecutive chunks
+# search_results = number of chunks to retrieve per query
+[rag]
+enabled = true
+db_path = "data/rag_index.json"
+chunk_size = 60
+chunk_overlap = 10
+search_results = 3
+
+# ── Models ──────────────────────────────────────────────────
 
 [[models]]
 filename = "qwen2.5-0.5b-instruct-q8_0.gguf"

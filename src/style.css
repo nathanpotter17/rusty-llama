@@ -21,6 +21,9 @@
   --blue:          #7aa2f7;
   --blue-dim:      #3d5a9e;
   --orange:        #c09070;
+  --rag:           #7aa2f7;
+  --rag-dim:       #3d5a9e;
+  --rag-bg:        #161b2e;
   --font-body:     'Outfit', system-ui, sans-serif;
   --font-mono:     'IBM Plex Mono', 'Consolas', monospace;
   --radius:        10px;
@@ -893,6 +896,185 @@ pre.code-block {
 ::selection {
   background-color: rgba(255, 255, 255, 0.12);
   color: var(--text-bright);
+}
+
+/* ── Drop Destination Toggle ───────────────────────── */
+
+.drop-dest-toggle {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  margin-bottom: 6px;
+}
+
+.dest-btn {
+  background-color: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.5px;
+  padding: 4px 14px;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.dest-btn:not(:last-child) {
+  border-right: 1px solid var(--border);
+}
+
+.dest-btn:hover {
+  color: var(--text-dim);
+  background-color: var(--bg-input);
+}
+
+.dest-btn.active {
+  background-color: var(--bg-raised);
+  color: var(--text-bright);
+}
+
+.dest-btn[data-dest="rag"].active {
+  color: var(--rag);
+  background-color: var(--rag-bg);
+}
+
+/* ── File Sections ─────────────────────────────────── */
+
+.file-section {
+  border-top: 1px solid var(--border-subtle);
+}
+
+.file-section-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 16px;
+  background-color: var(--bg);
+}
+
+.file-section-label {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.file-section-label.rag-label {
+  color: var(--rag-dim);
+}
+
+.file-section-hint {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-muted);
+  opacity: 0.5;
+  letter-spacing: 0.2px;
+  flex: 1;
+}
+
+/* ── RAG Toggle ─────────────────────────────────────── */
+
+.rag-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.rag-toggle input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background-color: var(--bg-input);
+  cursor: pointer;
+  position: relative;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.rag-toggle input[type="checkbox"]:checked {
+  background-color: var(--rag-dim);
+  border-color: var(--rag);
+}
+
+.rag-toggle input[type="checkbox"]:checked::after {
+  content: '✓';
+  position: absolute;
+  top: -1px;
+  left: 2px;
+  font-size: 10px;
+  color: var(--text-bright);
+}
+
+.rag-toggle-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  transition: color 0.15s ease;
+}
+
+.rag-toggle input[type="checkbox"]:checked ~ .rag-toggle-label {
+  color: var(--rag);
+}
+
+/* ── RAG Controls ──────────────────────────────────── */
+
+.rag-index-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px !important;
+  padding: 3px 10px !important;
+  color: var(--rag) !important;
+  border-color: var(--rag-dim) !important;
+  margin-left: auto;
+}
+
+.rag-index-btn:hover {
+  background-color: var(--rag-bg) !important;
+  color: var(--text-bright) !important;
+}
+
+.rag-index-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.rag-index-status {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  letter-spacing: 0.3px;
+}
+
+.rag-index-status.rag-indexing {
+  color: var(--yellow);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.rag-index-status.rag-success {
+  color: var(--rag);
+}
+
+.rag-index-status.rag-error {
+  color: var(--red);
+}
+
+/* ── RAG Context Info ──────────────────────────────── */
+
+.context-info .ctx-rag {
+  color: var(--rag);
+  font-weight: 600;
 }
 
 /* ── Responsive ────────────────────────────────────── */

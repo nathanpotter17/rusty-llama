@@ -2,6 +2,8 @@
 
 Local code generation UI powered by [llama.cpp](https://github.com/ggerganov/llama.cpp).
 
+`ver. b9254 CUDA 13.1`
+
 ## What it does
 
 Describe what you need → streams code from a local GGUF model via llama-server. Supports multiple models, speculative decoding, KV cache quantization, and per-model tuning.
