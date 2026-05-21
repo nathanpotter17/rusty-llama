@@ -11,6 +11,8 @@ use std::{
 
 // ── Config ──────────────────────────────────────────────────
 
+const MAX_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MB cap
+
 #[derive(Deserialize)]
 #[serde(default)]
 struct FileConfig {
@@ -223,6 +225,13 @@ fn pretty_name(f: &str) -> String {
     f.trim_end_matches(".gguf").replace(['-', '_'], " ")
 }
 
+// ── Token estimation ────────────────────────────────────────
+// Approximate: ~3.2 chars per token for code (conservative)
+
+fn estimate_tokens(s: &str) -> u64 {
+    (s.len() as f64 / 3.2).ceil() as u64
+}
+
 // ── Llama server management ─────────────────────────────────
 
 #[derive(Clone, PartialEq, Serialize)]
@@ -421,14 +430,27 @@ type Shared = Arc<Mutex<State>>;
 // ── API types ───────────────────────────────────────────────
 
 #[derive(Deserialize)]
+struct FileEntry {
+    name: String,
+    content: String,
+    #[serde(default)]
+    language: String,
+}
+
+#[derive(Deserialize)]
 struct WriteReq {
     description: String,
     #[serde(default = "def_lang")]
     language: String,
+    #[serde(default = "def_mode")]
+    mode: String,
     #[serde(default)]
     context: String,
+    #[serde(default)]
+    files: Vec<FileEntry>,
 }
 fn def_lang() -> String { "python".into() }
+fn def_mode() -> String { "write".into() }
 
 #[derive(Deserialize)]
 struct LoadReq {
@@ -447,6 +469,13 @@ struct LoadReq {
     top_p: Option<f32>,
     #[serde(default)]
     repeat_penalty: Option<f32>,
+    // Speculative decoding — empty string or absent = disable draft
+    #[serde(default)]
+    draft_model: Option<String>,
+    #[serde(default)]
+    draft_max: Option<u32>,
+    #[serde(default)]
+    gpu_layers_draft: Option<i32>,
 }
 
 #[derive(Deserialize)]
@@ -594,7 +623,8 @@ fn apply_model_params(cfg: &mut RuntimeCfg, m: &Model) {
 // ── HTTP server ─────────────────────────────────────────────
 
 fn serve(mut stream: TcpStream, st: &Shared) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    // Longer timeout for large file uploads
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
     let mut reader = BufReader::new(&stream);
 
     // Parse request line
@@ -612,6 +642,12 @@ fn serve(mut stream: TcpStream, st: &Shared) {
         if let Some(rest) = line.to_lowercase().strip_prefix("content-length:") {
             content_len = rest.trim().parse().unwrap_or(0);
         }
+    }
+
+    // Enforce body size limit
+    if content_len > MAX_BODY_BYTES {
+        respond(&mut stream, 413, "text/plain", "payload too large");
+        return;
     }
 
     // Read body
@@ -634,7 +670,11 @@ fn serve(mut stream: TcpStream, st: &Shared) {
 }
 
 fn respond(s: &mut TcpStream, code: u16, ct: &str, body: &str) {
-    let status = if code == 200 { "OK" } else { "Not Found" };
+    let status = match code {
+        200 => "OK",
+        413 => "Payload Too Large",
+        _ => "Not Found",
+    };
     let _ = write!(
         s, "HTTP/1.1 {code} {status}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\n\
             Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}",
@@ -651,17 +691,30 @@ fn respond_json(s: &mut TcpStream, val: &serde_json::Value) {
 
 fn handle_models(st: &Shared) -> serde_json::Value {
     let s = st.lock().unwrap();
+    // Build draft candidate list: all .gguf files in models_dir
+    let draft_candidates: Vec<String> = fs::read_dir(&s.cfg.models_dir)
+        .into_iter().flatten().flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.ends_with(".gguf") { Some(name) } else { None }
+        })
+        .collect();
+
     serde_json::json!({
         "models": s.models,
         "active": s.cfg.active_model,
+        "draft_candidates": draft_candidates,
+        "draft": {
+            "model": if s.cfg.draft_model.is_empty() { None } else { Some(&s.cfg.draft_model) },
+            "max": s.cfg.draft_max,
+            "ngl": s.cfg.gpu_layers_draft,
+        },
         "params": {
             "ngl": s.cfg.ngl, "ctx": s.cfg.ctx, "flash_attn": s.cfg.flash_attn,
             "temp": s.cfg.temp, "top_k": s.cfg.top_k, "top_p": s.cfg.top_p,
             "repeat_penalty": s.cfg.repeat_penalty,
             "cache_type_k": if s.cfg.cache_type_k.is_empty() { None } else { Some(&s.cfg.cache_type_k) },
             "cache_type_v": if s.cfg.cache_type_v.is_empty() { None } else { Some(&s.cfg.cache_type_v) },
-            "draft_model": if s.cfg.draft_model.is_empty() { None } else { Some(&s.cfg.draft_model) },
-            "draft_max": if s.cfg.draft_max > 0 { Some(s.cfg.draft_max) } else { None },
         },
         "llama": s.llama.status_json(),
     })
@@ -673,6 +726,7 @@ fn handle_status(st: &Shared) -> serde_json::Value {
         "tokens_session": s.tokens_session,
         "requests": s.requests,
         "model": s.cfg.active_model,
+        "ctx": s.cfg.ctx,
         "has_model": s.cfg.has_model(),
         "llama": s.llama.status_json(),
     })
@@ -701,6 +755,10 @@ fn handle_load(st: &Shared, body: &str) -> serde_json::Value {
     if let Some(v) = req.top_k { cfg.top_k = v; }
     if let Some(v) = req.top_p { cfg.top_p = v; }
     if let Some(v) = req.repeat_penalty { cfg.repeat_penalty = v; }
+    // Draft model — empty string disables speculative decoding
+    if let Some(v) = req.draft_model { cfg.draft_model = v; }
+    if let Some(v) = req.draft_max { cfg.draft_max = v; }
+    if let Some(v) = req.gpu_layers_draft { cfg.gpu_layers_draft = v; }
 
     // Stop current, start new (hold lock briefly)
     st.lock().unwrap().llama.stop();
@@ -745,6 +803,164 @@ fn handle_params(st: &Shared, body: &str) -> serde_json::Value {
     })
 }
 
+// ── Relevance scoring for file ordering ─────────────────────
+
+fn relevance_score(file: &FileEntry, description: &str, target_lang: &str) -> u32 {
+    let mut score = 0u32;
+    let file_lang = file.language.to_lowercase();
+    let target = target_lang.to_lowercase();
+
+    // Same language as target
+    if file_lang == target { score += 10; }
+
+    // Filename stem mentioned in description
+    let fname_lower = file.name.to_lowercase();
+    let stem = fname_lower.rsplit('/').next().unwrap_or(&fname_lower);
+    let stem = stem.rsplit('.').last().unwrap_or(stem);
+    let desc_lower = description.to_lowercase();
+    if stem.len() > 2 && desc_lower.contains(stem) {
+        score += 20;
+    }
+
+    // Content words from description found in file
+    for word in desc_lower.split_whitespace() {
+        if word.len() > 3 && file.content.contains(word) {
+            score += 2;
+        }
+    }
+
+    score
+}
+
+// ── Token-budget-aware context assembly ─────────────────────
+
+struct ContextResult {
+    context_block: String,
+    files_included: Vec<String>,
+    files_truncated: Vec<String>,
+    files_dropped: Vec<String>,
+    total_input_tokens: u64,
+    model_ctx: u64,
+}
+
+/// Minimum tokens to leave for the model to respond.
+const MIN_OUTPUT_TOKENS: u64 = 256;
+
+fn assemble_context(
+    files: &[FileEntry],
+    extra_ctx: &str,
+    description: &str,
+    target_lang: &str,
+    model_ctx: u32,
+    system_text: &str,
+) -> ContextResult {
+    let system_tok = estimate_tokens(system_text);
+    let desc_tok = estimate_tokens(description);
+    let fixed_input = system_tok + desc_tok;
+    // How many tokens files/context can use: everything except the fixed input and a minimum for output
+    let file_budget = (model_ctx as u64).saturating_sub(fixed_input + MIN_OUTPUT_TOKENS);
+
+    let mut result = ContextResult {
+        context_block: String::new(),
+        files_included: Vec::new(),
+        files_truncated: Vec::new(),
+        files_dropped: Vec::new(),
+        total_input_tokens: fixed_input,
+        model_ctx: model_ctx as u64,
+    };
+
+    // Sort files by relevance score (descending)
+    let mut scored: Vec<(usize, u32)> = files.iter().enumerate()
+        .map(|(i, f)| (i, relevance_score(f, description, target_lang)))
+        .collect();
+    scored.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut files_used: u64 = 0;
+
+    // Fill file_budget with files in relevance order
+    for (idx, _score) in &scored {
+        let f = &files[*idx];
+        let lang_tag = if f.language.is_empty() { "text" } else { &f.language };
+        let block = format!("\n--- {} ---\n```{}\n{}\n```\n", f.name, lang_tag, f.content);
+        let cost = estimate_tokens(&block);
+
+        if files_used + cost <= file_budget {
+            // Fits entirely
+            result.context_block.push_str(&block);
+            files_used += cost;
+            result.files_included.push(f.name.clone());
+        } else if files_used < file_budget {
+            // Partial fit — truncate content to fill remaining space
+            let remaining_tokens = file_budget - files_used;
+            let overhead: u64 = 15;
+            if remaining_tokens > overhead {
+                let content_tokens = remaining_tokens - overhead;
+                let max_chars = (content_tokens as f64 * 3.2) as usize;
+                let truncated = if max_chars < f.content.len() {
+                    let slice = &f.content[..max_chars.min(f.content.len())];
+                    if let Some(nl) = slice.rfind('\n') {
+                        &f.content[..nl + 1]
+                    } else {
+                        slice
+                    }
+                } else {
+                    &f.content
+                };
+                let block = format!(
+                    "\n--- {} (truncated) ---\n```{}\n{}\n```\n",
+                    f.name, lang_tag, truncated
+                );
+                let actual_cost = estimate_tokens(&block);
+                result.context_block.push_str(&block);
+                files_used += actual_cost;
+                result.files_truncated.push(f.name.clone());
+            } else {
+                result.files_dropped.push(f.name.clone());
+            }
+        } else {
+            result.files_dropped.push(f.name.clone());
+        }
+    }
+
+    // Append extra text context if it fits
+    if !extra_ctx.is_empty() {
+        let block = format!("\n--- additional context ---\n```\n{}\n```\n", extra_ctx);
+        let cost = estimate_tokens(&block);
+        if files_used + cost <= file_budget {
+            result.context_block.push_str(&block);
+            files_used += cost;
+        } else if files_used < file_budget {
+            let remaining_tokens = file_budget - files_used;
+            let overhead: u64 = 15;
+            if remaining_tokens > overhead {
+                let content_tokens = remaining_tokens - overhead;
+                let max_chars = (content_tokens as f64 * 3.2) as usize;
+                let truncated = if max_chars < extra_ctx.len() {
+                    let slice = &extra_ctx[..max_chars.min(extra_ctx.len())];
+                    if let Some(nl) = slice.rfind('\n') {
+                        &extra_ctx[..nl + 1]
+                    } else {
+                        slice
+                    }
+                } else {
+                    extra_ctx
+                };
+                let block = format!(
+                    "\n--- additional context (truncated) ---\n```\n{}\n```\n",
+                    truncated
+                );
+                let actual_cost = estimate_tokens(&block);
+                result.context_block.push_str(&block);
+                files_used += actual_cost;
+            }
+        }
+    }
+
+    result.total_input_tokens = fixed_input + files_used;
+
+    result
+}
+
 // ── Streaming write ─────────────────────────────────────────
 
 fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
@@ -777,18 +993,89 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
     );
     let _ = stream.flush();
 
-    let ctx_block = if req.context.is_empty() {
-        String::new()
+    let is_review = req.mode == "review";
+
+    let system = if is_review {
+        format!(
+            "You are an expert {} code reviewer and software engineer.\n\
+             Analyze the provided code thoroughly. Discuss:\n\
+             - Correctness and potential bugs\n\
+             - Performance issues and optimization opportunities\n\
+             - Security concerns\n\
+             - Code style and readability\n\
+             - Concrete suggestions for improvement\n\n\
+             Be specific — reference functions, types, and line-level details.\n\
+             Use markdown code fences (```) when showing code snippets.\n\
+             Focus on actionable feedback, not generic advice.",
+            req.language
+        )
     } else {
-        format!("\n\nExisting code context:\n```\n{}\n```", req.context)
+        format!(
+            "You are an expert {} programmer. Write clean, efficient, well-documented code.\n\
+             Output ONLY the code with clear comments. No markdown fences, no prose outside code.",
+            req.language
+        )
     };
 
-    let system = format!(
-        "You are an expert {} programmer. Write clean, efficient, well-documented code.\n\
-         Output ONLY the code with clear comments. No markdown fences, no prose outside code.",
-        req.language
+    // Assemble context — packs as much input as possible, leaving MIN_OUTPUT_TOKENS for response
+    let ctx_result = assemble_context(
+        &req.files,
+        &req.context,
+        &req.description,
+        &req.language,
+        cfg.ctx,
+        &system,
     );
-    let user = format!("Write {} code for: {}{ctx_block}", req.language, req.description);
+
+    // Send context_info event so the frontend knows what fit
+    let remaining = ctx_result.model_ctx.saturating_sub(ctx_result.total_input_tokens);
+    if !req.files.is_empty() || !req.context.is_empty() {
+        send_sse(stream, &serde_json::json!({
+            "context_info": {
+                "model_ctx": ctx_result.model_ctx,
+                "input_tokens": ctx_result.total_input_tokens,
+                "remaining_tokens": remaining,
+                "files_included": ctx_result.files_included,
+                "files_truncated": ctx_result.files_truncated,
+                "files_dropped": ctx_result.files_dropped,
+            }
+        }));
+    }
+
+    let user = if is_review {
+        if ctx_result.context_block.is_empty() {
+            format!("{}", req.description)
+        } else {
+            format!(
+                "{}\n\nCode to review:{}\n",
+                req.description, ctx_result.context_block
+            )
+        }
+    } else {
+        if ctx_result.context_block.is_empty() {
+            format!("Write {} code for: {}", req.language, req.description)
+        } else {
+            format!(
+                "Write {} code for: {}\n\nExisting code context:{}\n",
+                req.language, req.description, ctx_result.context_block
+            )
+        }
+    };
+
+    // max_tokens = whatever context space is left after actual input
+    let actual_input = estimate_tokens(&system) + estimate_tokens(&user);
+    let max_tokens = (cfg.ctx as u64).saturating_sub(actual_input);
+
+    if max_tokens < MIN_OUTPUT_TOKENS {
+        send_sse(stream, &serde_json::json!({
+            "error": format!(
+                "Context full — input uses ~{} of {} tokens, only {} left for output. \
+                 Remove files or increase context size.",
+                actual_input, cfg.ctx, max_tokens
+            )
+        }));
+        return;
+    }
 
     let llama_req = serde_json::json!({
         "model": "local",
@@ -796,7 +1083,7 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        "max_tokens": 2048,
+        "max_tokens": max_tokens,
         "temperature": cfg.temp,
         "top_p": cfg.top_p,
         "repeat_penalty": cfg.repeat_penalty,
@@ -814,7 +1101,7 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
             "-s", "--no-buffer", "-X", "POST",
             &cfg.endpoint(),
             "-H", "content-type: application/json",
-            "--max-time", "180",
+            "--max-time", "300",
             "-d", &format!("@{tmp}"),
         ])
         .stdout(Stdio::piped())

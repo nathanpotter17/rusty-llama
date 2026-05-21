@@ -39,19 +39,53 @@
             <option value="bash">Bash</option>
           </select>
         </div>
+        <div class="mode-toggle">
+          <button class="mode-btn active" data-mode="write">Write</button>
+          <button class="mode-btn" data-mode="review">Review</button>
+        </div>
         <button id="write-btn" class="primary-btn">Write &rarr;</button>
       </div>
       <textarea id="write-desc" class="desc-input" placeholder="Describe what you need..." rows="4" spellcheck="false"></textarea>
-      <textarea id="write-ctx" class="code-input" placeholder="Paste existing code context here (optional)..." spellcheck="false"></textarea>
+
+      <!-- File upload zone -->
+      <div id="file-zone" class="file-zone">
+        <div id="drop-area" class="drop-area">
+          <svg class="drop-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="17 8 12 3 7 8"></polyline>
+            <line x1="12" y1="3" x2="12" y2="15"></line>
+          </svg>
+          <span class="drop-text">Drop files or <label class="file-label" for="file-input">browse</label></span>
+          <span class="drop-hint">.ts .js .rs .c .cpp .h .py .go .java .html .css .sql .sh .toml .json .md</span>
+          <input type="file" id="file-input" multiple accept=".ts,.tsx,.js,.jsx,.rs,.c,.cpp,.h,.hpp,.py,.go,.java,.html,.css,.sql,.sh,.bash,.toml,.yaml,.yml,.json,.md,.txt,.rb,.swift,.kt,.cs,.lua,.zig,.asm,.s,.vue,.svelte,.astro,.graphql,.gql,.proto,.cmake,.mk,.makefile,.dockerfile,.xml,.ini,.cfg,.conf,.env,.gitignore,.hbs,.ejs,.pug,.scss,.sass,.less,.styl,.wasm,.wat">
+        </div>
+
+        <!-- Budget bar -->
+        <div id="budget-bar" class="budget-bar hidden">
+          <div class="budget-row">
+            <div class="budget-track">
+              <div id="budget-fill" class="budget-fill"></div>
+            </div>
+            <span id="budget-label" class="budget-label"></span>
+          </div>
+          <div id="budget-detail" class="budget-detail"></div>
+        </div>
+
+        <!-- File list -->
+        <div id="file-list" class="file-list"></div>
+      </div>
+
+      <textarea id="write-ctx" class="code-input" placeholder="Paste additional code context here (optional)..." spellcheck="false"></textarea>
     </div>
     <div class="pane pane-output">
       <div class="pane-header">
         <span class="pane-title">Output</span>
+        <div id="context-info" class="context-info hidden"></div>
         <button id="copy-btn" class="small-btn hidden">Copy</button>
         <span id="stats" class="stats"></span>
       </div>
       <div id="output" class="output-area">
-        <div class="placeholder-msg">*Model output will appear here*</div>
+        <div class="placeholder-msg">Model output will appear here</div>
       </div>
     </div>
   </main>
@@ -79,6 +113,19 @@
             <button id="stop-btn" class="danger-btn">Stop</button>
           </div>
           <div id="llama-status" class="status-line" style="margin-top:12px"></div>
+        </section>
+        <section>
+          <h4>Speculative Decoding</h4>
+          <div class="select-wrap select-wrap-full">
+            <select id="draft-select">
+              <option value="">None (disabled)</option>
+            </select>
+          </div>
+          <div class="param-grid" style="margin-top:10px">
+            <label>Draft Max<input id="p-draft-max" type="number" value="10" min="2" max="32" step="1"></label>
+            <label>Draft GPU Layers<input id="p-draft-ngl" type="number" value="99" min="0" max="99"></label>
+          </div>
+          <div id="draft-info" class="status-line" style="margin-top:10px"></div>
         </section>
         <section>
           <h4>Parameters</h4>
