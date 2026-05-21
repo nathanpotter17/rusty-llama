@@ -1,12 +1,21 @@
-# Rusty Llama - Code Generation Tool
+# CodeWriter
 
-Local code generation UI powered by [llama.cpp](https://github.com/ggerganov/llama.cpp).
+Local code generation & review UI powered by [llama.cpp](https://github.com/ggerganov/llama.cpp), with built-in RAG.
 
+Supported Versions
+`ver. 6467`
 `ver. b9254 CUDA 13.1`
 
-## What it does
+## Features
 
-Describe what you need → streams code from a local GGUF model via llama-server. Supports multiple models, speculative decoding, KV cache quantization, and per-model tuning.
+- **Write / Review modes** — generate code or get structured reviews from a local GGUF model
+- **RAG** — upload files → chunk → embed → cosine similarity search → inject relevant context into prompts
+- **Dedicated embed server** — separate llama-server process for embeddings (e.g. `embeddinggemma-300m`), keeps main model's KV cache free for generation
+- **Context budgeting** — files ranked by relevance, packed into context window with automatic truncation/dropping; live token budget bar in UI
+- **Speculative decoding** — optional draft model for faster inference
+- **KV cache quantization** — `q8_0` / `q4_0` cache types via config
+- **Multi-model** — auto-discovers `.gguf` files, per-model params in `config.toml`
+- **SSE streaming** — token-by-token output
 
 ## Build & Run
 
@@ -14,33 +23,50 @@ Describe what you need → streams code from a local GGUF model via llama-server
 cargo build --release
 cp config.toml target/release/
 cd target/release
-# put .gguf models in ./models/
-# put llama-server binary in PATH or ./models/
-./code-review-server
+# place .gguf models in ./models/
+# place llama-server binary in PATH or ./models/
+cargo run --release
 ```
 
 Open `http://localhost:8090`.
 
 ## Config
 
-Edit `config.toml` to set models dir, GPU layers, context size, sampling params, draft model, etc. Unknown `.gguf` files in the models dir auto-load with defaults.
+`config.toml` controls server ports, model defaults, embed server, RAG, and per-model overrides. Key sections:
+
+| Section | Purpose |
+|---|---|
+| `[server]` | HTTP port (default 8090) |
+| `[llama]` | llama-server binary, port, slots, timeout |
+| `[defaults]` | GPU layers, context size, sampling params, KV cache types, draft model |
+| `[embed]` | Embed server model, port, GPU layers, context |
+| `[rag]` | Chunk size/overlap, search results count, DB path |
+| `[[models]]` | Per-model filename, family, params |
 
 ## Stack
 
-- **Backend:** Rust — raw TCP, no web framework. Embeds HTML/CSS/JS. Manages llama-server as a child process.
-- **Frontend:** Vanilla JS. SSE streaming. Settings overlay for model/param management.
-- **Inference:** llama-server (OpenAI-compatible `/v1/chat/completions`), proxied via curl.
+- **Backend:** Rust — raw TCP, no framework. Embeds HTML/CSS/JS via `include_str!`. Manages llama-server + embed-server as child processes. Proxies inference via curl.
+- **Frontend:** Vanilla JS. SSE streaming. Drag-and-drop file upload with context/RAG destination toggle.
+- **Inference:** llama-server OpenAI-compatible `/v1/chat/completions` (generation) + `/v1/embeddings` (RAG).
+- **Vector store:** In-memory JSON-persisted chunks with brute-force cosine similarity.
 
 ## API
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/api/models` | GET | List models + active params |
-| `/api/status` | GET | Usage stats + server state |
-| `/api/load` | POST | Load a model (restarts llama-server) |
+| `/api/models` | GET | List models, active params, draft/embed/RAG status |
+| `/api/status` | GET | Usage stats, server state |
+| `/api/load` | POST | Load model (restarts llama-server) |
 | `/api/stop` | POST | Kill llama-server |
 | `/api/params` | POST | Update sampling params live |
-| `/api/write` | POST | Stream code generation (SSE) |
+| `/api/write` | POST | Stream code generation or review (SSE) |
+| `/api/embed/status` | GET | Embed server status |
+| `/api/embed/start` | POST | Start embed server |
+| `/api/embed/stop` | POST | Stop embed server |
+| `/api/rag/status` | GET | RAG index status (chunks, files, dim) |
+| `/api/rag/index` | POST | Index files into vector store |
+| `/api/rag/search` | POST | Semantic search over indexed chunks |
+| `/api/rag/clear` | POST | Clear RAG index |
 
 ## License
 
