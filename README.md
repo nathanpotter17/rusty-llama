@@ -8,11 +8,13 @@ Supported Versions
 ## Features
 
 - **Write / Review modes** — generate code or get structured reviews from a local GGUF model
-- **RAG** — upload files → chunk → embed → cosine similarity search → inject relevant context into prompts
-- **Dedicated embed server** — separate llama-server process for embeddings (e.g. `embeddinggemma-300m`), keeps main model's KV cache free for generation
+- **RAG** — upload files → chunk → embed → HNSW index → semantic search → inject relevant context into prompts
+- **Dedicated embed server** — separate llama-server process for embeddings; configurable pooling strategy and query/doc prefixes per model
 - **Context budgeting** — files ranked by relevance, packed into context window with automatic truncation/dropping; live token budget bar in UI
 - **Speculative decoding** — optional draft model for faster inference
+- **Flash attention** — enabled by default, configurable per model
 - **KV cache quantization** — `q8_0` / `q4_0` cache types via config
+- **Token limits** — optional per-session and daily token caps
 - **Multi-model** — auto-discovers `.gguf` files, per-model params in `config.toml`
 - **SSE streaming** — token-by-token output
 
@@ -37,17 +39,18 @@ Open `http://localhost:8090`.
 |---|---|
 | `[server]` | HTTP port (default 8090) |
 | `[llama]` | llama-server binary, port, slots, timeout |
-| `[defaults]` | GPU layers, context size, sampling params, KV cache types, draft model |
-| `[embed]` | Embed server model, port, GPU layers, context |
-| `[rag]` | Chunk size/overlap, search results count, DB path |
+| `[limits]` | Session and daily token caps (0 = unlimited) |
+| `[defaults]` | GPU layers, context size, flash attention, sampling params, KV cache types, draft model |
+| `[embed]` | Embed server model, port, GPU layers, context, pooling, query/doc prefixes |
+| `[rag]` | Chunk size/overlap, search results count, HNSW params (`M`, `ef_construction`, `ef_search`), DB path |
 | `[[models]]` | Per-model filename, family, params |
 
 ## Stack
 
-- **Backend:** Rust — raw TCP, no framework. Embeds HTML/CSS/JS via `include_str!`. Manages llama-server + embed-server as child processes. Proxies inference via curl.
+- **Backend:** Rust (v0.2.0) — raw TCP, no framework. Embeds HTML/CSS/JS via `include_str!`. Manages llama-server + embed-server as child processes. Proxies inference via curl.
 - **Frontend:** Vanilla JS. SSE streaming. Drag-and-drop file upload with context/RAG destination toggle.
 - **Inference:** llama-server OpenAI-compatible `/v1/chat/completions` (generation) + `/v1/embeddings` (RAG).
-- **Vector store:** In-memory JSON-persisted chunks with brute-force cosine similarity.
+- **Vector store:** HNSW graph index over cosine distance. JSON-persisted chunks + serialized graph. Configurable `M`, `ef_construction`, `ef_search`.
 
 ## API
 
@@ -62,6 +65,7 @@ Open `http://localhost:8090`.
 | `/api/embed/status` | GET | Embed server status |
 | `/api/embed/start` | POST | Start embed server |
 | `/api/embed/stop` | POST | Stop embed server |
+| `/api/embed/prefixes` | POST | Update query/doc embedding prefixes at runtime |
 | `/api/rag/status` | GET | RAG index status (chunks, files, dim) |
 | `/api/rag/index` | POST | Index files into vector store |
 | `/api/rag/search` | POST | Semantic search over indexed chunks |
