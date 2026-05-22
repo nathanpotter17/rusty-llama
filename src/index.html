@@ -166,6 +166,19 @@
             <button id="embed-start-btn" class="primary-btn">Start</button>
             <button id="embed-stop-btn" class="danger-btn">Stop</button>
           </div>
+          <div class="prefix-fields" style="margin-top:14px">
+            <label class="prefix-label">
+              Query Prefix
+              <span class="prefix-hint">prepended to search queries before embedding</span>
+              <input id="embed-query-prefix" type="text" class="prefix-input" placeholder="e.g. Represent this query for searching relevant code: " spellcheck="false">
+            </label>
+            <label class="prefix-label">
+              Doc Prefix
+              <span class="prefix-hint">prepended to code chunks during indexing (usually empty)</span>
+              <input id="embed-doc-prefix" type="text" class="prefix-input" placeholder="(empty for most models)" spellcheck="false">
+            </label>
+            <button id="save-prefixes-btn" class="small-btn" style="margin-top:8px">Apply Prefixes</button>
+          </div>
         </section>
         <section>
           <h4>RAG Index</h4>

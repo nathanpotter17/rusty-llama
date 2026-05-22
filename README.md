@@ -3,7 +3,6 @@
 Local code generation & review UI powered by [llama.cpp](https://github.com/ggerganov/llama.cpp), with built-in RAG.
 
 Supported Versions
-`ver. 6467`
 `ver. b9254 CUDA 13.1`
 
 ## Features

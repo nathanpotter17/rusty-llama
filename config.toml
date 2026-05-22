@@ -14,7 +14,7 @@ session_tokens = 0       # 0 = unlimited
 daily_tokens = 0
 
 [defaults]
-model = ""               # auto-select first found
+model = "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
 models_dir = "models"
 gpu_layers = -1           # -1 = per-model default
 context_size = 0          # 0 = per-model default
@@ -39,30 +39,58 @@ gpu_layers_draft = 99
 # the embed model produces vectors. Both PIDs are managed by
 # the main binary — start/stop from the settings panel or
 # automatically on boot.
+#
+# pooling: "mean", "cls", "last", or "" (let server auto-detect).
+#   - embeddinggemma: "" (auto / mean)
+#   - nomic-embed-code: "last"
+#   - qwen3-embedding: "" (auto / mean)
+#
+# query_prefix / doc_prefix: text prepended before embedding.
+#   Different models require different prefixes for best retrieval.
+#   Leave both empty for models that don't use prefixes (e.g. embeddinggemma).
+#
+#   nomic-embed-code:
+#     query_prefix = "Represent this query for searching relevant code: "
+#     doc_prefix = ""
+#
+#   qwen3-embedding:
+#     query_prefix = "Instruct: Find code relevant to this description\nQuery: "
+#     doc_prefix = ""
 
 [embed]
 enabled = true
-model = "embeddinggemma-300m-Q8_0.gguf"
+model = "Qwen3-Embedding-0.6B-Q8_0.gguf"
 port = 8078
-gpu_layers = 99           # full offload — only ~329 MB
-context_size = 2048       # plenty for code chunks
+gpu_layers = 99           # full offload
+context_size = 4096       # supports up to 32k
 parallel_slots = 1
-startup_timeout = 30      # loads fast at 300M params
+startup_timeout = 30
+pooling = ""              # auto-detect from GGUF metadata
+query_prefix = "Instruct: Find code relevant to this description\nQuery: "
+doc_prefix = ""
 
 # ── RAG (Retrieval-Augmented Generation) ────────────────────
-# Indexes uploaded files into a local LanceDB vector store using
-# the embed server. Semantic search retrieves relevant code chunks
-# and injects them into the prompt before generation.
+# Indexes uploaded files into a local vector store using the embed
+# server. Semantic search retrieves relevant code chunks and injects
+# them into the prompt before generation.
 #
 # chunk_size = lines per chunk for code files
 # chunk_overlap = overlapping lines between consecutive chunks
 # search_results = number of chunks to retrieve per query
+#
+# HNSW graph parameters (approximate nearest neighbor search):
+# hnsw_m = max connections per node per layer (layer 0 gets 2×M)
+# hnsw_ef_construction = beam width during index build (higher = better graph, slower build)
+# hnsw_ef_search = beam width during query (higher = more accurate, slower search)
 [rag]
 enabled = true
 db_path = "data/rag_index.json"
 chunk_size = 60
 chunk_overlap = 10
 search_results = 3
+hnsw_m = 16
+hnsw_ef_construction = 150
+hnsw_ef_search = 50
 
 # ── Models ──────────────────────────────────────────────────
 

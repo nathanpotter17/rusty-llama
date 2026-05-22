@@ -408,8 +408,37 @@
       embedReady = d.status === 'ready';
       updateEmbedStatusLine(d);
       updateRagBadge();
+      // Populate prefix fields (only overwrite if user hasn't focused the input)
+      const qp = $('#embed-query-prefix');
+      const dp = $('#embed-doc-prefix');
+      if (document.activeElement !== qp && d.query_prefix != null) {
+        qp.value = d.query_prefix;
+      }
+      if (document.activeElement !== dp && d.doc_prefix != null) {
+        dp.value = d.doc_prefix;
+      }
     } catch (_) {}
   }
+
+  // Save embed prefixes
+  $('#save-prefixes-btn').onclick = async () => {
+    const btn = $('#save-prefixes-btn');
+    btn.textContent = 'Saving...';
+    try {
+      await fetch('/api/embed/prefixes', {
+        method: 'POST',
+        body: JSON.stringify({
+          query_prefix: $('#embed-query-prefix').value,
+          doc_prefix: $('#embed-doc-prefix').value,
+        }),
+      });
+      btn.textContent = 'Applied ✓';
+      setTimeout(() => (btn.textContent = 'Apply Prefixes'), 1500);
+    } catch (e) {
+      btn.textContent = 'Error';
+      setTimeout(() => (btn.textContent = 'Apply Prefixes'), 2000);
+    }
+  };
 
   async function refreshRagSettings() {
     try {

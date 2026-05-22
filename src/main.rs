@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{BinaryHeap, HashSet},
     env, fs,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
@@ -117,6 +118,9 @@ struct EmbedCfg {
     context_size: u32,
     parallel_slots: u32,
     startup_timeout: u64,
+    pooling: String,       // "mean", "cls", "last", or "" (server default)
+    query_prefix: String,  // prepended to search queries before embedding
+    doc_prefix: String,    // prepended to documents/chunks before embedding
 }
 impl Default for EmbedCfg {
     fn default() -> Self {
@@ -128,6 +132,9 @@ impl Default for EmbedCfg {
             context_size: 2048,
             parallel_slots: 2,
             startup_timeout: 60,
+            pooling: String::new(),
+            query_prefix: String::new(),
+            doc_prefix: String::new(),
         }
     }
 }
@@ -140,6 +147,10 @@ struct RagCfg {
     chunk_size: usize,
     chunk_overlap: usize,
     search_results: usize,
+    // HNSW graph parameters
+    hnsw_m: usize,               // max connections per node per layer (M0 = 2*M for layer 0)
+    hnsw_ef_construction: usize, // beam width during index build
+    hnsw_ef_search: usize,       // beam width during query (higher = more accurate, slower)
 }
 impl Default for RagCfg {
     fn default() -> Self {
@@ -148,7 +159,10 @@ impl Default for RagCfg {
             db_path: "data/rag_index.json".into(),
             chunk_size: 60,
             chunk_overlap: 10,
-            search_results: 3,
+            search_results: 5,
+            hnsw_m: 16,
+            hnsw_ef_construction: 150,
+            hnsw_ef_search: 50,
         }
     }
 }
@@ -344,10 +358,15 @@ fn parse_endpoint(endpoint: &str) -> Result<(&str, u16, String), String> {
     Ok((host, port, path.to_string()))
 }
 
-fn get_embedding(endpoint: &str, text: &str) -> Result<Vec<f32>, String> {
+fn get_embedding(endpoint: &str, text: &str, prefix: &str) -> Result<Vec<f32>, String> {
+    let input = if prefix.is_empty() {
+        text.to_string()
+    } else {
+        format!("{prefix}{text}")
+    };
     let (host, port, path) = parse_endpoint(endpoint)?;
     let req_body = serde_json::json!({
-        "input": text,
+        "input": input,
         "model": "local"
     });
     let body_str = req_body.to_string();
@@ -359,17 +378,23 @@ fn get_embedding(endpoint: &str, text: &str) -> Result<Vec<f32>, String> {
 
 /// Send all texts in a single batched request: { "input": [...], "model": "local" }.
 /// Falls back to sequential if the server doesn't support batch input.
-fn get_embeddings_batch(endpoint: &str, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+fn get_embeddings_batch(endpoint: &str, texts: &[String], prefix: &str) -> Result<Vec<Vec<f32>>, String> {
     if texts.is_empty() { return Ok(Vec::new()); }
     if texts.len() == 1 {
-        return get_embedding(endpoint, &texts[0]).map(|v| vec![v]);
+        return get_embedding(endpoint, &texts[0], prefix).map(|v| vec![v]);
     }
+
+    let prefixed: Vec<String> = if prefix.is_empty() {
+        texts.to_vec()
+    } else {
+        texts.iter().map(|t| format!("{prefix}{t}")).collect()
+    };
 
     let (host, port, path) = parse_endpoint(endpoint)?;
 
     // Try batched request first
     let req_body = serde_json::json!({
-        "input": texts,
+        "input": prefixed,
         "model": "local"
     });
     let body_str = req_body.to_string();
@@ -396,7 +421,7 @@ fn get_embeddings_batch(endpoint: &str, texts: &[String]) -> Result<Vec<Vec<f32>
     eprintln!("[embed] batch response didn't match, falling back to sequential");
     let mut results = Vec::with_capacity(texts.len());
     for (i, text) in texts.iter().enumerate() {
-        match get_embedding(endpoint, text) {
+        match get_embedding(endpoint, text, prefix) {
             Ok(v) => results.push(v),
             Err(e) => return Err(format!("embedding #{i} failed: {e}")),
         }
@@ -417,34 +442,435 @@ fn parse_single_embedding(resp: &serde_json::Value) -> Result<Vec<f32>, String> 
     Err(format!("no embedding in response: {}", &s[..s.len().min(300)]))
 }
 
-// ── RAG: In-memory vector store ─────────────────────────────
+// ── RAG: In-memory vector store with HNSW index ────────────
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Clone)]
 struct VecChunk {
     text: String,
     source: String,
     vector: Vec<f32>,
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() { return 0.0; }
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let mag_a = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let mag_b = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if mag_a < 1e-10 || mag_b < 1e-10 { return 0.0; }
-    dot / (mag_a * mag_b)
+/// Cosine distance: 1.0 − cosine_similarity.  Lower = more similar.
+/// HNSW uses "lower is closer" convention throughout.
+fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() { return 1.0; }
+    let mut dot = 0.0f32;
+    let mut mag_a = 0.0f32;
+    let mut mag_b = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        mag_a += a[i] * a[i];
+        mag_b += b[i] * b[i];
+    }
+    let denom = mag_a.sqrt() * mag_b.sqrt();
+    if denom < 1e-10 { return 1.0; }
+    1.0 - (dot / denom)
 }
+
+/// Convert cosine distance back to similarity for the public API.
+#[inline]
+fn distance_to_similarity(d: f32) -> f32 { 1.0 - d }
+
+// ── HNSW Graph ──────────────────────────────────────────────
+//
+// Hierarchical Navigable Small World graph for approximate nearest
+// neighbor search.  O(log n) query time with high recall.
+//
+// References:
+//   Malkov & Yashunin, "Efficient and robust approximate nearest
+//   neighbor search using Hierarchical Navigable Small World graphs"
+//   (2018), arXiv:1603.09320v4.
+
+/// Per-node metadata: the layers it lives on and its neighbor lists.
+struct HnswNode {
+    /// Maximum layer this node exists on (0-indexed, layer 0 is bottom).
+    level: usize,
+    /// Neighbors per layer: neighbors[layer] = vec of node indices.
+    /// Layer 0 allows up to M0 = 2*M connections; higher layers allow M.
+    neighbors: Vec<Vec<usize>>,
+}
+
+struct HnswGraph {
+    nodes: Vec<HnswNode>,
+    entry_point: Option<usize>,
+    max_level: usize,
+    m: usize,               // max connections per layer (layer 0 gets 2*m)
+    m0: usize,               // = 2 * m
+    ef_construction: usize,
+    ml: f64,                 // level multiplier = 1 / ln(m)
+    rng_state: u64,          // xorshift64 state
+}
+
+/// (distance, node_id) — ordered by distance ascending for min-extraction.
+#[derive(Clone, Copy, PartialEq)]
+struct DistNode {
+    dist: f32,
+    id: usize,
+}
+
+impl Eq for DistNode {}
+impl PartialOrd for DistNode {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+impl Ord for DistNode {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Natural order: lower dist = "less" → min-heap extracts closest first.
+        self.dist.partial_cmp(&other.dist)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+impl HnswGraph {
+    fn new(m: usize, ef_construction: usize) -> Self {
+        let m = m.max(4);
+        Self {
+            nodes: Vec::new(),
+            entry_point: None,
+            max_level: 0,
+            m,
+            m0: m * 2,
+            ef_construction,
+            ml: 1.0 / (m as f64).ln(),
+            rng_state: 0xDEAD_BEEF_CAFE_1337,
+        }
+    }
+
+    /// Xorshift64 PRNG — fast, no deps, good enough for layer assignment.
+    fn rand_f64(&mut self) -> f64 {
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng_state = x;
+        (x as f64) / (u64::MAX as f64)
+    }
+
+    fn random_level(&mut self) -> usize {
+        let r = self.rand_f64().max(1e-15);
+        (-r.ln() * self.ml).floor() as usize
+    }
+
+    fn max_neighbors(&self, layer: usize) -> usize {
+        if layer == 0 { self.m0 } else { self.m }
+    }
+
+    /// Core HNSW layer search: beam search starting from `entry_points`,
+    /// returning the `ef` closest nodes to `query` on `layer`.
+    ///
+    /// Generic over V so callers can pass &[Vec<f32>] (build) or &[&[f32]] (search)
+    /// without cloning vector data.
+    ///
+    /// Returns a max-heap (furthest on top) of up to `ef` results.
+    fn search_layer<V: AsRef<[f32]>>(
+        &self,
+        query: &[f32],
+        entry_points: &[usize],
+        ef: usize,
+        layer: usize,
+        vectors: &[V],
+    ) -> BinaryHeap<DistNode> {
+        let mut visited = HashSet::with_capacity(ef * 2);
+
+        // candidates: min-heap (closest on top) — use Reverse
+        let mut candidates: BinaryHeap<std::cmp::Reverse<DistNode>> = BinaryHeap::new();
+        // results: max-heap (furthest on top) — natural order
+        let mut results: BinaryHeap<DistNode> = BinaryHeap::new();
+
+        for &ep in entry_points {
+            if !visited.insert(ep) { continue; }
+            let d = cosine_distance(query, vectors[ep].as_ref());
+            candidates.push(std::cmp::Reverse(DistNode { dist: d, id: ep }));
+            results.push(DistNode { dist: d, id: ep });
+        }
+
+        while let Some(std::cmp::Reverse(closest)) = candidates.pop() {
+            // If the closest candidate is further than the furthest result, stop
+            let furthest_dist = results.peek().map(|n| n.dist).unwrap_or(f32::MAX);
+            if closest.dist > furthest_dist {
+                break;
+            }
+
+            // Explore neighbors of this candidate on the given layer
+            let node = &self.nodes[closest.id];
+            if layer < node.neighbors.len() {
+                for &neighbor_id in &node.neighbors[layer] {
+                    if !visited.insert(neighbor_id) { continue; }
+                    let d = cosine_distance(query, vectors[neighbor_id].as_ref());
+                    let furthest_dist = results.peek().map(|n| n.dist).unwrap_or(f32::MAX);
+
+                    if d < furthest_dist || results.len() < ef {
+                        candidates.push(std::cmp::Reverse(DistNode { dist: d, id: neighbor_id }));
+                        results.push(DistNode { dist: d, id: neighbor_id });
+                        if results.len() > ef {
+                            results.pop(); // evict furthest
+                        }
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Select the best M neighbors from candidates using the simple heuristic:
+    /// just take the M closest.  (The "heuristic neighbor selection" from the
+    /// paper is more complex but benchmarks show diminishing returns for our
+    /// dimensionality range.)
+    fn select_neighbors(candidates: &BinaryHeap<DistNode>, m: usize) -> Vec<usize> {
+        let mut sorted: Vec<DistNode> = candidates.iter().copied().collect();
+        sorted.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.iter().take(m).map(|n| n.id).collect()
+    }
+
+    /// Prune a node's neighbor list on a given layer to at most `max_m`,
+    /// keeping the closest neighbors by distance.
+    fn prune(&mut self, node_id: usize, layer: usize, vectors: &[Vec<f32>]) {
+        let max_m = self.max_neighbors(layer);
+        let neighbors = &self.nodes[node_id].neighbors[layer];
+        if neighbors.len() <= max_m { return; }
+
+        let mut scored: Vec<(f32, usize)> = neighbors.iter()
+            .map(|&nid| (cosine_distance(&vectors[node_id], &vectors[nid]), nid))
+            .collect();
+        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(max_m);
+
+        self.nodes[node_id].neighbors[layer] = scored.iter().map(|&(_, id)| id).collect();
+    }
+
+    /// Insert a single node into the graph.  `node_id` must already be
+    /// appended to `self.nodes` (with empty neighbors) before calling.
+    fn insert(&mut self, node_id: usize, vectors: &[Vec<f32>]) {
+        let level = self.nodes[node_id].level;
+
+        // First node — just set as entry point
+        if self.entry_point.is_none() {
+            self.entry_point = Some(node_id);
+            self.max_level = level;
+            return;
+        }
+
+        let ep = self.entry_point.unwrap();
+
+        // Phase 1: greedy descent from top layer down to level+1
+        let mut current_ep = ep;
+        let start_layer = self.max_level;
+        if start_layer > level {
+            for lc in ((level + 1)..=start_layer).rev() {
+                let results = self.search_layer(
+                    &vectors[node_id], &[current_ep], 1, lc, vectors,
+                );
+                if let Some(nearest) = results.into_iter()
+                    .min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal))
+                {
+                    current_ep = nearest.id;
+                }
+            }
+        }
+
+        // Phase 2: insert at layers min(level, max_level) down to 0
+        let insert_top = level.min(self.max_level);
+        let mut entry_points = vec![current_ep];
+
+        for lc in (0..=insert_top).rev() {
+            let results = self.search_layer(
+                &vectors[node_id], &entry_points, self.ef_construction, lc, vectors,
+            );
+            let max_m = self.max_neighbors(lc);
+            let selected = Self::select_neighbors(&results, max_m);
+
+            // Connect node_id → selected
+            self.nodes[node_id].neighbors[lc] = selected.clone();
+
+            // Bidirectional: connect each selected → node_id, then prune
+            for &sid in &selected {
+                self.nodes[sid].neighbors[lc].push(node_id);
+                if self.nodes[sid].neighbors[lc].len() > max_m {
+                    self.prune(sid, lc, vectors);
+                }
+            }
+
+            // Entry points for next layer down = the search results
+            entry_points = results.into_iter().map(|n| n.id).collect();
+        }
+
+        // Promote entry point if this node is on a higher level
+        if level > self.max_level {
+            self.max_level = level;
+            self.entry_point = Some(node_id);
+        }
+    }
+
+    /// K-nearest-neighbor search.  Returns up to `k` results sorted by
+    /// ascending distance (most similar first).
+    fn knn_search<V: AsRef<[f32]>>(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        vectors: &[V],
+    ) -> Vec<DistNode> {
+        let Some(ep) = self.entry_point else { return Vec::new(); };
+
+        // Phase 1: greedy descent from top to layer 1
+        let mut current_ep = ep;
+        if self.max_level > 0 {
+            for lc in (1..=self.max_level).rev() {
+                let results = self.search_layer(query, &[current_ep], 1, lc, vectors);
+                if let Some(nearest) = results.into_iter()
+                    .min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal))
+                {
+                    current_ep = nearest.id;
+                }
+            }
+        }
+
+        // Phase 2: full beam search on layer 0
+        let ef = ef_search.max(k);
+        let results = self.search_layer(query, &[current_ep], ef, 0, vectors);
+
+        // Extract top-k sorted by distance
+        let mut sorted: Vec<DistNode> = results.into_iter().collect();
+        sorted.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.truncate(k);
+        sorted
+    }
+
+    /// Build the entire graph from scratch for all vectors.
+    fn build_all(&mut self, vectors: &[Vec<f32>]) {
+        let n = vectors.len();
+        self.nodes.clear();
+        self.nodes.reserve(n);
+        self.entry_point = None;
+        self.max_level = 0;
+
+        // Pre-assign levels and create empty nodes
+        for _ in 0..n {
+            let level = self.random_level();
+            let neighbors = (0..=level).map(|_| Vec::new()).collect();
+            self.nodes.push(HnswNode { level, neighbors });
+        }
+
+        // Insert nodes one by one
+        for i in 0..n {
+            self.insert(i, vectors);
+        }
+
+        eprintln!(
+            "[hnsw] built graph: {} nodes, max_level={}, M={}, ef_c={}",
+            n, self.max_level, self.m, self.ef_construction
+        );
+    }
+
+    fn clear(&mut self) {
+        self.nodes.clear();
+        self.entry_point = None;
+        self.max_level = 0;
+    }
+
+    fn is_empty(&self) -> bool { self.nodes.is_empty() }
+
+    fn len(&self) -> usize { self.nodes.len() }
+
+    /// Total edges in the graph (for diagnostics).
+    fn edge_count(&self) -> usize {
+        self.nodes.iter()
+            .flat_map(|n| n.neighbors.iter())
+            .map(|nbrs| nbrs.len())
+            .sum()
+    }
+
+    // ── Serialization ───────────────────────────────────────
+
+    /// Serialize graph to binary:
+    ///   [u32 node_count] [u32 max_level] [u32 entry_point (u32::MAX if none)] [u32 m]
+    ///   for each node:
+    ///     [u32 level]
+    ///     for layer in 0..=level:
+    ///       [u32 neighbor_count] [u32 * neighbor_count]
+    fn save_to(&self, buf: &mut Vec<u8>) {
+        let count = self.nodes.len() as u32;
+        let ep = self.entry_point.map(|e| e as u32).unwrap_or(u32::MAX);
+        buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend_from_slice(&(self.max_level as u32).to_le_bytes());
+        buf.extend_from_slice(&ep.to_le_bytes());
+        buf.extend_from_slice(&(self.m as u32).to_le_bytes());
+
+        for node in &self.nodes {
+            buf.extend_from_slice(&(node.level as u32).to_le_bytes());
+            for layer_neighbors in &node.neighbors {
+                buf.extend_from_slice(&(layer_neighbors.len() as u32).to_le_bytes());
+                for &nid in layer_neighbors {
+                    buf.extend_from_slice(&(nid as u32).to_le_bytes());
+                }
+            }
+        }
+    }
+
+    /// Deserialize graph from binary.  Returns bytes consumed.
+    fn load_from(&mut self, data: &[u8]) -> Result<usize, String> {
+        if data.len() < 16 { return Err("hnsw header too short".into()); }
+        let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let max_level = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+        let ep_raw = u32::from_le_bytes(data[8..12].try_into().unwrap());
+        let m = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
+
+        self.max_level = max_level;
+        self.entry_point = if ep_raw == u32::MAX { None } else { Some(ep_raw as usize) };
+        self.m = m;
+        self.m0 = m * 2;
+        self.ml = 1.0 / (m as f64).ln();
+
+        let mut pos = 16;
+        self.nodes.clear();
+        self.nodes.reserve(count);
+
+        for i in 0..count {
+            if pos + 4 > data.len() { return Err(format!("hnsw truncated at node {i} (level)")); }
+            let level = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+            pos += 4;
+
+            let mut neighbors = Vec::with_capacity(level + 1);
+            for lc in 0..=level {
+                if pos + 4 > data.len() { return Err(format!("hnsw truncated at node {i} layer {lc}")); }
+                let nn = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+                pos += 4;
+                let bytes_needed = nn * 4;
+                if pos + bytes_needed > data.len() {
+                    return Err(format!("hnsw truncated at node {i} layer {lc} neighbors"));
+                }
+                let nbrs: Vec<usize> = (0..nn)
+                    .map(|j| u32::from_le_bytes(data[pos + j*4..pos + j*4 + 4].try_into().unwrap()) as usize)
+                    .collect();
+                pos += bytes_needed;
+                neighbors.push(nbrs);
+            }
+            self.nodes.push(HnswNode { level, neighbors });
+        }
+
+        eprintln!(
+            "[hnsw] loaded graph: {} nodes, max_level={}, M={}, edges={}",
+            self.nodes.len(), self.max_level, self.m, self.edge_count()
+        );
+        Ok(pos)
+    }
+}
+
+// ── RAG Store (chunks + HNSW) ───────────────────────────────
 
 struct RagStore {
     chunks: Vec<VecChunk>,
+    graph: HnswGraph,
     cfg: RagCfg,
     indexed_files: Vec<String>,
 }
 
 impl RagStore {
     fn new(cfg: RagCfg) -> Self {
-        let mut store = Self { chunks: Vec::new(), cfg, indexed_files: Vec::new() };
-        // Load persisted index if it exists
+        let graph = HnswGraph::new(cfg.hnsw_m, cfg.hnsw_ef_construction);
+        let mut store = Self { chunks: Vec::new(), graph, cfg, indexed_files: Vec::new() };
         if let Err(e) = store.load() {
             eprintln!("[rag] load: {e} (starting empty)");
         }
@@ -468,7 +894,7 @@ impl RagStore {
         (all_chunks, all_sources)
     }
 
-    /// Store pre-computed embeddings. Call this under lock after embedding completes.
+    /// Store pre-computed embeddings and build the HNSW graph.
     fn store_embeddings(
         &mut self,
         chunks: Vec<String>,
@@ -490,6 +916,13 @@ impl RagStore {
         }
         self.indexed_files = file_names;
 
+        // Build HNSW graph over the vectors
+        let t0 = Instant::now();
+        let vecs: Vec<Vec<f32>> = self.chunks.iter().map(|c| c.vector.clone()).collect();
+        self.graph = HnswGraph::new(self.cfg.hnsw_m, self.cfg.hnsw_ef_construction);
+        self.graph.build_all(&vecs);
+        eprintln!("[rag] HNSW built in {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+
         if let Err(e) = self.save() {
             eprintln!("[rag] save warning: {e}");
         }
@@ -497,65 +930,61 @@ impl RagStore {
         Ok(self.chunks.len())
     }
 
-    /// Search with pre-filtering: skip chunks whose source file doesn't match
-    /// any word in the query, unless that would eliminate all candidates.
+    /// Search using HNSW graph.  Falls back to brute force if the graph
+    /// is out of sync (shouldn't happen, but defensive).
     fn search_local(
         &self,
         query_vec: &[f32],
         limit: usize,
-        query_hint: &str,
+        _query_hint: &str,
     ) -> Vec<(String, String, f32)> {
         if self.chunks.is_empty() { return Vec::new(); }
 
-        // Pre-filter: extract keywords from query, match against source filenames
-        let hint_words: Vec<String> = query_hint.to_lowercase()
-            .split_whitespace()
-            .filter(|w| w.len() > 2)
-            .map(|s| s.to_string())
-            .collect();
-
-        let candidates: Vec<usize> = if hint_words.is_empty() {
-            (0..self.chunks.len()).collect()
-        } else {
-            let filtered: Vec<usize> = self.chunks.iter().enumerate()
-                .filter(|(_, c)| {
-                    let src = c.source.to_lowercase();
-                    hint_words.iter().any(|w| src.contains(w.as_str()) || c.text.contains(w.as_str()))
+        if !self.graph.is_empty() && self.graph.len() == self.chunks.len() {
+            // HNSW search path — O(log n), zero-copy vector access
+            let vec_refs: Vec<&[f32]> = self.chunks.iter().map(|c| c.vector.as_slice()).collect();
+            let results = self.graph.knn_search(
+                query_vec, limit, self.cfg.hnsw_ef_search, &vec_refs,
+            );
+            results.iter()
+                .map(|dn| {
+                    let c = &self.chunks[dn.id];
+                    (c.source.clone(), c.text.clone(), distance_to_similarity(dn.dist))
                 })
-                .map(|(i, _)| i)
+                .collect()
+        } else {
+            // Fallback: brute-force (graph missing or stale)
+            eprintln!("[rag] WARN: HNSW graph missing/stale, falling back to brute force");
+            let mut scored: Vec<(usize, f32)> = self.chunks.iter().enumerate()
+                .map(|(i, c)| (i, cosine_distance(query_vec, &c.vector)))
                 .collect();
-            // Fall back to all if pre-filter is too aggressive
-            if filtered.len() < limit { (0..self.chunks.len()).collect() } else { filtered }
-        };
-
-        let mut scored: Vec<(usize, f32)> = candidates.iter()
-            .map(|&i| (i, cosine_similarity(query_vec, &self.chunks[i].vector)))
-            .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        scored.iter()
-            .take(limit)
-            .map(|(i, sim)| {
-                let c = &self.chunks[*i];
-                (c.source.clone(), c.text.clone(), *sim)
-            })
-            .collect()
+            scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored.iter()
+                .take(limit)
+                .map(|(i, d)| {
+                    let c = &self.chunks[*i];
+                    (c.source.clone(), c.text.clone(), distance_to_similarity(*d))
+                })
+                .collect()
+        }
     }
 
     fn clear(&mut self) -> Result<(), String> {
         self.chunks.clear();
+        self.graph.clear();
         self.indexed_files.clear();
         let _ = fs::remove_file(&self.cfg.db_path);
         eprintln!("[rag] index cleared");
         Ok(())
     }
 
-    /// Persist index in compact binary format:
+    /// Persist index in binary format:
     ///   [u32 chunk_count] [u32 vector_dim]
     ///   for each chunk:
     ///     [u32 source_len] [source_bytes]
     ///     [u32 text_len] [text_bytes]
     ///     [f32 * dim]
+    ///   [HNSW graph bytes]
     fn save(&self) -> Result<(), String> {
         if let Some(parent) = Path::new(&self.cfg.db_path).parent() {
             let _ = fs::create_dir_all(parent);
@@ -563,7 +992,6 @@ impl RagStore {
         let dim = self.chunks.first().map(|c| c.vector.len()).unwrap_or(0) as u32;
         let count = self.chunks.len() as u32;
 
-        // Estimate capacity: header + per-chunk overhead
         let mut buf = Vec::with_capacity(8 + self.chunks.len() * (8 + 200 + dim as usize * 4));
         buf.extend_from_slice(&count.to_le_bytes());
         buf.extend_from_slice(&dim.to_le_bytes());
@@ -580,47 +1008,24 @@ impl RagStore {
             }
         }
 
+        self.graph.save_to(&mut buf);
+
         fs::write(&self.cfg.db_path, &buf)
             .map_err(|e| format!("write {}: {e}", self.cfg.db_path))
     }
 
-    /// Load persisted index from disk (binary or legacy JSON fallback).
+    /// Load persisted index from disk.
     fn load(&mut self) -> Result<(), String> {
         let path = Path::new(&self.cfg.db_path);
         if !path.exists() { return Ok(()); }
         let data = fs::read(path)
             .map_err(|e| format!("read {}: {e}", self.cfg.db_path))?;
+        if data.len() < 8 { return Ok(()); }
 
-        if data.is_empty() { return Ok(()); }
-
-        // Detect format: binary starts with u32 count, JSON starts with '['
-        if data[0] == b'[' {
-            // Legacy JSON format — migrate on next save
-            let text = String::from_utf8_lossy(&data);
-            self.chunks = serde_json::from_str(&text)
-                .map_err(|e| format!("parse json: {e}"))?;
-            eprintln!("[rag] loaded {} chunks from JSON (will migrate to binary on next save)", self.chunks.len());
-        } else {
-            // Binary format
-            self.load_binary(&data)?;
-        }
-
-        // Reconstruct indexed_files from chunk sources
-        let mut files: Vec<String> = self.chunks.iter()
-            .map(|c| c.source.split(':').next().unwrap_or("").to_string())
-            .collect();
-        files.sort();
-        files.dedup();
-        self.indexed_files = files;
-        eprintln!("[rag] loaded {} chunks from {}", self.chunks.len(), self.cfg.db_path);
-        Ok(())
-    }
-
-    fn load_binary(&mut self, data: &[u8]) -> Result<(), String> {
-        if data.len() < 8 { return Err("binary index too short".into()); }
         let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
         let dim = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
         let mut pos = 8;
+
         self.chunks.clear();
         self.chunks.reserve(count);
 
@@ -651,7 +1056,40 @@ impl RagStore {
 
             self.chunks.push(VecChunk { text, source, vector });
         }
+
+        // Load HNSW graph
+        if pos < data.len() {
+            self.graph.load_from(&data[pos..])?;
+            if self.graph.len() != self.chunks.len() {
+                eprintln!("[rag] graph/chunk count mismatch, rebuilding");
+                self.rebuild_graph();
+            }
+        } else {
+            self.rebuild_graph();
+        }
+
+        // Reconstruct indexed_files from chunk sources
+        let mut files: Vec<String> = self.chunks.iter()
+            .map(|c| c.source.split(':').next().unwrap_or("").to_string())
+            .collect();
+        files.sort();
+        files.dedup();
+        self.indexed_files = files;
+        eprintln!("[rag] loaded {} chunks from {}", self.chunks.len(), self.cfg.db_path);
         Ok(())
+    }
+
+    /// Rebuild the HNSW graph from the current chunk vectors.
+    fn rebuild_graph(&mut self) {
+        if self.chunks.is_empty() {
+            self.graph.clear();
+            return;
+        }
+        let t0 = Instant::now();
+        let vecs: Vec<Vec<f32>> = self.chunks.iter().map(|c| c.vector.clone()).collect();
+        self.graph = HnswGraph::new(self.cfg.hnsw_m, self.cfg.hnsw_ef_construction);
+        self.graph.build_all(&vecs);
+        eprintln!("[rag] graph rebuilt in {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
     }
 
     fn vector_dim(&self) -> Option<usize> {
@@ -665,6 +1103,13 @@ impl RagStore {
             "vector_dim": self.vector_dim(),
             "files": self.indexed_files,
             "db_path": self.cfg.db_path,
+            "hnsw": {
+                "nodes": self.graph.len(),
+                "max_level": self.graph.max_level,
+                "edges": self.graph.edge_count(),
+                "m": self.graph.m,
+                "ef_search": self.cfg.hnsw_ef_search,
+            },
         })
     }
 }
@@ -690,17 +1135,28 @@ impl EmbedServer {
         eprintln!("[embed] starting {} (ngl={ngl}, ctx={}, port={})", model_name, cfg.context_size, cfg.port);
 
         let ctx_str = cfg.context_size.to_string();
+        let port_str = cfg.port.to_string();
+        let ngl_str = ngl.to_string();
+        let slots_str = cfg.parallel_slots.to_string();
+
+        let mut args = vec![
+            "-m", model_path,
+            "--port", &port_str,
+            "-ngl", &ngl_str,
+            "-c", &ctx_str,
+            "-ub", &ctx_str,
+            "-np", &slots_str,
+            "--host", "127.0.0.1",
+            "--embedding",
+        ];
+
+        if !cfg.pooling.is_empty() {
+            args.push("--pooling");
+            args.push(&cfg.pooling);
+        }
+
         let child = Command::new(binary)
-            .args([
-                "-m", model_path,
-                "--port", &cfg.port.to_string(),
-                "-ngl", &ngl.to_string(),
-                "-c", &ctx_str,
-                "-ub", &ctx_str,
-                "-np", &cfg.parallel_slots.to_string(),
-                "--host", "127.0.0.1",
-                "--embedding",
-            ])
+            .args(&args)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
@@ -1121,6 +1577,12 @@ struct RagSearchReq {
 }
 
 #[derive(Deserialize)]
+struct EmbedPrefixReq {
+    #[serde(default)] query_prefix: Option<String>,
+    #[serde(default)] doc_prefix: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct ChatChunk {
     #[serde(default)] choices: Vec<ChunkChoice>,
 }
@@ -1171,8 +1633,9 @@ fn main() {
         eprintln!("  embed-server: disabled");
     }
     if file_cfg.rag.enabled {
-        eprintln!("  rag: enabled (db={}, chunk={}/{})",
-            file_cfg.rag.db_path, file_cfg.rag.chunk_size, file_cfg.rag.chunk_overlap);
+        eprintln!("  rag: enabled (db={}, chunk={}/{}, hnsw M={} ef_c={} ef_s={})",
+            file_cfg.rag.db_path, file_cfg.rag.chunk_size, file_cfg.rag.chunk_overlap,
+            file_cfg.rag.hnsw_m, file_cfg.rag.hnsw_ef_construction, file_cfg.rag.hnsw_ef_search);
     }
 
     let llama_ok = Command::new(&llama_binary)
@@ -1311,6 +1774,7 @@ fn serve(mut stream: TcpStream, st: &Shared) {
         ("GET", "/api/embed/status")  => respond_json(&mut stream, &handle_embed_status(st)),
         ("POST", "/api/embed/start")  => respond_json(&mut stream, &handle_embed_start(st)),
         ("POST", "/api/embed/stop")   => respond_json(&mut stream, &handle_embed_stop(st)),
+        ("POST", "/api/embed/prefixes") => respond_json(&mut stream, &handle_embed_prefixes(st, &body)),
         // RAG endpoints
         ("GET", "/api/rag/status")   => respond_json(&mut stream, &handle_rag_status(st)),
         ("POST", "/api/rag/index")   => respond_json(&mut stream, &handle_rag_index(st, &body)),
@@ -1492,7 +1956,11 @@ fn handle_params(st: &Shared, body: &str) -> serde_json::Value {
 
 fn handle_embed_status(st: &Shared) -> serde_json::Value {
     let s = st.lock().unwrap();
-    s.embed.status_json()
+    let mut status = s.embed.status_json();
+    status["query_prefix"] = serde_json::json!(s.cfg.embed.query_prefix);
+    status["doc_prefix"] = serde_json::json!(s.cfg.embed.doc_prefix);
+    status["pooling"] = serde_json::json!(s.cfg.embed.pooling);
+    status
 }
 
 fn handle_embed_start(st: &Shared) -> serde_json::Value {
@@ -1569,6 +2037,21 @@ fn handle_embed_stop(st: &Shared) -> serde_json::Value {
     serde_json::json!({"ok": true})
 }
 
+fn handle_embed_prefixes(st: &Shared, body: &str) -> serde_json::Value {
+    let req: EmbedPrefixReq = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => return serde_json::json!({"error": e.to_string()}),
+    };
+    let mut s = st.lock().unwrap();
+    if let Some(v) = req.query_prefix { s.cfg.embed.query_prefix = v; }
+    if let Some(v) = req.doc_prefix { s.cfg.embed.doc_prefix = v; }
+    serde_json::json!({
+        "ok": true,
+        "query_prefix": s.cfg.embed.query_prefix,
+        "doc_prefix": s.cfg.embed.doc_prefix,
+    })
+}
+
 // ── RAG Handlers ────────────────────────────────────────────
 
 fn handle_rag_status(st: &Shared) -> serde_json::Value {
@@ -1589,12 +2072,13 @@ fn handle_rag_index(st: &Shared, body: &str) -> serde_json::Value {
     }
 
     // Phase 1: lock briefly to check state and prepare chunks
-    let (embed_ready, endpoint, all_chunks, all_sources) = {
+    let (embed_ready, endpoint, doc_prefix, all_chunks, all_sources) = {
         let s = st.lock().unwrap();
         let ready = s.embed.is_ready();
         let ep = s.cfg.embedding_endpoint();
+        let pfx = s.cfg.embed.doc_prefix.clone();
         let (chunks, sources) = s.rag.prepare_chunks(&req.files);
-        (ready, ep, chunks, sources)
+        (ready, ep, pfx, chunks, sources)
     };
     // Lock released here — other API calls can proceed
 
@@ -1609,7 +2093,7 @@ fn handle_rag_index(st: &Shared, body: &str) -> serde_json::Value {
     eprintln!("[rag] embedding {} chunks from {} files...", all_chunks.len(), req.files.len());
     let t0 = Instant::now();
 
-    let vectors = match get_embeddings_batch(&endpoint, &all_chunks) {
+    let vectors = match get_embeddings_batch(&endpoint, &all_chunks, &doc_prefix) {
         Ok(v) => v,
         Err(e) => return serde_json::json!({"error": e}),
     };
@@ -1636,9 +2120,10 @@ fn handle_rag_search(st: &Shared, body: &str) -> serde_json::Value {
     };
 
     // Phase 1: lock briefly to get config
-    let (endpoint, search_limit, has_chunks) = {
+    let (endpoint, query_prefix, search_limit, has_chunks) = {
         let s = st.lock().unwrap();
-        (s.cfg.embedding_endpoint(), s.rag.cfg.search_results, !s.rag.chunks.is_empty())
+        (s.cfg.embedding_endpoint(), s.cfg.embed.query_prefix.clone(),
+         s.rag.cfg.search_results, !s.rag.chunks.is_empty())
     };
 
     if !has_chunks {
@@ -1647,7 +2132,7 @@ fn handle_rag_search(st: &Shared, body: &str) -> serde_json::Value {
 
     // Phase 2: embed query (no lock)
     let limit = req.limit.unwrap_or(search_limit);
-    let query_vec = match get_embedding(&endpoint, &req.query) {
+    let query_vec = match get_embedding(&endpoint, &req.query, &query_prefix) {
         Ok(v) => v,
         Err(e) => return serde_json::json!({"error": e}),
     };
@@ -1823,7 +2308,7 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
 
         if should_search {
             // Phase 2: embed query (no lock)
-            match get_embedding(&endpoint, &req.description) {
+            match get_embedding(&endpoint, &req.description, &cfg.embed.query_prefix) {
                 Ok(query_vec) => {
                     // Phase 3: lock briefly for similarity (CPU only)
                     let s = st.lock().unwrap();
