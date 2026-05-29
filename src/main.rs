@@ -165,7 +165,7 @@ impl Default for RagCfg {
             db_path: "data/rag_index.json".into(),
             chunk_size: 60,
             chunk_overlap: 10,
-            search_results: 5,
+            search_results: 15,
             min_similarity: 0.25,
             hybrid_weight_vector: 0.7,
             hybrid_weight_bm25: 0.3,
@@ -2592,7 +2592,17 @@ struct ContextResult {
     model_ctx: u64,
 }
 
+/// Minimum output tokens — hard floor, never go below this.
 const MIN_OUTPUT_TOKENS: u64 = 256;
+
+/// Reserve 25% of context for output.  Scales with model size:
+///   8k ctx  →  2048 output reserve
+///  32k ctx  →  8192 output reserve
+/// Never drops below MIN_OUTPUT_TOKENS.
+#[inline]
+fn output_reserve_for(model_ctx: u64) -> u64 {
+    (model_ctx / 4).max(MIN_OUTPUT_TOKENS)
+}
 
 fn assemble_context(
     files: &[FileEntry], extra_ctx: &str, rag_context: &str,
@@ -2602,7 +2612,7 @@ fn assemble_context(
     let desc_tok = estimate_tokens(description);
     let rag_tok = estimate_tokens(rag_context);
     let fixed_input = system_tok + desc_tok + rag_tok;
-    let file_budget = (model_ctx as u64).saturating_sub(fixed_input + MIN_OUTPUT_TOKENS);
+    let file_budget = (model_ctx as u64).saturating_sub(fixed_input + output_reserve_for(model_ctx as u64));
 
     let mut result = ContextResult {
         context_block: String::new(),
@@ -2704,57 +2714,21 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
 
     let is_review = req.mode == "review";
 
-    // ── RAG retrieval (lock-free embedding) ──
-    let mut rag_context = String::new();
-    let mut rag_chunks_used = 0usize;
-    if req.use_rag {
-        // Phase 1: lock briefly to check state
-        let (should_search, endpoint, search_limit) = {
-            let s = st.lock().unwrap();
-            let ok = !s.rag.chunks.is_empty() && s.rag.cfg.enabled && s.embed.is_ready();
-            (ok, cfg.embedding_endpoint(), s.rag.cfg.search_results)
-        };
-
-        if should_search {
-            // Phase 2: embed query (no lock)
-            match get_embedding(&endpoint, &req.description, &cfg.embed.query_prefix) {
-                Ok(query_vec) => {
-                    // Phase 3: lock briefly for similarity (CPU only)
-                    let s = st.lock().unwrap();
-                    let hits = s.rag.search_local(&query_vec, search_limit, &req.description);
-                    drop(s); // release immediately
-
-                    if !hits.is_empty() {
-                        rag_context.push_str("\n--- retrieved context (RAG) ---\n");
-                        for (source, text, dist) in &hits {
-                            rag_context.push_str(&format!("# {} (distance: {:.4})\n{}\n\n", source, dist, text));
-                        }
-                        rag_chunks_used = hits.len();
-                        eprintln!("[rag] retrieved {} chunks for query", hits.len());
-                        send_sse(stream, &serde_json::json!({
-                            "rag_info": {
-                                "chunks_retrieved": hits.len(),
-                                "sources": hits.iter().map(|(s, _, d)| {
-                                    serde_json::json!({"source": s, "distance": d})
-                                }).collect::<Vec<_>>(),
-                            }
-                        }));
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[rag] search error: {e}");
-                    send_sse(stream, &serde_json::json!({"rag_info": {"error": e}}));
-                }
-            }
-        }
+    // ════════════════════════════════════════════════════════════
+    // Precomputed token budget — exact values, no estimation.
+    // Built once, used throughout the pipeline.
+    // ════════════════════════════════════════════════════════════
+    struct TokenBudget {
+        pub model_ctx: u64,
+        pub system_tokens: u64,
+        pub desc_tokens: u64,
+        pub output_reserve: u64,
+        pub context_budget: u64,    // everything available for RAG + files
+        pub rag_tokens: u64,        // filled during retrieval
     }
 
-    let system = if is_review {
-        let rag_note = if rag_chunks_used > 0 {
-            "\nRelevant code from the project has been retrieved and included below. \
-             Reference it directly — quote specific fields, types, and function \
-             signatures when they're relevant to the discussion."
-        } else { "" };
+    // Step 1: Build system prompt base (rag_note appended later if chunks found)
+    let system_base = if is_review {
         format!(
             "You are a senior {} engineer in a pair-programming conversation.\n\
              The user will ask questions, request explanations, or discuss code \
@@ -2775,19 +2749,155 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
              - If the question is broad (\"explain this struct\"), walk through \
                the logical groups/sections and explain the design — what each \
                cluster of fields does, how they relate, why they're structured \
-               that way.{}",
-            req.language, rag_note
+               that way.",
+            req.language
         )
     } else {
-        let rag_note = if rag_chunks_used > 0 {
-            "\nRelevant code context has been retrieved from the project index. \
-             Use it to ensure consistency with the existing codebase."
-        } else { "" };
         format!(
             "You are an expert {} programmer. Write clean, efficient, well-documented code.\n\
-             Output ONLY the code with clear comments. No markdown fences, no prose outside code.{}",
-            req.language, rag_note
+             Output ONLY the code with clear comments. No markdown fences, no prose outside code.",
+            req.language
         )
+    };
+
+    let rag_note = if is_review {
+        "\nRelevant code from the project has been retrieved and included below. \
+         Reference it directly — quote specific fields, types, and function \
+         signatures when they're relevant to the discussion."
+    } else {
+        "\nRelevant code context has been retrieved from the project index. \
+         Use it to ensure consistency with the existing codebase."
+    };
+
+    // Step 2: Compute exact token costs — fixed overhead only.
+    // RAG and files share one pool: everything left after system + desc + output reserve.
+    let system_tokens = estimate_tokens(&system_base) + estimate_tokens(rag_note);
+    let desc_tokens = estimate_tokens(&req.description);
+    let output_reserve = output_reserve_for(cfg.ctx as u64);
+    let context_budget = (cfg.ctx as u64).saturating_sub(
+        system_tokens + desc_tokens + output_reserve
+    );
+
+    let mut budget = TokenBudget {
+        model_ctx: cfg.ctx as u64,
+        system_tokens,
+        desc_tokens,
+        output_reserve,
+        context_budget,
+        rag_tokens: 0,
+    };
+
+    // ── RAG retrieval (budget-adaptive) ──────────────────────
+    let mut rag_context = String::new();
+    let mut rag_chunks_used = 0usize;
+    if req.use_rag {
+        let (should_search, endpoint, max_chunks) = {
+            let s = st.lock().unwrap();
+            let ok = !s.rag.chunks.is_empty() && s.rag.cfg.enabled && s.embed.is_ready();
+            (ok, cfg.embedding_endpoint(), s.rag.cfg.search_results)
+        };
+
+        if should_search {
+            const RAG_CANDIDATE_POOL: usize = 30;
+
+            match get_embedding(&endpoint, &req.description, &cfg.embed.query_prefix) {
+                Ok(query_vec) => {
+                    let s = st.lock().unwrap();
+                    let hits = s.rag.search_local(
+                        &query_vec, RAG_CANDIDATE_POOL, &req.description,
+                    );
+                    drop(s);
+
+                    if !hits.is_empty() {
+                        let header = "\n--- retrieved context (RAG) ---\n";
+                        rag_context.push_str(header);
+                        let mut rag_used: u64 = estimate_tokens(header);
+                        let mut selected: Vec<(&String, &String, &f32)> = Vec::new();
+
+                        // Score decay: stop when a chunk's score drops below
+                        // 50% of the best hit.  This is the primary control —
+                        // focused queries get few chunks, broad queries get more,
+                        // and noise never enters regardless of remaining budget.
+                        let top_score = hits[0].2;
+                        let score_floor = top_score * 0.5;
+
+                        for (source, text, score) in &hits {
+                            // 1. Max chunks — hard latency cap (config: search_results)
+                            if selected.len() >= max_chunks {
+                                eprintln!("[rag] stopping: max chunks ({})", max_chunks);
+                                break;
+                            }
+
+                            // 2. Score decay — chunk isn't worth including
+                            if !selected.is_empty() && *score < score_floor {
+                                eprintln!(
+                                    "[rag] stopping: score {:.4} < floor {:.4} (50% of top {:.4})",
+                                    score, score_floor, top_score
+                                );
+                                break;
+                            }
+
+                            let chunk_block = format!(
+                                "# {} (score: {:.4})\n{}\n\n", source, score, text
+                            );
+                            let cost = estimate_tokens_lang(&chunk_block, &req.language);
+
+                            // Hard ceiling: don't overflow context
+                            if rag_used + cost > context_budget {
+                                if selected.is_empty() {
+                                    // Always include at least one chunk
+                                    rag_context.push_str(&chunk_block);
+                                    rag_used += cost;
+                                    selected.push((source, text, score));
+                                }
+                                eprintln!("[rag] stopping: budget exhausted ({}/{})", rag_used, context_budget);
+                                break;
+                            }
+
+                            rag_context.push_str(&chunk_block);
+                            rag_used += cost;
+                            selected.push((source, text, score));
+                        }
+
+                        budget.rag_tokens = rag_used;
+                        rag_chunks_used = selected.len();
+                        let remaining = budget.model_ctx.saturating_sub(
+                            budget.system_tokens + budget.desc_tokens + rag_used
+                        );
+                        eprintln!(
+                            "[rag] {} chunks, {} tok, ~{} tok remaining for response",
+                            rag_chunks_used, rag_used, remaining
+                        );
+                        send_sse(stream, &serde_json::json!({
+                            "rag_info": {
+                                "chunks_retrieved": rag_chunks_used,
+                                "max_chunks": max_chunks,
+                                "rag_tokens": rag_used,
+                                "response_budget": remaining,
+                                "top_score": top_score,
+                                "score_floor": score_floor,
+                                "sources": selected.iter().map(|(s, _, d)| {
+                                    serde_json::json!({"source": s, "score": d})
+                                }).collect::<Vec<_>>(),
+                            }
+                        }));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[rag] search error: {e}");
+                    send_sse(stream, &serde_json::json!({"rag_info": {"error": e}}));
+                }
+            }
+        }
+    }
+
+    // Step 3: Finalize system prompt — add rag_note only if chunks found
+    let system = if rag_chunks_used > 0 {
+        format!("{}{}", system_base, rag_note)
+    } else {
+        // Reclaim the rag_note tokens we reserved
+        budget.system_tokens = estimate_tokens(&system_base);
+        system_base
     };
 
     let ctx_result = assemble_context(
@@ -2799,7 +2909,12 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
     if !req.files.is_empty() || !req.context.is_empty() || rag_chunks_used > 0 {
         let mut info = serde_json::json!({
             "context_info": {
-                "model_ctx": ctx_result.model_ctx,
+                "model_ctx": budget.model_ctx,
+                "system_tokens": budget.system_tokens,
+                "desc_tokens": budget.desc_tokens,
+                "context_budget": budget.context_budget,
+                "rag_tokens": budget.rag_tokens,
+                "output_reserve": budget.output_reserve,
                 "input_tokens": ctx_result.total_input_tokens,
                 "remaining_tokens": remaining,
                 "files_included": ctx_result.files_included,
@@ -2828,8 +2943,9 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
         }
     };
 
-    let actual_input = estimate_tokens(&system) + estimate_tokens_lang(&user, &req.language);
-    let max_tokens = (cfg.ctx as u64).saturating_sub(actual_input);
+    let actual_input = budget.system_tokens
+        + estimate_tokens_lang(&user, &req.language);
+    let max_tokens = budget.model_ctx.saturating_sub(actual_input);
 
     if max_tokens < MIN_OUTPUT_TOKENS {
         send_sse(stream, &serde_json::json!({
