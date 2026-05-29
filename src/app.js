@@ -713,6 +713,18 @@
     }
   });
 
+  function setGenerating(on) {
+    const writeBtn = $('#write-btn');
+    const abortBtn = $('#abort-btn');
+    if (on) {
+      writeBtn.classList.add('hidden');
+      abortBtn.classList.remove('hidden');
+    } else {
+      writeBtn.classList.remove('hidden');
+      abortBtn.classList.add('hidden');
+    }
+  }
+
   async function doWrite() {
     const desc = $('#write-desc').value.trim();
     if (!desc) return;
@@ -733,6 +745,7 @@
     statsEl.textContent = '';
     ctxInfo.classList.add('hidden');
     ctxInfo.innerHTML = '';
+    setGenerating(true);
 
     const lang = $('#lang-select').value;
     const sorted = getSortedFiles(desc, lang);
@@ -741,6 +754,11 @@
       content: f.content,
       language: f.language,
     }));
+
+    let fullText = '';
+    let started = false;
+    let tokenCount = 0;
+    const genStart = Date.now();
 
     try {
       const res = await fetch('/api/write', {
@@ -759,8 +777,6 @@
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buf = '';
-      let fullText = '';
-      let started = false;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -778,6 +794,7 @@
 
           if (data.error) {
             output.innerHTML = `<div class="error-msg">${esc(data.error)}</div>`;
+            setGenerating(false);
             return;
           }
 
@@ -840,6 +857,7 @@
               started = true;
             }
             fullText += data.token;
+            tokenCount++;
             if (isReview) {
               $('#stream-review').innerHTML = renderReview(fullText);
             } else {
@@ -878,13 +896,48 @@
         output.innerHTML = '<div class="placeholder-msg">No output received</div>';
       }
     } catch (e) {
-      if (e.name !== 'AbortError') {
+      if (e.name === 'AbortError') {
+        // User clicked abort — keep partial output and show stats
+        const cursor = output.querySelector('.streaming-cursor');
+        if (cursor) cursor.classList.remove('streaming-cursor');
+
+        if (isReview && fullText) {
+          const el = $('#stream-review');
+          if (el) el.innerHTML = renderReview(fullText);
+        }
+
+        const secs = ((Date.now() - genStart) / 1000).toFixed(1);
+        statsEl.textContent = `${tokenCount} tok · ${secs}s · stopped`;
+
+        if (fullText) {
+          copyBtn.classList.remove('hidden');
+          copyBtn.onclick = () => {
+            navigator.clipboard.writeText(fullText);
+            copyBtn.textContent = 'Copied!';
+            setTimeout(() => (copyBtn.textContent = 'Copy'), 1500);
+          };
+        }
+      } else {
         output.innerHTML = `<div class="error-msg">Error: ${esc(String(e))}</div>`;
       }
     } finally {
       abortCtrl = null;
+      setGenerating(false);
     }
   }
+
+  // Abort button handler
+  $('#abort-btn').onclick = () => {
+    if (abortCtrl) abortCtrl.abort();
+  };
+
+  // Escape key aborts generation
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && abortCtrl) {
+      e.preventDefault();
+      abortCtrl.abort();
+    }
+  });
 
   function renderReview(text) {
     const parts = text.split(/(```[\s\S]*?```|```[\s\S]*$)/);

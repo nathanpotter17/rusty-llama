@@ -147,6 +147,12 @@ struct RagCfg {
     chunk_size: usize,
     chunk_overlap: usize,
     search_results: usize,
+    // Retrieval quality
+    min_similarity: f32,         // skip chunks below this cosine similarity
+    hybrid_weight_vector: f32,   // weight for vector similarity in hybrid scoring
+    hybrid_weight_bm25: f32,     // weight for BM25 keyword score in hybrid scoring
+    // External chunker tool (empty = use internal chunker only)
+    chunker_tool: String,
     // HNSW graph parameters
     hnsw_m: usize,               // max connections per node per layer (M0 = 2*M for layer 0)
     hnsw_ef_construction: usize, // beam width during index build
@@ -160,9 +166,13 @@ impl Default for RagCfg {
             chunk_size: 60,
             chunk_overlap: 10,
             search_results: 5,
+            min_similarity: 0.25,
+            hybrid_weight_vector: 0.7,
+            hybrid_weight_bm25: 0.3,
+            chunker_tool: "tools/chunker.py".into(),
             hnsw_m: 16,
             hnsw_ef_construction: 150,
-            hnsw_ef_search: 50,
+            hnsw_ef_search: 64,
         }
     }
 }
@@ -325,7 +335,9 @@ fn estimate_tokens_lang(s: &str, lang: &str) -> u64 {
 
 // ── RAG: Text chunking ─────────────────────────────────────
 
-fn chunk_code_file(name: &str, content: &str, chunk_size: usize, overlap: usize) -> Vec<(String, String)> {
+/// Simple line-window chunker — used as fallback when the external
+/// chunker tool is unavailable or fails.
+fn chunk_code_file_simple(name: &str, content: &str, chunk_size: usize, overlap: usize) -> Vec<(String, String, String, String)> {
     let lines: Vec<&str> = content.lines().collect();
     if lines.is_empty() { return Vec::new(); }
     let mut chunks = Vec::new();
@@ -334,11 +346,160 @@ fn chunk_code_file(name: &str, content: &str, chunk_size: usize, overlap: usize)
         let end = std::cmp::min(i + chunk_size, lines.len());
         let chunk = lines[i..end].join("\n");
         let label = format!("{}:{}-{}", name, i + 1, end);
-        chunks.push((label, chunk));
+        // Add metadata header for better embedding quality
+        let enriched = enrich_chunk_metadata(name, &chunk, i + 1, end);
+        chunks.push((label, enriched, "block".to_string(), name.to_string()));
         if end == lines.len() { break; }
         i += chunk_size.saturating_sub(overlap);
     }
     chunks
+}
+
+/// Detect the display language name from a filename extension.
+fn lang_display_name(filename: &str) -> &'static str {
+    let ext = filename.rsplit('.').next().unwrap_or("");
+    match ext {
+        "rs" => "Rust", "py" => "Python", "js" | "jsx" | "mjs" => "JavaScript",
+        "ts" | "tsx" => "TypeScript", "go" => "Go", "c" | "h" => "C",
+        "cpp" | "cc" | "cxx" | "hpp" => "C++", "java" => "Java",
+        "cs" => "C#", "rb" => "Ruby", "php" => "PHP",
+        "swift" => "Swift", "kt" | "kts" => "Kotlin", "zig" => "Zig",
+        "lua" => "Lua", "sh" | "bash" => "Bash", "sql" => "SQL",
+        "html" | "htm" => "HTML", "css" | "scss" => "CSS",
+        "json" => "JSON", "yaml" | "yml" => "YAML", "toml" => "TOML",
+        "md" | "markdown" => "Markdown", _ => "Text",
+    }
+}
+
+/// Detect what constructs a chunk contains for metadata enrichment.
+fn detect_chunk_contents(text: &str) -> String {
+    let mut tags: Vec<&str> = Vec::new();
+    if text.contains("fn ") || text.contains("def ") || text.contains("function ") || text.contains("func ") {
+        tags.push("functions");
+    }
+    if text.contains("struct ") || text.contains("class ") || text.contains("interface ") {
+        tags.push("types");
+    }
+    if text.contains("enum ") { tags.push("enums"); }
+    if text.contains("impl ") { tags.push("impl"); }
+    if text.contains("trait ") { tags.push("traits"); }
+    let has_test = text.contains("#[test]") || text.contains("#[cfg(test)]")
+        || text.contains("def test_") || text.contains("describe(")
+        || text.contains("@Test") || text.contains("@test");
+    if has_test { tags.push("tests"); }
+    if text.contains("use ") || text.contains("import ") || text.contains("require(") || text.contains("#include") {
+        tags.push("imports");
+    }
+    if text.contains("Error") || text.contains("Result<") || text.contains("unwrap(")
+        || text.contains("expect(") || text.contains("panic!") || text.contains("try ")
+        || text.contains("catch ") || text.contains("except ") {
+        tags.push("error_handling");
+    }
+    if tags.is_empty() { "code".into() } else { tags.join(", ") }
+}
+
+/// Add metadata header to a chunk for better embedding quality.
+fn enrich_chunk_metadata(filename: &str, text: &str, start_line: usize, end_line: usize) -> String {
+    let lang = lang_display_name(filename);
+    let contents = detect_chunk_contents(text);
+    format!("File: {} | Language: {} | Lines: {}-{} | Contains: {}\n{}",
+        filename, lang, start_line, end_line, contents, text)
+}
+
+/// Try to run the external chunker tool (Python script) for syntax-aware chunking.
+/// Returns None if the tool is not available or fails.
+fn try_external_chunker(
+    tool_path: &str, files: &[FileEntry], chunk_size: usize, overlap: usize,
+) -> Option<Vec<(String, String, String, String)>> {
+    if tool_path.is_empty() { return None; }
+
+    // Check tool exists
+    let path = Path::new(tool_path);
+    if !path.exists() {
+        eprintln!("[rag] chunker tool not found: {tool_path}");
+        return None;
+    }
+
+    // Serialize files to JSON
+    let input: Vec<serde_json::Value> = files.iter().map(|f| {
+        serde_json::json!({
+            "name": f.name,
+            "content": f.content,
+            "language": f.language,
+        })
+    }).collect();
+    let json_input = match serde_json::to_string(&input) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("[rag] chunker serialize error: {e}"); return None; }
+    };
+
+    // Spawn the chunker process
+    let t0 = Instant::now();
+    let mut child = match Command::new("python3")
+        .arg(tool_path)
+        .arg("--chunk-size").arg(chunk_size.to_string())
+        .arg("--overlap").arg(overlap.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[rag] chunker spawn error: {e}");
+            return None;
+        }
+    };
+
+    // Write input to stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(json_input.as_bytes()).is_err() {
+            eprintln!("[rag] chunker stdin write error");
+            return None;
+        }
+    }
+
+    // Read output
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => { eprintln!("[rag] chunker wait error: {e}"); return None; }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("[rag] chunker exited with error: {}", stderr.trim());
+        return None;
+    }
+
+    // Parse output JSON: [{"source": "...", "text": "...", "kind": "...", "file": "..."}, ...]
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: Vec<serde_json::Value> = match serde_json::from_str(&stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[rag] chunker output parse error: {e}");
+            return None;
+        }
+    };
+
+    let mut result: Vec<(String, String, String, String)> = Vec::with_capacity(parsed.len());
+    for item in &parsed {
+        let source = item["source"].as_str().unwrap_or("unknown").to_string();
+        let text   = item["text"].as_str().unwrap_or("").to_string();
+        let kind   = item["kind"].as_str().unwrap_or("block").to_string();
+        let file   = item["file"].as_str().unwrap_or("").to_string();
+        if !text.trim().is_empty() {
+            result.push((source, text, kind, file));
+        }
+    }
+
+    eprintln!("[rag] external chunker produced {} chunks in {:.1}ms",
+        result.len(), t0.elapsed().as_secs_f64() * 1000.0);
+    Some(result)
+}
+
+/// Legacy entry point — still called by internal fallback paths.
+fn chunk_code_file(name: &str, content: &str, chunk_size: usize, overlap: usize) -> Vec<(String, String, String, String)> {
+    chunk_code_file_simple(name, content, chunk_size, overlap)
 }
 
 // ── RAG: Embedding via dedicated embed server ───────────────
@@ -449,6 +610,8 @@ struct VecChunk {
     text: String,
     source: String,
     vector: Vec<f32>,
+    kind: String,   // "block", "block_part", "file_summary", "gap"
+    file: String,   // originating filename, e.g. "main.rs"
 }
 
 /// Cosine distance: 1.0 − cosine_similarity.  Lower = more similar.
@@ -471,6 +634,12 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 /// Convert cosine distance back to similarity for the public API.
 #[inline]
 fn distance_to_similarity(d: f32) -> f32 { 1.0 - d }
+
+/// Cosine similarity between two vectors.  Returns 0..1 (1 = identical).
+#[inline]
+fn cosine_similarity_vecs(a: &[f32], b: &[f32]) -> f32 {
+    1.0 - cosine_distance(a, b)
+}
 
 // ── HNSW Graph ──────────────────────────────────────────────
 //
@@ -878,20 +1047,24 @@ impl RagStore {
     }
 
     /// Prepare chunks from files (no network, safe to call under lock).
-    fn prepare_chunks(&self, files: &[FileEntry]) -> (Vec<String>, Vec<String>) {
+    fn prepare_chunks(&self, files: &[FileEntry]) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
         let mut all_chunks: Vec<String> = Vec::new();
         let mut all_sources: Vec<String> = Vec::new();
+        let mut all_kinds: Vec<String> = Vec::new();
+        let mut all_files: Vec<String> = Vec::new();
         for f in files {
             let chunks = chunk_code_file(
                 &f.name, &f.content,
                 self.cfg.chunk_size, self.cfg.chunk_overlap,
             );
-            for (label, text) in chunks {
+            for (label, text, kind, file) in chunks {
                 all_sources.push(label);
                 all_chunks.push(text);
+                all_kinds.push(kind);
+                all_files.push(file);
             }
         }
-        (all_chunks, all_sources)
+        (all_chunks, all_sources, all_kinds, all_files)
     }
 
     /// Store pre-computed embeddings and build the HNSW graph.
@@ -901,6 +1074,8 @@ impl RagStore {
         sources: Vec<String>,
         vectors: Vec<Vec<f32>>,
         file_names: Vec<String>,
+        kinds: Vec<String>,
+        files: Vec<String>,
     ) -> Result<usize, String> {
         if vectors.is_empty() { return Err("no embeddings".into()); }
         let dim = vectors[0].len();
@@ -910,9 +1085,11 @@ impl RagStore {
         self.chunks.reserve(chunks.len());
         let iter = chunks.into_iter()
             .zip(sources.into_iter())
-            .zip(vectors.into_iter());
-        for ((text, source), vector) in iter {
-            self.chunks.push(VecChunk { text, source, vector });
+            .zip(vectors.into_iter())
+            .zip(kinds.into_iter())
+            .zip(files.into_iter());
+        for ((((text, source), vector), kind), file) in iter {
+            self.chunks.push(VecChunk { text, source, vector, kind, file });
         }
         self.indexed_files = file_names;
 
@@ -930,43 +1107,198 @@ impl RagStore {
         Ok(self.chunks.len())
     }
 
-    /// Search using HNSW graph.  Falls back to brute force if the graph
-    /// is out of sync (shouldn't happen, but defensive).
+    /// Code-aware BM25 keyword score.
+    /// Splits on whitespace AND code punctuation, uses a code-specific
+    /// stopword list, and accepts short tokens (code has 1-2 char identifiers).
+    fn bm25_score(&self, query: &str, chunk_idx: usize) -> f32 {
+        const STOP: &[&str] = &[
+            // English
+            "the", "and", "for", "this", "that", "with", "from", "are", "was",
+            "not", "but", "can", "will", "has", "had", "its", "all", "any",
+            // Rust keywords too common to discriminate
+            "let", "mut", "pub", "use", "mod", "ref", "str", "self",
+            "true", "false", "crate", "super", "where",
+            // Common types
+            "i32", "u32", "i64", "u64", "f32", "f64", "usize", "bool",
+            "fn", "impl", "struct", "enum", "type", "const",
+            // Common in all languages
+            "var", "val", "new", "return", "if", "else", "while",
+            "for", "in", "to", "of", "is", "it", "be", "as", "do",
+        ];
+
+        let query_terms: Vec<String> = query
+            .split(|c: char| c.is_whitespace() || c == ':' || c == '.' || c == '(' || c == ')')
+            .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric() && c != '_').to_lowercase())
+            .filter(|t| !t.is_empty() && !STOP.contains(&t.as_str()))
+            .collect();
+        if query_terms.is_empty() { return 0.0; }
+
+        let text = self.chunks[chunk_idx].text.to_lowercase();
+        let doc_len = text.split_whitespace().count() as f32;
+        let avg_len = if self.chunks.is_empty() { doc_len } else {
+            self.chunks.iter()
+                .map(|c| c.text.split_whitespace().count())
+                .sum::<usize>() as f32 / self.chunks.len() as f32
+        };
+
+        let k1: f32 = 1.2;
+        let b: f32 = 0.75;
+        let n = self.chunks.len() as f32;
+        let mut score: f32 = 0.0;
+
+        for term in &query_terms {
+            let tf = text.matches(term.as_str()).count() as f32;
+            if tf == 0.0 { continue; }
+            let df = self.chunks.iter()
+                .filter(|c| c.text.to_lowercase().contains(term.as_str()))
+                .count() as f32;
+            let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+            score += idf * (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * doc_len / avg_len));
+        }
+        score
+    }
+
+    /// Search using HNSW graph with hybrid BM25+vector scoring,
+    /// MMR diversity reranking, and hierarchical chunk expansion.
     fn search_local(
         &self,
         query_vec: &[f32],
         limit: usize,
-        _query_hint: &str,
+        query_hint: &str,
     ) -> Vec<(String, String, f32)> {
         if self.chunks.is_empty() { return Vec::new(); }
 
-        if !self.graph.is_empty() && self.graph.len() == self.chunks.len() {
-            // HNSW search path — O(log n), zero-copy vector access
-            let vec_refs: Vec<&[f32]> = self.chunks.iter().map(|c| c.vector.as_slice()).collect();
+        // ── Stage 1: Retrieve 3× candidates for hybrid re-ranking + MMR ──
+        let candidate_limit = limit * 3;
+        let use_hybrid = self.cfg.hybrid_weight_bm25 > 0.0 && !query_hint.is_empty();
+
+        let candidates: Vec<(usize, f32)> = if !self.graph.is_empty()
+            && self.graph.len() == self.chunks.len()
+        {
+            // HNSW search path — O(log n)
+            let vec_refs: Vec<&[f32]> = self.chunks.iter()
+                .map(|c| c.vector.as_slice()).collect();
             let results = self.graph.knn_search(
-                query_vec, limit, self.cfg.hnsw_ef_search, &vec_refs,
+                query_vec, candidate_limit, self.cfg.hnsw_ef_search, &vec_refs,
             );
             results.iter()
-                .map(|dn| {
-                    let c = &self.chunks[dn.id];
-                    (c.source.clone(), c.text.clone(), distance_to_similarity(dn.dist))
-                })
+                .map(|dn| (dn.id, distance_to_similarity(dn.dist)))
                 .collect()
         } else {
-            // Fallback: brute-force (graph missing or stale)
+            // Fallback: brute-force
             eprintln!("[rag] WARN: HNSW graph missing/stale, falling back to brute force");
             let mut scored: Vec<(usize, f32)> = self.chunks.iter().enumerate()
                 .map(|(i, c)| (i, cosine_distance(query_vec, &c.vector)))
                 .collect();
             scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             scored.iter()
-                .take(limit)
-                .map(|(i, d)| {
-                    let c = &self.chunks[*i];
-                    (c.source.clone(), c.text.clone(), distance_to_similarity(*d))
-                })
+                .take(candidate_limit)
+                .map(|(i, d)| (*i, distance_to_similarity(*d)))
                 .collect()
+        };
+
+        // ── Stage 2: Hybrid BM25 re-scoring ──────────────────────────────
+        let mut hybrid_scored: Vec<(usize, f32)> = if use_hybrid {
+            let wv = self.cfg.hybrid_weight_vector;
+            let wb = self.cfg.hybrid_weight_bm25;
+            candidates.iter().map(|(id, vec_sim)| {
+                let bm25_raw = self.bm25_score(query_hint, *id);
+                let bm25_norm = bm25_raw / (bm25_raw + 1.0);
+                let combined = wv * vec_sim + wb * bm25_norm;
+                (*id, combined)
+            }).collect()
+        } else {
+            candidates
+        };
+
+        hybrid_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // ── Stage 3: MMR diversity reranking ─────────────────────────────
+        // score_mmr = λ * relevance − (1−λ) * max_sim_to_already_selected
+        let lambda: f32 = 0.7;
+        let min_sim = self.cfg.min_similarity;
+
+        let mut selected: Vec<(usize, f32)> = Vec::with_capacity(limit);
+        let mut remaining: Vec<(usize, f32)> = hybrid_scored
+            .into_iter()
+            .filter(|(_, sim)| *sim >= min_sim)
+            .collect();
+
+        // First pick: highest relevance
+        if let Some(first) = remaining.first().copied() {
+            selected.push(first);
+            remaining.remove(0);
         }
+
+        // Subsequent picks: balance relevance vs. diversity
+        while selected.len() < limit && !remaining.is_empty() {
+            let mut best_idx = 0;
+            let mut best_mmr = f32::MIN;
+
+            for (i, (chunk_id, relevance)) in remaining.iter().enumerate() {
+                let max_sim_to_sel = selected.iter()
+                    .map(|(sel_id, _)| {
+                        cosine_similarity_vecs(
+                            &self.chunks[*chunk_id].vector,
+                            &self.chunks[*sel_id].vector,
+                        )
+                    })
+                    .fold(f32::MIN, f32::max);
+
+                let mmr = lambda * relevance - (1.0 - lambda) * max_sim_to_sel;
+                if mmr > best_mmr {
+                    best_mmr = mmr;
+                    best_idx = i;
+                }
+            }
+
+            selected.push(remaining.remove(best_idx));
+        }
+
+        // ── Stage 4: Hierarchical expansion ──────────────────────────────
+        // If a file_summary chunk was selected, replace it with top child
+        // chunks from the same file (they carry the actual code).
+        let mut final_results: Vec<(String, String, f32)> = Vec::new();
+
+        for (id, sim) in &selected {
+            let chunk = &self.chunks[*id];
+
+            if chunk.kind == "file_summary" && !chunk.file.is_empty() {
+                let already: HashSet<usize> =
+                    selected.iter().map(|(sid, _)| *sid).collect();
+
+                let mut file_chunks: Vec<(usize, f32)> = self.chunks.iter()
+                    .enumerate()
+                    .filter(|(i, c)| {
+                        c.file == chunk.file
+                            && c.kind != "file_summary"
+                            && !already.contains(i)
+                    })
+                    .map(|(i, c)| {
+                        let vsim = distance_to_similarity(
+                            cosine_distance(query_vec, &c.vector),
+                        );
+                        (i, vsim)
+                    })
+                    .collect();
+
+                file_chunks.sort_by(|a, b| b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal));
+
+                let expand_count = 3.min(limit.saturating_sub(final_results.len()));
+                for (cid, csim) in file_chunks.into_iter().take(expand_count) {
+                    if csim >= min_sim {
+                        let cc = &self.chunks[cid];
+                        final_results.push((cc.source.clone(), cc.text.clone(), csim));
+                    }
+                }
+            } else {
+                final_results.push((chunk.source.clone(), chunk.text.clone(), *sim));
+            }
+        }
+
+        final_results.truncate(limit);
+        final_results
     }
 
     fn clear(&mut self) -> Result<(), String> {
@@ -978,11 +1310,14 @@ impl RagStore {
         Ok(())
     }
 
-    /// Persist index in binary format:
+    /// Persist index in binary format (v2):
+    ///   [u8 x 4  "RAG2" magic]
     ///   [u32 chunk_count] [u32 vector_dim]
     ///   for each chunk:
     ///     [u32 source_len] [source_bytes]
     ///     [u32 text_len] [text_bytes]
+    ///     [u32 kind_len] [kind_bytes]
+    ///     [u32 file_len] [file_bytes]
     ///     [f32 * dim]
     ///   [HNSW graph bytes]
     fn save(&self) -> Result<(), String> {
@@ -992,17 +1327,24 @@ impl RagStore {
         let dim = self.chunks.first().map(|c| c.vector.len()).unwrap_or(0) as u32;
         let count = self.chunks.len() as u32;
 
-        let mut buf = Vec::with_capacity(8 + self.chunks.len() * (8 + 200 + dim as usize * 4));
+        let mut buf = Vec::with_capacity(12 + self.chunks.len() * (16 + 200 + dim as usize * 4));
+        buf.extend_from_slice(b"RAG2");
         buf.extend_from_slice(&count.to_le_bytes());
         buf.extend_from_slice(&dim.to_le_bytes());
 
         for c in &self.chunks {
             let src = c.source.as_bytes();
             let txt = c.text.as_bytes();
+            let knd = c.kind.as_bytes();
+            let fil = c.file.as_bytes();
             buf.extend_from_slice(&(src.len() as u32).to_le_bytes());
             buf.extend_from_slice(src);
             buf.extend_from_slice(&(txt.len() as u32).to_le_bytes());
             buf.extend_from_slice(txt);
+            buf.extend_from_slice(&(knd.len() as u32).to_le_bytes());
+            buf.extend_from_slice(knd);
+            buf.extend_from_slice(&(fil.len() as u32).to_le_bytes());
+            buf.extend_from_slice(fil);
             for &v in &c.vector {
                 buf.extend_from_slice(&v.to_le_bytes());
             }
@@ -1014,17 +1356,23 @@ impl RagStore {
             .map_err(|e| format!("write {}: {e}", self.cfg.db_path))
     }
 
-    /// Load persisted index from disk.
+    /// Load persisted index from disk (v2 format only).
     fn load(&mut self) -> Result<(), String> {
         let path = Path::new(&self.cfg.db_path);
         if !path.exists() { return Ok(()); }
         let data = fs::read(path)
             .map_err(|e| format!("read {}: {e}", self.cfg.db_path))?;
-        if data.len() < 8 { return Ok(()); }
+        if data.len() < 12 { return Ok(()); }
 
-        let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-        let dim = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
-        let mut pos = 8;
+        // Require RAG2 magic header
+        if &data[0..4] != b"RAG2" {
+            eprintln!("[rag] stale v1 index at {} — delete and re-index", self.cfg.db_path);
+            return Ok(());
+        }
+
+        let count = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+        let dim = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+        let mut pos = 12;
 
         self.chunks.clear();
         self.chunks.reserve(count);
@@ -1044,6 +1392,20 @@ impl RagStore {
             let text = String::from_utf8_lossy(&data[pos..pos+txt_len]).to_string();
             pos += txt_len;
 
+            if pos + 4 > data.len() { return Err(format!("truncated at chunk {i} (kind len)")); }
+            let knd_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+            pos += 4;
+            if pos + knd_len > data.len() { return Err(format!("truncated at chunk {i} (kind)")); }
+            let kind = String::from_utf8_lossy(&data[pos..pos+knd_len]).to_string();
+            pos += knd_len;
+
+            if pos + 4 > data.len() { return Err(format!("truncated at chunk {i} (file len)")); }
+            let fil_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+            pos += 4;
+            if pos + fil_len > data.len() { return Err(format!("truncated at chunk {i} (file)")); }
+            let file = String::from_utf8_lossy(&data[pos..pos+fil_len]).to_string();
+            pos += fil_len;
+
             let vec_bytes = dim * 4;
             if pos + vec_bytes > data.len() { return Err(format!("truncated at chunk {i} (vector)")); }
             let vector: Vec<f32> = (0..dim)
@@ -1054,7 +1416,7 @@ impl RagStore {
                 .collect();
             pos += vec_bytes;
 
-            self.chunks.push(VecChunk { text, source, vector });
+            self.chunks.push(VecChunk { text, source, vector, kind, file });
         }
 
         // Load HNSW graph
@@ -1103,6 +1465,12 @@ impl RagStore {
             "vector_dim": self.vector_dim(),
             "files": self.indexed_files,
             "db_path": self.cfg.db_path,
+            "min_similarity": self.cfg.min_similarity,
+            "hybrid": {
+                "vector_weight": self.cfg.hybrid_weight_vector,
+                "bm25_weight": self.cfg.hybrid_weight_bm25,
+            },
+            "chunker_tool": self.cfg.chunker_tool,
             "hnsw": {
                 "nodes": self.graph.len(),
                 "max_level": self.graph.max_level,
@@ -1636,6 +2004,11 @@ fn main() {
         eprintln!("  rag: enabled (db={}, chunk={}/{}, hnsw M={} ef_c={} ef_s={})",
             file_cfg.rag.db_path, file_cfg.rag.chunk_size, file_cfg.rag.chunk_overlap,
             file_cfg.rag.hnsw_m, file_cfg.rag.hnsw_ef_construction, file_cfg.rag.hnsw_ef_search);
+        eprintln!("       min_sim={:.2}, hybrid vec={:.1}/bm25={:.1}, chunker={}",
+            file_cfg.rag.min_similarity,
+            file_cfg.rag.hybrid_weight_vector, file_cfg.rag.hybrid_weight_bm25,
+            if file_cfg.rag.chunker_tool.is_empty() { "internal" }
+            else { &file_cfg.rag.chunker_tool });
     }
 
     let llama_ok = Command::new(&llama_binary)
@@ -2071,20 +2444,56 @@ fn handle_rag_index(st: &Shared, body: &str) -> serde_json::Value {
         return serde_json::json!({"error": "no files to index"});
     }
 
-    // Phase 1: lock briefly to check state and prepare chunks
-    let (embed_ready, endpoint, doc_prefix, all_chunks, all_sources) = {
+    // Phase 1: lock briefly to read config
+    let (embed_ready, endpoint, doc_prefix, chunk_size, chunk_overlap, chunker_tool) = {
         let s = st.lock().unwrap();
         let ready = s.embed.is_ready();
         let ep = s.cfg.embedding_endpoint();
         let pfx = s.cfg.embed.doc_prefix.clone();
-        let (chunks, sources) = s.rag.prepare_chunks(&req.files);
-        (ready, ep, pfx, chunks, sources)
+        let cs = s.rag.cfg.chunk_size;
+        let co = s.rag.cfg.chunk_overlap;
+        let ct = s.rag.cfg.chunker_tool.clone();
+        (ready, ep, pfx, cs, co, ct)
     };
-    // Lock released here — other API calls can proceed
+    // Lock released here
 
     if !embed_ready {
         return serde_json::json!({"error": "embed server not ready — start it from settings"});
     }
+
+    // Phase 1b: chunk files outside the lock (may spawn external process)
+    let (all_chunks, all_sources, all_kinds, all_files) = if let Some(ext_chunks) =
+        try_external_chunker(&chunker_tool, &req.files, chunk_size, chunk_overlap)
+    {
+        let mut chunks = Vec::with_capacity(ext_chunks.len());
+        let mut sources = Vec::with_capacity(ext_chunks.len());
+        let mut kinds = Vec::with_capacity(ext_chunks.len());
+        let mut files = Vec::with_capacity(ext_chunks.len());
+        for (source, text, kind, file) in ext_chunks {
+            sources.push(source);
+            chunks.push(text);
+            kinds.push(kind);
+            files.push(file);
+        }
+        (chunks, sources, kinds, files)
+    } else {
+        // Fallback: internal chunker (lock-free, uses only config values)
+        eprintln!("[rag] using internal fallback chunker");
+        let mut chunks: Vec<String> = Vec::new();
+        let mut sources: Vec<String> = Vec::new();
+        let mut kinds: Vec<String> = Vec::new();
+        let mut files: Vec<String> = Vec::new();
+        for f in &req.files {
+            for (label, text, kind, file) in chunk_code_file(&f.name, &f.content, chunk_size, chunk_overlap) {
+                sources.push(label);
+                chunks.push(text);
+                kinds.push(kind);
+                files.push(file);
+            }
+        }
+        (chunks, sources, kinds, files)
+    };
+
     if all_chunks.is_empty() {
         return serde_json::json!({"error": "no chunks produced from files"});
     }
@@ -2103,7 +2512,7 @@ fn handle_rag_index(st: &Shared, body: &str) -> serde_json::Value {
     // Phase 3: lock briefly to store results
     let file_names: Vec<String> = req.files.iter().map(|f| f.name.clone()).collect();
     let mut s = st.lock().unwrap();
-    match s.rag.store_embeddings(all_chunks, all_sources, vectors, file_names) {
+    match s.rag.store_embeddings(all_chunks, all_sources, vectors, file_names, all_kinds, all_files) {
         Ok(count) => serde_json::json!({
             "ok": true,
             "chunks_indexed": count,
@@ -2341,18 +2750,33 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
     }
 
     let system = if is_review {
+        let rag_note = if rag_chunks_used > 0 {
+            "\nRelevant code from the project has been retrieved and included below. \
+             Reference it directly — quote specific fields, types, and function \
+             signatures when they're relevant to the discussion."
+        } else { "" };
         format!(
-            "You are an expert {} code reviewer and software engineer.\n\
-             Analyze the provided code thoroughly. Discuss:\n\
-             - Correctness and potential bugs\n\
-             - Performance issues and optimization opportunities\n\
-             - Security concerns\n\
-             - Code style and readability\n\
-             - Concrete suggestions for improvement\n\n\
-             Be specific — reference functions, types, and line-level details.\n\
-             Use markdown code fences (```) when showing code snippets.\n\
-             Focus on actionable feedback, not generic advice.",
-            req.language
+            "You are a senior {} engineer in a pair-programming conversation.\n\
+             The user will ask questions, request explanations, or discuss code \
+             they've provided. Respond naturally — like a knowledgeable colleague, \
+             not a report generator.\n\n\
+             Guidelines:\n\
+             - Answer the actual question. Don't run a generic review checklist \
+               unless they specifically ask for a review.\n\
+             - When you reference specific code, show the relevant snippet in a \
+               fenced code block so the user can see exactly what you're talking \
+               about. Pull from the provided code context — don't paraphrase \
+               field names or signatures from memory.\n\
+             - Organize around the concepts the user asked about, not around \
+               categories like \"correctness\" or \"security\".\n\
+             - Be concrete and specific. \"This Vec<Option<CachedShadowTile>> \
+               tracks per-light cache state\" is useful. \"Ensure proper memory \
+               management\" is not.\n\
+             - If the question is broad (\"explain this struct\"), walk through \
+               the logical groups/sections and explain the design — what each \
+               cluster of fields does, how they relate, why they're structured \
+               that way.{}",
+            req.language, rag_note
         )
     } else {
         let rag_note = if rag_chunks_used > 0 {
@@ -2393,7 +2817,7 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
         if ctx_result.context_block.is_empty() {
             req.description.clone()
         } else {
-            format!("{}\n\nCode to review:{}\n", req.description, ctx_result.context_block)
+            format!("{}\n\nCode:{}\n", req.description, ctx_result.context_block)
         }
     } else {
         if ctx_result.context_block.is_empty() {
@@ -2459,6 +2883,7 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
     let reader = BufReader::new(stdout);
     let t0 = Instant::now();
     let mut token_count = 0u64;
+    let mut aborted = false;
 
     for line in reader.lines().flatten() {
         let Some(data) = line.strip_prefix("data: ") else { continue };
@@ -2467,17 +2892,25 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
             if let Some(content) = chunk.choices.first().and_then(|c| c.delta.content.as_deref()) {
                 if !content.is_empty() {
                     token_count += 1;
-                    send_sse(stream, &serde_json::json!({"token": content}));
+                    if !send_sse(stream, &serde_json::json!({"token": content})) {
+                        // Client disconnected (abort) — kill curl to stop generation
+                        eprintln!("[write] client disconnected after {token_count} tokens, killing generation");
+                        let _ = child.kill();
+                        aborted = true;
+                        break;
+                    }
                 }
             }
         }
     }
 
     let elapsed_ms = t0.elapsed().as_millis() as u64;
-    send_sse(stream, &serde_json::json!({
-        "done": true, "tokens": token_count, "elapsed_ms": elapsed_ms,
-        "rag_chunks": rag_chunks_used,
-    }));
+    if !aborted {
+        send_sse(stream, &serde_json::json!({
+            "done": true, "tokens": token_count, "elapsed_ms": elapsed_ms,
+            "rag_chunks": rag_chunks_used,
+        }));
+    }
 
     let _ = fs::remove_file(&tmp);
     let _ = child.wait();
@@ -2487,10 +2920,12 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
     s.requests += 1;
 }
 
-fn send_sse(stream: &mut TcpStream, val: &serde_json::Value) {
+/// Send an SSE event to the client.  Returns `false` if the write fails
+/// (client disconnected), allowing the caller to abort early.
+fn send_sse(stream: &mut TcpStream, val: &serde_json::Value) -> bool {
     let data = serde_json::to_string(val).unwrap_or_default();
-    let _ = write!(stream, "data: {data}\n\n");
-    let _ = stream.flush();
+    if write!(stream, "data: {data}\n\n").is_err() { return false; }
+    stream.flush().is_ok()
 }
 
 fn send_sse_error(stream: &mut TcpStream, msg: &str) {

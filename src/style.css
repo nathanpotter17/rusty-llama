@@ -612,6 +612,38 @@ body {
   cursor: not-allowed;
 }
 
+.abort-btn {
+  background-color: transparent;
+  color: var(--orange);
+  border: 1px solid var(--orange);
+  padding: 7px 16px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-body);
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.abort-btn:hover {
+  background-color: rgba(255, 165, 0, 0.08);
+  color: #ffb347;
+  border-color: #ffb347;
+}
+
+.abort-btn:active {
+  background-color: rgba(255, 165, 0, 0.15);
+}
+
+.abort-btn svg {
+  flex-shrink: 0;
+}
+
 .danger-btn {
   background-color: transparent;
   color: var(--red);

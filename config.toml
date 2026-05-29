@@ -78,6 +78,21 @@ doc_prefix = ""
 # chunk_overlap = overlapping lines between consecutive chunks
 # search_results = number of chunks to retrieve per query
 #
+# min_similarity = cosine similarity threshold (0.0-1.0); chunks
+#   scoring below this are discarded even if they're the "best" match.
+#   Prevents injecting irrelevant context when no good match exists.
+#   Recommended: 0.20-0.35 depending on embedding model.
+#
+# hybrid_weight_vector / hybrid_weight_bm25 = weights for combining
+#   vector cosine similarity and BM25 keyword scoring. Should sum to 1.0.
+#   Set hybrid_weight_bm25 = 0.0 to disable hybrid search.
+#   Typical: 0.7/0.3 (vector-heavy) or 0.5/0.5 (balanced).
+#
+# chunker_tool = path to external chunker script. When set, the indexer
+#   spawns this tool for syntax-aware code chunking (respects function,
+#   struct, impl, class boundaries). Falls back to internal line-window
+#   chunker if the tool is missing or fails. Set to "" to disable.
+#
 # HNSW graph parameters (approximate nearest neighbor search):
 # hnsw_m = max connections per node per layer (layer 0 gets 2×M)
 # hnsw_ef_construction = beam width during index build (higher = better graph, slower build)
@@ -87,10 +102,14 @@ enabled = true
 db_path = "data/rag_index.json"
 chunk_size = 60
 chunk_overlap = 10
-search_results = 3
+search_results = 5
+min_similarity = 0.25
+hybrid_weight_vector = 0.7
+hybrid_weight_bm25 = 0.3
+chunker_tool = "tools/chunker.py"
 hnsw_m = 16
 hnsw_ef_construction = 150
-hnsw_ef_search = 50
+hnsw_ef_search = 64
 
 # ── Models ──────────────────────────────────────────────────
 
