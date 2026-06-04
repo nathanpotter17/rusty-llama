@@ -110,6 +110,9 @@ chunker_tool = "tools/chunker.py"
 hnsw_m = 16
 hnsw_ef_construction = 150
 hnsw_ef_search = 64
+query_expansion = true
+llm_reranking = true
+chunk_compression = true
 
 # ── Models ──────────────────────────────────────────────────
 

@@ -153,6 +153,10 @@ struct RagCfg {
     hybrid_weight_bm25: f32,     // weight for BM25 keyword score in hybrid scoring
     // External chunker tool (empty = use internal chunker only)
     chunker_tool: String,
+    // RAG preprocessing (uses the loaded llama-server for LLM calls)
+    query_expansion: bool,       // rewrite query into search terms before embedding
+    llm_reranking: bool,         // rerank candidates by LLM relevance scoring
+    chunk_compression: bool,     // compress selected chunks into dense summaries
     // HNSW graph parameters
     hnsw_m: usize,               // max connections per node per layer (M0 = 2*M for layer 0)
     hnsw_ef_construction: usize, // beam width during index build
@@ -170,6 +174,9 @@ impl Default for RagCfg {
             hybrid_weight_vector: 0.7,
             hybrid_weight_bm25: 0.3,
             chunker_tool: "tools/chunker.py".into(),
+            query_expansion: true,
+            llm_reranking: true,
+            chunk_compression: false, // expensive, off by default
             hnsw_m: 16,
             hnsw_ef_construction: 150,
             hnsw_ef_search: 64,
@@ -602,6 +609,168 @@ fn parse_single_embedding(resp: &serde_json::Value) -> Result<Vec<f32>, String> 
     let s = resp.to_string();
     Err(format!("no embedding in response: {}", &s[..s.len().min(300)]))
 }
+
+
+// ── RAG preprocessing: query expansion, reranking, compression ──
+
+/// Non-streaming completion call to the loaded llama-server.
+/// Returns the assistant's response text, or an error.
+fn llm_complete(
+    llama_port: u16, system: &str, user: &str, max_tokens: u32,
+) -> Result<String, String> {
+    let body = serde_json::json!({
+        "model": "local",
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "stream": false,
+    });
+    let body_str = body.to_string();
+    let resp_str = http_post_json(
+        "127.0.0.1", llama_port, "/v1/chat/completions", &body_str, 30,
+    )?;
+    let resp: serde_json::Value = serde_json::from_str(&resp_str)
+        .map_err(|e| format!("llm_complete parse: {e}"))?;
+    resp["choices"][0]["message"]["content"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "llm_complete: no content in response".into())
+}
+
+/// Rewrite a user query into dense search terms optimized for embedding retrieval.
+/// Falls back to the raw query on any error.
+fn expand_query(llama_port: u16, raw_query: &str) -> String {
+    let system =
+        "Rewrite the user's code question into a flat list of search keywords \
+         optimized for code retrieval. Include struct names, function names, \
+         type names, field names, and technical concepts. Output ONLY the \
+         keywords separated by spaces — no prose, no bullets, no explanation. \
+         Keep it under 40 words.";
+
+    let t0 = Instant::now();
+    match llm_complete(llama_port, system, raw_query, 80) {
+        Ok(expanded) => {
+            let clean = expanded.trim().to_string();
+            eprintln!(
+                "[rag] query expansion ({:.1}ms): \"{}\" → \"{}\"",
+                t0.elapsed().as_secs_f64() * 1000.0,
+                raw_query,
+                if clean.len() > 80 { &clean[..80] } else { &clean }
+            );
+            // Combine original + expanded for best coverage
+            format!("{} {}", raw_query, clean)
+        }
+        Err(e) => {
+            eprintln!("[rag] query expansion failed ({}), using raw query", e);
+            raw_query.to_string()
+        }
+    }
+}
+
+/// Rerank retrieved chunks by LLM relevance scoring.
+/// Sends chunk headers (not full text) to the model for a batch relevance judgment.
+/// Returns chunks reordered by LLM score (descending), with scores replaced.
+fn rerank_chunks(
+    llama_port: u16,
+    query: &str,
+    chunks: &[(String, String, f32)],
+) -> Vec<(String, String, f32)> {
+    if chunks.is_empty() { return Vec::new(); }
+
+    // Build a compact listing: source + first 3 lines of each chunk
+    let mut listing = String::with_capacity(chunks.len() * 120);
+    for (i, (source, text, _)) in chunks.iter().enumerate() {
+        let preview: String = text.lines()
+            .filter(|l| !l.starts_with("File:") && !l.trim().is_empty())
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n");
+        listing.push_str(&format!("{}. [{}]\n{}\n\n", i + 1, source, preview));
+    }
+
+    let system = format!(
+        "You are a code relevance judge. The user wants to answer this query:\n\
+         \"{}\"\n\n\
+         Rate each numbered code chunk 0-10 for relevance to the query.\n\
+         Output ONLY a JSON array of integers, e.g. [8, 3, 9, ...]\n\
+         Array length must be exactly {}.",
+        query, chunks.len()
+    );
+
+    let t0 = Instant::now();
+    let result = match llm_complete(llama_port, &system, &listing, 200) {
+        Ok(resp) => resp,
+        Err(e) => {
+            eprintln!("[rag] reranking failed ({}), keeping original order", e);
+            return chunks.to_vec();
+        }
+    };
+
+    // Parse the JSON array of scores
+    let clean = result.trim()
+        .trim_start_matches("```json").trim_start_matches("```")
+        .trim_end_matches("```").trim();
+    let scores: Vec<f32> = match serde_json::from_str::<Vec<f32>>(clean) {
+        Ok(s) if s.len() == chunks.len() => s,
+        Ok(s) => {
+            eprintln!(
+                "[rag] reranking returned {} scores for {} chunks, keeping original order",
+                s.len(), chunks.len()
+            );
+            return chunks.to_vec();
+        }
+        Err(e) => {
+            eprintln!("[rag] reranking parse error ({}), response: {}", e,
+                      &clean[..clean.len().min(100)]);
+            return chunks.to_vec();
+        }
+    };
+
+    // Rebuild with LLM scores, sort descending
+    let mut reranked: Vec<(String, String, f32)> = chunks.iter()
+        .zip(scores.iter())
+        .map(|((src, txt, _), &llm_score)| {
+            (src.clone(), txt.clone(), llm_score / 10.0) // normalize to 0..1
+        })
+        .collect();
+    reranked.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    eprintln!(
+        "[rag] reranked {} chunks in {:.1}ms",
+        reranked.len(), t0.elapsed().as_secs_f64() * 1000.0
+    );
+    reranked
+}
+
+/// Compress a code chunk into a dense summary preserving signatures and types.
+/// Falls back to the original text on error.
+fn compress_chunk(llama_port: u16, chunk_text: &str) -> String {
+    let system =
+        "Compress this code into a dense technical summary. \
+         PRESERVE all function signatures, struct/type definitions, field names, \
+         and key logic flow. Remove boilerplate, repetitive error handling, and \
+         obvious code. Output ONLY the compressed version — no commentary.";
+
+    let t0 = Instant::now();
+    match llm_complete(llama_port, system, chunk_text, 300) {
+        Ok(compressed) => {
+            let ratio = compressed.len() as f32 / chunk_text.len().max(1) as f32;
+            eprintln!(
+                "[rag] compressed chunk ({:.0}% of original) in {:.1}ms",
+                ratio * 100.0, t0.elapsed().as_secs_f64() * 1000.0
+            );
+            compressed
+        }
+        Err(e) => {
+            eprintln!("[rag] chunk compression failed ({}), using original", e);
+            chunk_text.to_string()
+        }
+    }
+}
+
 
 // ── RAG: In-memory vector store with HNSW index ────────────
 
@@ -2787,68 +2956,84 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
         rag_tokens: 0,
     };
 
-    // ── RAG retrieval (budget-adaptive) ──────────────────────
+    // ── RAG retrieval (budget-adaptive + LLM preprocessing) ──
     let mut rag_context = String::new();
     let mut rag_chunks_used = 0usize;
     if req.use_rag {
-        let (should_search, endpoint, max_chunks) = {
+        let (should_search, endpoint, max_chunks, do_expand, do_rerank, do_compress) = {
             let s = st.lock().unwrap();
             let ok = !s.rag.chunks.is_empty() && s.rag.cfg.enabled && s.embed.is_ready();
-            (ok, cfg.embedding_endpoint(), s.rag.cfg.search_results)
+            (ok, cfg.embedding_endpoint(), s.rag.cfg.search_results,
+             s.rag.cfg.query_expansion, s.rag.cfg.llm_reranking,
+             s.rag.cfg.chunk_compression)
         };
 
         if should_search {
             const RAG_CANDIDATE_POOL: usize = 30;
 
-            match get_embedding(&endpoint, &req.description, &cfg.embed.query_prefix) {
+            // ── Stage A: Query expansion ─────────────────────────
+            let search_query = if do_expand {
+                expand_query(cfg.llama_port, &req.description)
+            } else {
+                req.description.clone()
+            };
+
+            // ── Stage B: Embed + retrieve ────────────────────────
+            match get_embedding(&endpoint, &search_query, &cfg.embed.query_prefix) {
                 Ok(query_vec) => {
                     let s = st.lock().unwrap();
                     let hits = s.rag.search_local(
-                        &query_vec, RAG_CANDIDATE_POOL, &req.description,
+                        &query_vec, RAG_CANDIDATE_POOL, &search_query,
                     );
                     drop(s);
 
                     if !hits.is_empty() {
+                        // ── Stage C: LLM reranking ───────────────
+                        let ranked = if do_rerank {
+                            rerank_chunks(cfg.llama_port, &req.description, &hits)
+                        } else {
+                            hits
+                        };
+
+                        // ── Stage D: Fill budget (3 stops) ───────
                         let header = "\n--- retrieved context (RAG) ---\n";
                         rag_context.push_str(header);
                         let mut rag_used: u64 = estimate_tokens(header);
-                        let mut selected: Vec<(&String, &String, &f32)> = Vec::new();
+                        let mut selected: Vec<(String, String, f32)> = Vec::new();
 
-                        // Score decay: stop when a chunk's score drops below
-                        // 50% of the best hit.  This is the primary control —
-                        // focused queries get few chunks, broad queries get more,
-                        // and noise never enters regardless of remaining budget.
-                        let top_score = hits[0].2;
+                        let top_score = ranked[0].2;
                         let score_floor = top_score * 0.5;
 
-                        for (source, text, score) in &hits {
-                            // 1. Max chunks — hard latency cap (config: search_results)
+                        for (source, text, score) in &ranked {
                             if selected.len() >= max_chunks {
                                 eprintln!("[rag] stopping: max chunks ({})", max_chunks);
                                 break;
                             }
-
-                            // 2. Score decay — chunk isn't worth including
                             if !selected.is_empty() && *score < score_floor {
                                 eprintln!(
-                                    "[rag] stopping: score {:.4} < floor {:.4} (50% of top {:.4})",
-                                    score, score_floor, top_score
+                                    "[rag] stopping: score {:.4} < floor {:.4}",
+                                    score, score_floor
                                 );
                                 break;
                             }
 
+                            // Optionally compress before measuring cost
+                            let final_text = if do_compress {
+                                compress_chunk(cfg.llama_port, text)
+                            } else {
+                                text.clone()
+                            };
+
                             let chunk_block = format!(
-                                "# {} (score: {:.4})\n{}\n\n", source, score, text
+                                "# {} (score: {:.4})\n{}\n\n", source, score, final_text
                             );
                             let cost = estimate_tokens_lang(&chunk_block, &req.language);
 
-                            // Hard ceiling: don't overflow context
                             if rag_used + cost > context_budget {
                                 if selected.is_empty() {
-                                    // Always include at least one chunk
                                     rag_context.push_str(&chunk_block);
                                     rag_used += cost;
-                                    selected.push((source, text, score));
+                                    selected.push((source.clone(), final_text, *score));
                                 }
                                 eprintln!("[rag] stopping: budget exhausted ({}/{})", rag_used, context_budget);
                                 break;
@@ -2856,7 +3041,7 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
 
                             rag_context.push_str(&chunk_block);
                             rag_used += cost;
-                            selected.push((source, text, score));
+                            selected.push((source.clone(), final_text, *score));
                         }
 
                         budget.rag_tokens = rag_used;
@@ -2865,8 +3050,11 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
                             budget.system_tokens + budget.desc_tokens + rag_used
                         );
                         eprintln!(
-                            "[rag] {} chunks, {} tok, ~{} tok remaining for response",
-                            rag_chunks_used, rag_used, remaining
+                            "[rag] {} chunks, {} tok, ~{} tok remaining for response{}{}{}",
+                            rag_chunks_used, rag_used, remaining,
+                            if do_expand { " [expanded]" } else { "" },
+                            if do_rerank { " [reranked]" } else { "" },
+                            if do_compress { " [compressed]" } else { "" },
                         );
                         send_sse(stream, &serde_json::json!({
                             "rag_info": {
@@ -2876,6 +3064,9 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
                                 "response_budget": remaining,
                                 "top_score": top_score,
                                 "score_floor": score_floor,
+                                "query_expanded": do_expand,
+                                "llm_reranked": do_rerank,
+                                "chunks_compressed": do_compress,
                                 "sources": selected.iter().map(|(s, _, d)| {
                                     serde_json::json!({"source": s, "score": d})
                                 }).collect::<Vec<_>>(),
