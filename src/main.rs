@@ -153,10 +153,6 @@ struct RagCfg {
     hybrid_weight_bm25: f32,     // weight for BM25 keyword score in hybrid scoring
     // External chunker tool (empty = use internal chunker only)
     chunker_tool: String,
-    // RAG preprocessing (uses the loaded llama-server for LLM calls)
-    query_expansion: bool,       // rewrite query into search terms before embedding
-    llm_reranking: bool,         // rerank candidates by LLM relevance scoring
-    chunk_compression: bool,     // compress selected chunks into dense summaries
     // HNSW graph parameters
     hnsw_m: usize,               // max connections per node per layer (M0 = 2*M for layer 0)
     hnsw_ef_construction: usize, // beam width during index build
@@ -169,14 +165,11 @@ impl Default for RagCfg {
             db_path: "data/rag_index.json".into(),
             chunk_size: 60,
             chunk_overlap: 10,
-            search_results: 15,
+            search_results: 5,
             min_similarity: 0.25,
             hybrid_weight_vector: 0.7,
             hybrid_weight_bm25: 0.3,
             chunker_tool: "tools/chunker.py".into(),
-            query_expansion: true,
-            llm_reranking: true,
-            chunk_compression: false, // expensive, off by default
             hnsw_m: 16,
             hnsw_ef_construction: 150,
             hnsw_ef_search: 64,
@@ -241,6 +234,8 @@ struct RuntimeCfg {
     draft_model: String,
     draft_max: u32,
     gpu_layers_draft: i32,
+    threads: usize,           // generation threads, derived from SystemInfo
+    auto_ctx: u32,            // VRAM-derived context default (used when ctx unset)
     // Embed server config (cloned from EmbedCfg)
     embed: EmbedCfg,
 }
@@ -504,11 +499,6 @@ fn try_external_chunker(
     Some(result)
 }
 
-/// Legacy entry point — still called by internal fallback paths.
-fn chunk_code_file(name: &str, content: &str, chunk_size: usize, overlap: usize) -> Vec<(String, String, String, String)> {
-    chunk_code_file_simple(name, content, chunk_size, overlap)
-}
-
 // ── RAG: Embedding via dedicated embed server ───────────────
 
 /// Parse "http://host:port/path" into components.
@@ -609,168 +599,6 @@ fn parse_single_embedding(resp: &serde_json::Value) -> Result<Vec<f32>, String> 
     let s = resp.to_string();
     Err(format!("no embedding in response: {}", &s[..s.len().min(300)]))
 }
-
-
-// ── RAG preprocessing: query expansion, reranking, compression ──
-
-/// Non-streaming completion call to the loaded llama-server.
-/// Returns the assistant's response text, or an error.
-fn llm_complete(
-    llama_port: u16, system: &str, user: &str, max_tokens: u32,
-) -> Result<String, String> {
-    let body = serde_json::json!({
-        "model": "local",
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": 0.0,
-        "stream": false,
-    });
-    let body_str = body.to_string();
-    let resp_str = http_post_json(
-        "127.0.0.1", llama_port, "/v1/chat/completions", &body_str, 30,
-    )?;
-    let resp: serde_json::Value = serde_json::from_str(&resp_str)
-        .map_err(|e| format!("llm_complete parse: {e}"))?;
-    resp["choices"][0]["message"]["content"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| "llm_complete: no content in response".into())
-}
-
-/// Rewrite a user query into dense search terms optimized for embedding retrieval.
-/// Falls back to the raw query on any error.
-fn expand_query(llama_port: u16, raw_query: &str) -> String {
-    let system =
-        "Rewrite the user's code question into a flat list of search keywords \
-         optimized for code retrieval. Include struct names, function names, \
-         type names, field names, and technical concepts. Output ONLY the \
-         keywords separated by spaces — no prose, no bullets, no explanation. \
-         Keep it under 40 words.";
-
-    let t0 = Instant::now();
-    match llm_complete(llama_port, system, raw_query, 80) {
-        Ok(expanded) => {
-            let clean = expanded.trim().to_string();
-            eprintln!(
-                "[rag] query expansion ({:.1}ms): \"{}\" → \"{}\"",
-                t0.elapsed().as_secs_f64() * 1000.0,
-                raw_query,
-                if clean.len() > 80 { &clean[..80] } else { &clean }
-            );
-            // Combine original + expanded for best coverage
-            format!("{} {}", raw_query, clean)
-        }
-        Err(e) => {
-            eprintln!("[rag] query expansion failed ({}), using raw query", e);
-            raw_query.to_string()
-        }
-    }
-}
-
-/// Rerank retrieved chunks by LLM relevance scoring.
-/// Sends chunk headers (not full text) to the model for a batch relevance judgment.
-/// Returns chunks reordered by LLM score (descending), with scores replaced.
-fn rerank_chunks(
-    llama_port: u16,
-    query: &str,
-    chunks: &[(String, String, f32)],
-) -> Vec<(String, String, f32)> {
-    if chunks.is_empty() { return Vec::new(); }
-
-    // Build a compact listing: source + first 3 lines of each chunk
-    let mut listing = String::with_capacity(chunks.len() * 120);
-    for (i, (source, text, _)) in chunks.iter().enumerate() {
-        let preview: String = text.lines()
-            .filter(|l| !l.starts_with("File:") && !l.trim().is_empty())
-            .take(3)
-            .collect::<Vec<_>>()
-            .join("\n");
-        listing.push_str(&format!("{}. [{}]\n{}\n\n", i + 1, source, preview));
-    }
-
-    let system = format!(
-        "You are a code relevance judge. The user wants to answer this query:\n\
-         \"{}\"\n\n\
-         Rate each numbered code chunk 0-10 for relevance to the query.\n\
-         Output ONLY a JSON array of integers, e.g. [8, 3, 9, ...]\n\
-         Array length must be exactly {}.",
-        query, chunks.len()
-    );
-
-    let t0 = Instant::now();
-    let result = match llm_complete(llama_port, &system, &listing, 200) {
-        Ok(resp) => resp,
-        Err(e) => {
-            eprintln!("[rag] reranking failed ({}), keeping original order", e);
-            return chunks.to_vec();
-        }
-    };
-
-    // Parse the JSON array of scores
-    let clean = result.trim()
-        .trim_start_matches("```json").trim_start_matches("```")
-        .trim_end_matches("```").trim();
-    let scores: Vec<f32> = match serde_json::from_str::<Vec<f32>>(clean) {
-        Ok(s) if s.len() == chunks.len() => s,
-        Ok(s) => {
-            eprintln!(
-                "[rag] reranking returned {} scores for {} chunks, keeping original order",
-                s.len(), chunks.len()
-            );
-            return chunks.to_vec();
-        }
-        Err(e) => {
-            eprintln!("[rag] reranking parse error ({}), response: {}", e,
-                      &clean[..clean.len().min(100)]);
-            return chunks.to_vec();
-        }
-    };
-
-    // Rebuild with LLM scores, sort descending
-    let mut reranked: Vec<(String, String, f32)> = chunks.iter()
-        .zip(scores.iter())
-        .map(|((src, txt, _), &llm_score)| {
-            (src.clone(), txt.clone(), llm_score / 10.0) // normalize to 0..1
-        })
-        .collect();
-    reranked.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-
-    eprintln!(
-        "[rag] reranked {} chunks in {:.1}ms",
-        reranked.len(), t0.elapsed().as_secs_f64() * 1000.0
-    );
-    reranked
-}
-
-/// Compress a code chunk into a dense summary preserving signatures and types.
-/// Falls back to the original text on error.
-fn compress_chunk(llama_port: u16, chunk_text: &str) -> String {
-    let system =
-        "Compress this code into a dense technical summary. \
-         PRESERVE all function signatures, struct/type definitions, field names, \
-         and key logic flow. Remove boilerplate, repetitive error handling, and \
-         obvious code. Output ONLY the compressed version — no commentary.";
-
-    let t0 = Instant::now();
-    match llm_complete(llama_port, system, chunk_text, 300) {
-        Ok(compressed) => {
-            let ratio = compressed.len() as f32 / chunk_text.len().max(1) as f32;
-            eprintln!(
-                "[rag] compressed chunk ({:.0}% of original) in {:.1}ms",
-                ratio * 100.0, t0.elapsed().as_secs_f64() * 1000.0
-            );
-            compressed
-        }
-        Err(e) => {
-            eprintln!("[rag] chunk compression failed ({}), using original", e);
-            chunk_text.to_string()
-        }
-    }
-}
-
 
 // ── RAG: In-memory vector store with HNSW index ────────────
 
@@ -1215,27 +1043,6 @@ impl RagStore {
         store
     }
 
-    /// Prepare chunks from files (no network, safe to call under lock).
-    fn prepare_chunks(&self, files: &[FileEntry]) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
-        let mut all_chunks: Vec<String> = Vec::new();
-        let mut all_sources: Vec<String> = Vec::new();
-        let mut all_kinds: Vec<String> = Vec::new();
-        let mut all_files: Vec<String> = Vec::new();
-        for f in files {
-            let chunks = chunk_code_file(
-                &f.name, &f.content,
-                self.cfg.chunk_size, self.cfg.chunk_overlap,
-            );
-            for (label, text, kind, file) in chunks {
-                all_sources.push(label);
-                all_chunks.push(text);
-                all_kinds.push(kind);
-                all_files.push(file);
-            }
-        }
-        (all_chunks, all_sources, all_kinds, all_files)
-    }
-
     /// Store pre-computed embeddings and build the HNSW graph.
     fn store_embeddings(
         &mut self,
@@ -1651,273 +1458,275 @@ impl RagStore {
     }
 }
 
-// ── Embedding server (second llama-server process) ──────────
+// ── Managed llama-server process (generation + embedding) ───
+//
+// One process-manager type for both roles. `kind` selects the log
+// prefix ("llama" | "embed"); role-specific launch flags are built by
+// the free `llama_args` / `embed_args` functions. The old split
+// EmbedServer / LlamaServer types (near-identical wait/stop/poll logic)
+// are deleted — this is the single production implementation.
 
-struct EmbedServer {
+#[derive(Clone, Debug, PartialEq)]
+enum ServerStatus { Stopped, Starting, Ready, Error(String) }
+
+/// Result of a single non-blocking readiness check.
+enum PollOutcome { Pending, Ready, Dead(String) }
+
+struct ManagedServer {
+    kind: &'static str,
     child: Option<Child>,
-    status: LlamaStatus,
+    status: ServerStatus,
     model: String,
     pid: Option<u32>,
     port: u16,
 }
 
-impl EmbedServer {
-    fn new(port: u16) -> Self {
-        Self { child: None, status: LlamaStatus::Stopped, model: String::new(), pid: None, port }
+impl ManagedServer {
+    fn new(kind: &'static str, port: u16) -> Self {
+        Self { kind, child: None, status: ServerStatus::Stopped, model: String::new(), pid: None, port }
     }
 
-    fn start(&mut self, binary: &str, model_path: &str, model_name: &str, cfg: &EmbedCfg) -> Result<(), String> {
+    /// Spawn `binary args`, replacing any existing child. stderr is
+    /// inherited (not piped-and-unread — an unread pipe can deadlock the
+    /// child once its buffer fills).
+    fn spawn(&mut self, binary: &str, args: &[String], model: &str, port: u16) -> Result<(), String> {
         self.stop();
-        let ngl = if cfg.gpu_layers < 0 { 99 } else { cfg.gpu_layers };
-        eprintln!("[embed] starting {} (ngl={ngl}, ctx={}, port={})", model_name, cfg.context_size, cfg.port);
-
-        let ctx_str = cfg.context_size.to_string();
-        let port_str = cfg.port.to_string();
-        let ngl_str = ngl.to_string();
-        let slots_str = cfg.parallel_slots.to_string();
-
-        let mut args = vec![
-            "-m", model_path,
-            "--port", &port_str,
-            "-ngl", &ngl_str,
-            "-c", &ctx_str,
-            "-ub", &ctx_str,
-            "-np", &slots_str,
-            "--host", "127.0.0.1",
-            "--embedding",
-        ];
-
-        if !cfg.pooling.is_empty() {
-            args.push("--pooling");
-            args.push(&cfg.pooling);
-        }
-
         let child = Command::new(binary)
-            .args(&args)
+            .args(args)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|e| format!("spawn embed: {e}"))?;
-
+            .map_err(|e| format!("spawn {}: {e}", self.kind))?;
         self.pid = Some(child.id());
         self.child = Some(child);
-        self.status = LlamaStatus::Starting;
-        self.model = model_name.to_string();
-        self.port = cfg.port;
+        self.status = ServerStatus::Starting;
+        self.model = model.to_string();
+        self.port = port;
         Ok(())
     }
 
+    /// One non-blocking readiness probe: reap the child if it died,
+    /// otherwise health-check the port. Does not sleep or mutate status.
+    fn poll_once(&mut self) -> PollOutcome {
+        match self.child.as_mut().map(|c| c.try_wait()) {
+            None => return PollOutcome::Dead("process gone".into()),
+            Some(Ok(Some(code))) => { self.child = None; return PollOutcome::Dead(format!("exited: {code}")); }
+            Some(Err(e)) => return PollOutcome::Dead(format!("wait: {e}")),
+            Some(Ok(None)) => {}
+        }
+        if check_health(self.port) { PollOutcome::Ready } else { PollOutcome::Pending }
+    }
+
+    /// Block up to `timeout_secs` for readiness. Used on the boot path
+    /// where blocking is acceptable. Sets `status` to Ready/Error.
     fn wait_ready(&mut self, timeout_secs: u64) -> bool {
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-        std::thread::sleep(Duration::from_millis(400));
-
+        std::thread::sleep(Duration::from_millis(500));
         while Instant::now() < deadline {
-            if let Some(ref mut c) = self.child {
-                match c.try_wait() {
-                    Ok(Some(st)) => {
-                        self.status = LlamaStatus::Error(format!("exited: {st}"));
-                        self.child = None;
-                        return false;
-                    }
-                    Err(e) => {
-                        self.status = LlamaStatus::Error(format!("wait: {e}"));
-                        return false;
-                    }
-                    Ok(None) => {}
+            match self.poll_once() {
+                PollOutcome::Ready => {
+                    self.status = ServerStatus::Ready;
+                    eprintln!("[{}] ready (pid {:?})", self.kind, self.pid);
+                    return true;
                 }
-            } else {
-                self.status = LlamaStatus::Error("process gone".into());
-                return false;
+                PollOutcome::Dead(e) => { self.status = ServerStatus::Error(e); return false; }
+                PollOutcome::Pending => std::thread::sleep(Duration::from_millis(700)),
             }
-
-            if check_health(self.port) {
-                eprintln!("[embed] ready (pid {:?})", self.pid);
-                self.status = LlamaStatus::Ready;
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(600));
         }
-        self.status = LlamaStatus::Error(format!("timeout ({timeout_secs}s)"));
+        self.status = ServerStatus::Error(format!("timeout ({timeout_secs}s)"));
         false
     }
 
     fn stop(&mut self) {
         if let Some(mut c) = self.child.take() {
-            eprintln!("[embed] killing pid {:?}", self.pid);
+            eprintln!("[{}] killing pid {:?}", self.kind, self.pid);
             let _ = c.kill();
             let _ = c.wait();
         }
-        self.status = LlamaStatus::Stopped;
+        self.status = ServerStatus::Stopped;
         self.model.clear();
         self.pid = None;
     }
 
-    fn is_ready(&self) -> bool { self.status == LlamaStatus::Ready }
+    fn is_ready(&self) -> bool { self.status == ServerStatus::Ready }
+
+    /// True while a start is in flight or already serving — used to avoid
+    /// a duplicate spawn when two requests race to lazy-load.
+    fn is_active(&self) -> bool {
+        matches!(self.status, ServerStatus::Ready | ServerStatus::Starting)
+    }
 
     fn status_json(&self) -> serde_json::Value {
         serde_json::json!({
             "status": match &self.status {
-                LlamaStatus::Stopped => "stopped",
-                LlamaStatus::Starting => "starting",
-                LlamaStatus::Ready => "ready",
-                LlamaStatus::Error(_) => "error",
+                ServerStatus::Stopped => "stopped",
+                ServerStatus::Starting => "starting",
+                ServerStatus::Ready => "ready",
+                ServerStatus::Error(_) => "error",
             },
             "model": self.model,
             "pid": self.pid,
             "port": self.port,
             "error": match &self.status {
-                LlamaStatus::Error(e) => Some(e.as_str()),
+                ServerStatus::Error(e) => Some(e.as_str()),
                 _ => None,
             },
         })
     }
 }
 
-impl Drop for EmbedServer {
+impl Drop for ManagedServer {
     fn drop(&mut self) { self.stop(); }
 }
 
-// ── Main llama server management ────────────────────────────
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum LlamaStatus { Stopped, Starting, Ready, Error(String) }
-
-struct LlamaServer {
-    child: Option<Child>,
-    status: LlamaStatus,
-    model: String,
-    pid: Option<u32>,
+/// Launch flags for the main generation server.
+fn llama_args(cfg: &RuntimeCfg, model: &Model) -> Vec<String> {
+    let ngl = if cfg.ngl < 0 { 99 } else { cfg.ngl };
+    let fa = if cfg.flash_attn { "on" } else { "auto" };
+    let mut args = vec![
+        "-m".into(), model.path.clone(),
+        "--port".into(), cfg.llama_port.to_string(),
+        "-ngl".into(), ngl.to_string(),
+        "-c".into(), cfg.ctx.to_string(),
+        "-np".into(), cfg.parallel_slots.to_string(),
+        "--threads".into(), cfg.threads.to_string(),
+        "--host".into(), "127.0.0.1".into(),
+        "--flash-attn".into(), fa.into(),
+    ];
+    // No --embedding here: embeddings run in a dedicated ManagedServer so
+    // the main model keeps maximum KV cache for generation.
+    if !cfg.cache_type_k.is_empty() { args.extend(["--cache-type-k".into(), cfg.cache_type_k.clone()]); }
+    if !cfg.cache_type_v.is_empty() { args.extend(["--cache-type-v".into(), cfg.cache_type_v.clone()]); }
+    if !cfg.draft_model.is_empty() {
+        let draft_path = format!("{}/{}", cfg.models_dir, cfg.draft_model);
+        if Path::new(&draft_path).exists() {
+            let draft_ngl = if cfg.gpu_layers_draft < 0 { 99 } else { cfg.gpu_layers_draft };
+            eprintln!("[llama]   draft={} (ngl={draft_ngl}, max={})", cfg.draft_model, cfg.draft_max);
+            args.extend([
+                "--model-draft".into(), draft_path,
+                "--gpu-layers-draft".into(), draft_ngl.to_string(),
+                "--draft-max".into(), cfg.draft_max.max(2).to_string(),
+            ]);
+        } else {
+            eprintln!("[llama]   WARNING: draft model '{}' not found", draft_path);
+        }
+    }
+    args
 }
 
-impl LlamaServer {
-    fn new() -> Self {
-        Self { child: None, status: LlamaStatus::Stopped, model: String::new(), pid: None }
-    }
+/// Launch flags for the dedicated embedding server.
+fn embed_args(model_path: &str, cfg: &EmbedCfg) -> Vec<String> {
+    let ngl = if cfg.gpu_layers < 0 { 99 } else { cfg.gpu_layers };
+    let ctx = cfg.context_size.to_string();
+    let mut args = vec![
+        "-m".into(), model_path.to_string(),
+        "--port".into(), cfg.port.to_string(),
+        "-ngl".into(), ngl.to_string(),
+        "-c".into(), ctx.clone(),
+        "-ub".into(), ctx,
+        "-np".into(), cfg.parallel_slots.to_string(),
+        "--host".into(), "127.0.0.1".into(),
+        "--embedding".into(),
+    ];
+    if !cfg.pooling.is_empty() { args.extend(["--pooling".into(), cfg.pooling.clone()]); }
+    args
+}
 
-    fn start(&mut self, cfg: &RuntimeCfg, model: &Model) -> Result<(), String> {
-        self.stop();
-        let ngl = if cfg.ngl < 0 { 99 } else { cfg.ngl };
-        let fa = if cfg.flash_attn { "on" } else { "auto" };
-        eprintln!("[llama] starting {} (ngl={ngl}, ctx={}, fa={fa})", model.name, cfg.ctx);
+/// Selects which managed server a background poller operates on.
+#[derive(Clone, Copy)]
+enum Which { Llama, Embed }
 
-        let mut args = vec![
-            "-m".into(), model.path.clone(),
-            "--port".into(), cfg.llama_port.to_string(),
-            "-ngl".into(), ngl.to_string(),
-            "-c".into(), cfg.ctx.to_string(),
-            "-np".into(), cfg.parallel_slots.to_string(),
-            "--host".into(), "127.0.0.1".into(),
-            "--flash-attn".into(), fa.into(),
-        ];
-
-        // NOTE: No --embedding here. Embeddings are handled by the
-        // dedicated EmbedServer process so the main model stays
-        // focused on generation with maximum KV cache available.
-
-        if !cfg.cache_type_k.is_empty() {
-            args.extend(["--cache-type-k".into(), cfg.cache_type_k.clone()]);
-        }
-        if !cfg.cache_type_v.is_empty() {
-            args.extend(["--cache-type-v".into(), cfg.cache_type_v.clone()]);
-        }
-
-        if !cfg.draft_model.is_empty() {
-            let draft_path = format!("{}/{}", cfg.models_dir, cfg.draft_model);
-            if Path::new(&draft_path).exists() {
-                let draft_ngl = if cfg.gpu_layers_draft < 0 { 99 } else { cfg.gpu_layers_draft };
-                eprintln!("[llama]   draft={} (ngl={draft_ngl}, max={})", cfg.draft_model, cfg.draft_max);
-                args.extend([
-                    "--model-draft".into(), draft_path,
-                    "--gpu-layers-draft".into(), draft_ngl.to_string(),
-                    "--draft-max".into(), cfg.draft_max.max(2).to_string(),
-                ]);
-            } else {
-                eprintln!("[llama]   WARNING: draft model '{}' not found", draft_path);
-            }
-        }
-
-        let child = Command::new(&cfg.llama_binary)
-            .args(&args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("spawn failed: {e}"))?;
-
-        self.pid = Some(child.id());
-        self.child = Some(child);
-        self.status = LlamaStatus::Starting;
-        self.model = model.filename.clone();
-        Ok(())
-    }
-
-    fn wait_ready(&mut self, port: u16, timeout_secs: u64) -> bool {
+/// Background readiness poll — updates `State` under short locks so other
+/// requests aren't blocked while a server warms up. Shared by /api/load
+/// and /api/embed/start.
+fn spawn_ready_poll(st: &Shared, which: Which, timeout_secs: u64) {
+    let bg = Arc::clone(st);
+    std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
         std::thread::sleep(Duration::from_millis(500));
-
-        while Instant::now() < deadline {
-            if let Some(ref mut c) = self.child {
-                match c.try_wait() {
-                    Ok(Some(st)) => {
-                        self.status = LlamaStatus::Error(format!("exited: {st}"));
-                        self.child = None;
-                        return false;
-                    }
-                    Err(e) => {
-                        self.status = LlamaStatus::Error(format!("wait: {e}"));
-                        return false;
-                    }
-                    Ok(None) => {}
+        loop {
+            if Instant::now() >= deadline {
+                bg.lock().unwrap().server_mut(which).status =
+                    ServerStatus::Error(format!("timeout ({timeout_secs}s)"));
+                return;
+            }
+            let outcome = bg.lock().unwrap().server_mut(which).poll_once();
+            match outcome {
+                PollOutcome::Ready => {
+                    let mut s = bg.lock().unwrap();
+                    let srv = s.server_mut(which);
+                    srv.status = ServerStatus::Ready;
+                    eprintln!("[{}] ready (pid {:?})", srv.kind, srv.pid);
+                    return;
                 }
-            } else {
-                self.status = LlamaStatus::Error("process gone".into());
-                return false;
+                PollOutcome::Dead(e) => {
+                    bg.lock().unwrap().server_mut(which).status = ServerStatus::Error(e);
+                    return;
+                }
+                PollOutcome::Pending => std::thread::sleep(Duration::from_millis(700)),
             }
-
-            if check_health(port) {
-                eprintln!("[llama] ready (pid {:?})", self.pid);
-                self.status = LlamaStatus::Ready;
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(800));
         }
-        self.status = LlamaStatus::Error(format!("timeout ({timeout_secs}s)"));
-        false
-    }
-
-    fn stop(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            eprintln!("[llama] killing pid {:?}", self.pid);
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-        self.status = LlamaStatus::Stopped;
-        self.model.clear();
-        self.pid = None;
-    }
-
-    fn is_ready(&self) -> bool { self.status == LlamaStatus::Ready }
-
-    fn status_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "status": match &self.status {
-                LlamaStatus::Stopped => "stopped",
-                LlamaStatus::Starting => "starting",
-                LlamaStatus::Ready => "ready",
-                LlamaStatus::Error(_) => "error",
-            },
-            "model": self.model,
-            "pid": self.pid,
-            "error": match &self.status {
-                LlamaStatus::Error(e) => Some(e.as_str()),
-                _ => None,
-            },
-        })
-    }
+    });
 }
 
-impl Drop for LlamaServer {
-    fn drop(&mut self) { self.stop(); }
+/// Lazy-start the embed server on first RAG use and block until ready.
+/// Idempotent and race-safe: if another request already started it, this
+/// only waits. Never holds the state lock across sleeps / health checks.
+fn ensure_embed_ready(st: &Shared) -> Result<(), String> {
+    // Fast path + config validation.
+    {
+        let s = st.lock().unwrap();
+        if s.embed.is_ready() { return Ok(()); }
+        if !s.cfg.embed.enabled || s.cfg.embed.model.is_empty() {
+            return Err("embed server not configured — set [embed] model in config.toml".into());
+        }
+    }
+
+    let (binary, model_path, model_name, embed_cfg, timeout) = {
+        let s = st.lock().unwrap();
+        let path = format!("{}/{}", s.cfg.models_dir, s.cfg.embed.model);
+        (s.cfg.llama_binary.clone(), path, s.cfg.embed.model.clone(),
+         s.cfg.embed.clone(), s.cfg.embed.startup_timeout)
+    };
+    if !Path::new(&model_path).exists() {
+        return Err(format!("embed model '{model_path}' not found"));
+    }
+
+    // Spawn under a brief lock — but only if nobody else owns the start.
+    {
+        let mut s = st.lock().unwrap();
+        if !s.embed.is_active() {
+            let ngl = if embed_cfg.gpu_layers < 0 { 99 } else { embed_cfg.gpu_layers };
+            eprintln!("[embed] lazy-starting {} (ngl={ngl}, ctx={}, port={})",
+                model_name, embed_cfg.context_size, embed_cfg.port);
+            let args = embed_args(&model_path, &embed_cfg);
+            s.embed.spawn(&binary, &args, &model_name, embed_cfg.port)?;
+        }
+    }
+
+    // Wait for readiness with short status-update locks.
+    let deadline = Instant::now() + Duration::from_secs(timeout);
+    std::thread::sleep(Duration::from_millis(400));
+    loop {
+        if Instant::now() >= deadline {
+            st.lock().unwrap().embed.status = ServerStatus::Error(format!("timeout ({timeout}s)"));
+            return Err(format!("embed server timeout ({timeout}s)"));
+        }
+        let outcome = st.lock().unwrap().embed.poll_once();
+        match outcome {
+            PollOutcome::Ready => {
+                let mut s = st.lock().unwrap();
+                s.embed.status = ServerStatus::Ready;
+                eprintln!("[embed] ready (pid {:?})", s.embed.pid);
+                return Ok(());
+            }
+            PollOutcome::Dead(e) => {
+                st.lock().unwrap().embed.status = ServerStatus::Error(e.clone());
+                return Err(format!("embed server failed: {e}"));
+            }
+            PollOutcome::Pending => std::thread::sleep(Duration::from_millis(500)),
+        }
+    }
 }
 
 fn curl_cmd() -> &'static str {
@@ -2036,16 +1845,145 @@ fn find_llama_binary(models_dir: &str) -> String {
     "llama-server".into()
 }
 
+// ── System info probe ───────────────────────────────────────
+//
+// Read the host once at boot so context window + thread count are set
+// from real hardware instead of blind constants. VRAM is the governing
+// constraint for a GPU-offloaded model, so it drives the context ceiling
+// used when no explicit ctx is configured.
+
+struct GpuInfo { name: String, total_mib: u64, free_mib: u64 }
+
+struct SystemInfo {
+    cpu_threads: usize,
+    ram_total_mib: u64,
+    ram_free_mib: u64,
+    gpus: Vec<GpuInfo>,
+}
+
+impl SystemInfo {
+    fn probe() -> Self {
+        let cpu_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let (ram_total_mib, ram_free_mib) = probe_ram();
+        Self { cpu_threads, ram_total_mib, ram_free_mib, gpus: probe_gpus() }
+    }
+
+    /// Largest free-VRAM pool across detected GPUs (None => CPU-only host).
+    fn free_vram_mib(&self) -> Option<u64> { self.gpus.iter().map(|g| g.free_mib).max() }
+
+    /// Generation thread count: half the logical CPUs (accounts for SMT),
+    /// clamped so we neither starve the HTTP server nor oversubscribe.
+    fn gen_threads(&self) -> usize { (self.cpu_threads / 2).clamp(4, 16) }
+
+    fn print(&self) {
+        eprintln!("  system: {} logical CPUs, RAM {} / {} MiB free",
+            self.cpu_threads, self.ram_free_mib, self.ram_total_mib);
+        if self.gpus.is_empty() {
+            eprintln!("  gpu: none detected (nvidia-smi unavailable) — CPU inference");
+        } else {
+            for g in &self.gpus {
+                eprintln!("  gpu: {} — {} / {} MiB free", g.name, g.free_mib, g.total_mib);
+            }
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "cpu_threads": self.cpu_threads,
+            "gen_threads": self.gen_threads(),
+            "ram_total_mib": self.ram_total_mib,
+            "ram_free_mib": self.ram_free_mib,
+            "gpus": self.gpus.iter().map(|g| serde_json::json!({
+                "name": g.name, "total_mib": g.total_mib, "free_mib": g.free_mib,
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// Context ceiling derived from free VRAM. Heuristic, tuned for a 4-7B
+/// Q4/Q5 model with quantized (q8_0) KV cache. Only applied when no
+/// explicit ctx is configured — an explicit per-model ctx is always
+/// honored, never silently clamped.
+fn vram_ctx_ceiling(free_vram_mib: Option<u64>) -> u32 {
+    match free_vram_mib {
+        Some(v) if v >= 20000 => 65536,
+        Some(v) if v >= 12000 => 32768,
+        Some(v) if v >=  8000 => 16384,
+        Some(v) if v >=  5000 => 8192,
+        Some(v) if v >=  3000 => 4096,
+        Some(_)               => 2048,
+        None                  => 8192, // CPU / unknown host: modest default
+    }
+}
+
+fn probe_gpus() -> Vec<GpuInfo> {
+    let Ok(out) = Command::new("nvidia-smi")
+        .args(["--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"])
+        .stderr(Stdio::null())
+        .output()
+    else { return Vec::new(); };
+    if !out.status.success() { return Vec::new(); }
+    String::from_utf8_lossy(&out.stdout).lines().filter_map(|line| {
+        let mut it = line.split(',').map(|s| s.trim());
+        Some(GpuInfo {
+            name: it.next()?.to_string(),
+            total_mib: it.next()?.parse().ok()?,
+            free_mib: it.next()?.parse().ok()?,
+        })
+    }).collect()
+}
+
+#[cfg(target_os = "linux")]
+fn probe_ram() -> (u64, u64) {
+    let Ok(txt) = fs::read_to_string("/proc/meminfo") else { return (0, 0); };
+    let field = |key: &str| txt.lines()
+        .find_map(|l| l.strip_prefix(key))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    (field("MemTotal:") / 1024, field("MemAvailable:") / 1024)
+}
+
+#[cfg(windows)]
+fn probe_ram() -> (u64, u64) {
+    // Win32_OperatingSystem reports KiB.
+    let Ok(out) = Command::new("powershell")
+        .args([
+            "-NoProfile", "-Command",
+            "$m=Get-CimInstance Win32_OperatingSystem; \
+             \"$($m.TotalVisibleMemorySize) $($m.FreePhysicalMemory)\"",
+        ])
+        .stderr(Stdio::null())
+        .output()
+    else { return (0, 0); };
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut it = s.split_whitespace().filter_map(|n| n.parse::<u64>().ok());
+    (it.next().unwrap_or(0) / 1024, it.next().unwrap_or(0) / 1024)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn probe_ram() -> (u64, u64) { (0, 0) }
+
 // ── Shared state ────────────────────────────────────────────
 
 struct State {
     cfg: RuntimeCfg,
     models: Vec<Model>,
-    llama: LlamaServer,
-    embed: EmbedServer,
+    llama: ManagedServer,
+    embed: ManagedServer,
     rag: RagStore,
+    sys_info: serde_json::Value,
     tokens_session: u64,
     requests: u64,
+}
+
+impl State {
+    fn server_mut(&mut self, which: Which) -> &mut ManagedServer {
+        match which {
+            Which::Llama => &mut self.llama,
+            Which::Embed => &mut self.embed,
+        }
+    }
 }
 
 type Shared = Arc<Mutex<State>>;
@@ -2067,8 +2005,6 @@ struct WriteReq {
     language: String,
     #[serde(default = "def_mode")]
     mode: String,
-    #[serde(default)]
-    context: String,
     #[serde(default)]
     files: Vec<FileEntry>,
     #[serde(default)]
@@ -2187,6 +2123,14 @@ fn main() {
         eprintln!("  WARNING: '{llama_binary}' not found or not executable");
     }
 
+    // Read the host once; drives thread count and the auto context default.
+    let sys = SystemInfo::probe();
+    sys.print();
+    let auto_ctx = vram_ctx_ceiling(sys.free_vram_mib());
+    if file_cfg.defaults.context_size == 0 {
+        eprintln!("  auto ctx: {auto_ctx} (from free VRAM); threads: {}", sys.gen_threads());
+    }
+
     let mut cfg = RuntimeCfg {
         port: file_cfg.server.port,
         llama_binary,
@@ -2198,7 +2142,7 @@ fn main() {
         models_dir: file_cfg.defaults.models_dir.clone(),
         active_model: String::new(),
         ngl: file_cfg.defaults.gpu_layers,
-        ctx: if file_cfg.defaults.context_size > 0 { file_cfg.defaults.context_size } else { 4096 },
+        ctx: if file_cfg.defaults.context_size > 0 { file_cfg.defaults.context_size } else { auto_ctx },
         flash_attn: file_cfg.defaults.flash_attention,
         temp: file_cfg.defaults.temperature,
         top_k: file_cfg.defaults.top_k,
@@ -2209,13 +2153,17 @@ fn main() {
         draft_model: file_cfg.defaults.draft_model.clone(),
         draft_max: file_cfg.defaults.draft_max,
         gpu_layers_draft: file_cfg.defaults.gpu_layers_draft,
+        threads: sys.gen_threads(),
+        auto_ctx,
         embed: file_cfg.embed.clone(),
     };
 
-    let mut llama = LlamaServer::new();
-    let mut embed = EmbedServer::new(file_cfg.embed.port);
+    let mut llama = ManagedServer::new("llama", cfg.llama_port);
+    let embed = ManagedServer::new("embed", file_cfg.embed.port);
 
-    // Auto-load main model
+    // Auto-load main model. The embed server is NOT started here — it is
+    // lazy-loaded on first RAG use (indexing or a retrieval-backed request)
+    // so a review-only session never pays its VRAM/startup cost.
     if !models.is_empty() && llama_ok {
         let target = if !file_cfg.defaults.model.is_empty() {
             models.iter().find(|m| m.filename == file_cfg.defaults.model)
@@ -2224,25 +2172,20 @@ fn main() {
         };
         if let Some(m) = target {
             apply_model_params(&mut cfg, m);
-            if llama.start(&cfg, m).is_ok() {
-                llama.wait_ready(cfg.llama_port, cfg.startup_timeout);
+            eprintln!("[llama] starting {} (ngl={}, ctx={}, fa={})",
+                m.name, if cfg.ngl < 0 { 99 } else { cfg.ngl }, cfg.ctx,
+                if cfg.flash_attn { "on" } else { "auto" });
+            if llama.spawn(&cfg.llama_binary, &llama_args(&cfg, m), &m.filename, cfg.llama_port).is_ok() {
+                llama.wait_ready(cfg.startup_timeout);
             }
         }
     }
-
-    // Auto-start embed server if configured
-    if file_cfg.embed.enabled && !file_cfg.embed.model.is_empty() && llama_ok {
-        let embed_path = format!("{}/{}", cfg.models_dir, file_cfg.embed.model);
-        if Path::new(&embed_path).exists() {
-            if embed.start(&cfg.llama_binary, &embed_path, &file_cfg.embed.model, &file_cfg.embed).is_ok() {
-                embed.wait_ready(file_cfg.embed.startup_timeout);
-            }
-        } else {
-            eprintln!("  WARNING: embed model '{}' not found", embed_path);
-        }
+    if file_cfg.embed.enabled && !file_cfg.embed.model.is_empty() {
+        eprintln!("  embed-server: lazy (starts on first RAG use)");
     }
 
     let rag = RagStore::new(file_cfg.rag);
+    let sys_info = sys.to_json();
 
     let addr = format!("127.0.0.1:{}", cfg.port);
     let listener = TcpListener::bind(&addr).unwrap_or_else(|e| {
@@ -2252,7 +2195,7 @@ fn main() {
     eprintln!("  http://{addr}\n");
 
     let shared: Shared = Arc::new(Mutex::new(State {
-        cfg, models, llama, embed, rag, tokens_session: 0, requests: 0,
+        cfg, models, llama, embed, rag, sys_info, tokens_session: 0, requests: 0,
     }));
 
     for stream in listener.incoming().flatten() {
@@ -2264,7 +2207,7 @@ fn main() {
 fn apply_model_params(cfg: &mut RuntimeCfg, m: &Model) {
     cfg.active_model = m.filename.clone();
     cfg.ngl = m.gpu_layers;
-    cfg.ctx = if m.context_size > 0 { m.context_size } else { 4096 };
+    cfg.ctx = if m.context_size > 0 { m.context_size } else { cfg.auto_ctx };
     cfg.flash_attn = m.flash_attention;
     cfg.temp = m.temperature;
     cfg.top_k = m.top_k;
@@ -2385,6 +2328,7 @@ fn handle_status(st: &Shared) -> serde_json::Value {
         "llama": s.llama.status_json(),
         "embed": s.embed.status_json(),
         "rag": s.rag.status_json(),
+        "system": s.sys_info,
     })
 }
 
@@ -2414,63 +2358,23 @@ fn handle_load(st: &Shared, body: &str) -> serde_json::Value {
     if let Some(v) = req.draft_max { cfg.draft_max = v; }
     if let Some(v) = req.gpu_layers_draft { cfg.gpu_layers_draft = v; }
 
-    // Stop main model only (embed server stays up)
-    st.lock().unwrap().llama.stop();
+    eprintln!("[llama] starting {} (ngl={}, ctx={}, fa={})",
+        model.name, if cfg.ngl < 0 { 99 } else { cfg.ngl }, cfg.ctx,
+        if cfg.flash_attn { "on" } else { "auto" });
 
-    let mut llama = LlamaServer::new();
-    if let Err(e) = llama.start(&cfg, &model) {
-        st.lock().unwrap().cfg.active_model.clear();
-        return serde_json::json!({"error": e});
-    }
-
-    let status = llama.status_json();
-    {
+    // Stop old model + spawn new one under one lock (embed server untouched).
+    let status = {
         let mut s = st.lock().unwrap();
-        s.llama = llama;
-        s.cfg = cfg.clone();
-    }
-
-    // Background poll for main model readiness
-    let bg_st = Arc::clone(st);
-    let llama_port = cfg.llama_port;
-    let timeout = cfg.startup_timeout;
-    std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(timeout);
-        std::thread::sleep(Duration::from_millis(500));
-
-        loop {
-            if Instant::now() >= deadline {
-                let mut s = bg_st.lock().unwrap();
-                s.llama.status = LlamaStatus::Error(format!("timeout ({timeout}s)"));
-                return;
-            }
-            {
-                let mut s = bg_st.lock().unwrap();
-                if let Some(ref mut c) = s.llama.child {
-                    match c.try_wait() {
-                        Ok(Some(st_code)) => {
-                            s.llama.status = LlamaStatus::Error(format!("exited: {st_code}"));
-                            s.llama.child = None;
-                            return;
-                        }
-                        Err(e) => { s.llama.status = LlamaStatus::Error(format!("wait: {e}")); return; }
-                        Ok(None) => {}
-                    }
-                } else {
-                    s.llama.status = LlamaStatus::Error("process gone".into());
-                    return;
-                }
-            }
-            if check_health(llama_port) {
-                let mut s = bg_st.lock().unwrap();
-                s.llama.status = LlamaStatus::Ready;
-                eprintln!("[load] ready");
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(800));
+        s.llama.stop();
+        if let Err(e) = s.llama.spawn(&cfg.llama_binary, &llama_args(&cfg, &model), &model.filename, cfg.llama_port) {
+            s.cfg.active_model.clear();
+            return serde_json::json!({"error": e});
         }
-    });
+        s.cfg = cfg.clone();
+        s.llama.status_json()
+    };
 
+    spawn_ready_poll(st, Which::Llama, cfg.startup_timeout);
     serde_json::json!({"ok": true, "loading": true, "llama": status})
 }
 
@@ -2520,56 +2424,19 @@ fn handle_embed_start(st: &Shared) -> serde_json::Value {
         return serde_json::json!({"error": format!("embed model '{}' not found", model_path)});
     }
 
-    let mut s = st.lock().unwrap();
-    s.embed.stop();
-    if let Err(e) = s.embed.start(&binary, &model_path, &embed_cfg.model, &embed_cfg) {
-        return serde_json::json!({"error": e});
+    let ngl = if embed_cfg.gpu_layers < 0 { 99 } else { embed_cfg.gpu_layers };
+    eprintln!("[embed] starting {} (ngl={ngl}, ctx={}, port={})",
+        embed_cfg.model, embed_cfg.context_size, embed_cfg.port);
+    {
+        let mut s = st.lock().unwrap();
+        s.embed.stop();
+        let args = embed_args(&model_path, &embed_cfg);
+        if let Err(e) = s.embed.spawn(&binary, &args, &embed_cfg.model, embed_cfg.port) {
+            return serde_json::json!({"error": e});
+        }
     }
 
-    // Brief sync wait — embed models are small and load fast
-    drop(s);
-    let timeout = embed_cfg.startup_timeout;
-
-    // Background poll
-    let bg_st = Arc::clone(st);
-    let embed_port = embed_cfg.port;
-    std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(timeout);
-        std::thread::sleep(Duration::from_millis(400));
-
-        loop {
-            if Instant::now() >= deadline {
-                let mut s = bg_st.lock().unwrap();
-                s.embed.status = LlamaStatus::Error(format!("timeout ({timeout}s)"));
-                return;
-            }
-            {
-                let mut s = bg_st.lock().unwrap();
-                if let Some(ref mut c) = s.embed.child {
-                    match c.try_wait() {
-                        Ok(Some(st_code)) => {
-                            s.embed.status = LlamaStatus::Error(format!("exited: {st_code}"));
-                            s.embed.child = None;
-                            return;
-                        }
-                        Err(e) => { s.embed.status = LlamaStatus::Error(format!("wait: {e}")); return; }
-                        Ok(None) => {}
-                    }
-                } else {
-                    s.embed.status = LlamaStatus::Error("process gone".into());
-                    return;
-                }
-            }
-            if check_health(embed_port) {
-                let mut s = bg_st.lock().unwrap();
-                s.embed.status = LlamaStatus::Ready;
-                eprintln!("[embed] ready via API start");
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(600));
-        }
-    });
-
+    spawn_ready_poll(st, Which::Embed, embed_cfg.startup_timeout);
     serde_json::json!({"ok": true, "loading": true})
 }
 
@@ -2613,22 +2480,18 @@ fn handle_rag_index(st: &Shared, body: &str) -> serde_json::Value {
         return serde_json::json!({"error": "no files to index"});
     }
 
+    // Lazy-start the embed server on first index (blocks until ready).
+    if let Err(e) = ensure_embed_ready(st) {
+        return serde_json::json!({"error": e});
+    }
+
     // Phase 1: lock briefly to read config
-    let (embed_ready, endpoint, doc_prefix, chunk_size, chunk_overlap, chunker_tool) = {
+    let (endpoint, doc_prefix, chunk_size, chunk_overlap, chunker_tool) = {
         let s = st.lock().unwrap();
-        let ready = s.embed.is_ready();
-        let ep = s.cfg.embedding_endpoint();
-        let pfx = s.cfg.embed.doc_prefix.clone();
-        let cs = s.rag.cfg.chunk_size;
-        let co = s.rag.cfg.chunk_overlap;
-        let ct = s.rag.cfg.chunker_tool.clone();
-        (ready, ep, pfx, cs, co, ct)
+        (s.cfg.embedding_endpoint(), s.cfg.embed.doc_prefix.clone(),
+         s.rag.cfg.chunk_size, s.rag.cfg.chunk_overlap, s.rag.cfg.chunker_tool.clone())
     };
     // Lock released here
-
-    if !embed_ready {
-        return serde_json::json!({"error": "embed server not ready — start it from settings"});
-    }
 
     // Phase 1b: chunk files outside the lock (may spawn external process)
     let (all_chunks, all_sources, all_kinds, all_files) = if let Some(ext_chunks) =
@@ -2653,7 +2516,7 @@ fn handle_rag_index(st: &Shared, body: &str) -> serde_json::Value {
         let mut kinds: Vec<String> = Vec::new();
         let mut files: Vec<String> = Vec::new();
         for f in &req.files {
-            for (label, text, kind, file) in chunk_code_file(&f.name, &f.content, chunk_size, chunk_overlap) {
+            for (label, text, kind, file) in chunk_code_file_simple(&f.name, &f.content, chunk_size, chunk_overlap) {
                 sources.push(label);
                 chunks.push(text);
                 kinds.push(kind);
@@ -2761,27 +2624,17 @@ struct ContextResult {
     model_ctx: u64,
 }
 
-/// Minimum output tokens — hard floor, never go below this.
 const MIN_OUTPUT_TOKENS: u64 = 256;
 
-/// Reserve 25% of context for output.  Scales with model size:
-///   8k ctx  →  2048 output reserve
-///  32k ctx  →  8192 output reserve
-/// Never drops below MIN_OUTPUT_TOKENS.
-#[inline]
-fn output_reserve_for(model_ctx: u64) -> u64 {
-    (model_ctx / 4).max(MIN_OUTPUT_TOKENS)
-}
-
 fn assemble_context(
-    files: &[FileEntry], extra_ctx: &str, rag_context: &str,
+    files: &[FileEntry], rag_context: &str,
     description: &str, target_lang: &str, model_ctx: u32, system_text: &str,
 ) -> ContextResult {
     let system_tok = estimate_tokens(system_text);
     let desc_tok = estimate_tokens(description);
     let rag_tok = estimate_tokens(rag_context);
     let fixed_input = system_tok + desc_tok + rag_tok;
-    let file_budget = (model_ctx as u64).saturating_sub(fixed_input + output_reserve_for(model_ctx as u64));
+    let file_budget = (model_ctx as u64).saturating_sub(fixed_input + MIN_OUTPUT_TOKENS);
 
     let mut result = ContextResult {
         context_block: String::new(),
@@ -2834,15 +2687,6 @@ fn assemble_context(
             }
         } else {
             result.files_dropped.push(f.name.clone());
-        }
-    }
-
-    if !extra_ctx.is_empty() {
-        let block = format!("\n--- additional context ---\n```\n{}\n```\n", extra_ctx);
-        let cost = estimate_tokens(&block);
-        if files_used + cost <= file_budget {
-            result.context_block.push_str(&block);
-            files_used += cost;
         }
     }
 
@@ -2942,90 +2786,59 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
     // RAG and files share one pool: everything left after system + desc + output reserve.
     let system_tokens = estimate_tokens(&system_base) + estimate_tokens(rag_note);
     let desc_tokens = estimate_tokens(&req.description);
-    let output_reserve = output_reserve_for(cfg.ctx as u64);
     let context_budget = (cfg.ctx as u64).saturating_sub(
-        system_tokens + desc_tokens + output_reserve
+        system_tokens + desc_tokens + MIN_OUTPUT_TOKENS
     );
 
     let mut budget = TokenBudget {
         model_ctx: cfg.ctx as u64,
         system_tokens,
         desc_tokens,
-        output_reserve,
+        output_reserve: MIN_OUTPUT_TOKENS,
         context_budget,
         rag_tokens: 0,
     };
 
-    // ── RAG retrieval (budget-adaptive + LLM preprocessing) ──
+    // ── RAG retrieval (budget-adaptive) ──────────────────────
     let mut rag_context = String::new();
     let mut rag_chunks_used = 0usize;
     if req.use_rag {
-        let (should_search, endpoint, max_chunks, do_expand, do_rerank, do_compress) = {
+        // Only pay embed startup if there's actually something to retrieve.
+        let (have_index, endpoint) = {
             let s = st.lock().unwrap();
-            let ok = !s.rag.chunks.is_empty() && s.rag.cfg.enabled && s.embed.is_ready();
-            (ok, cfg.embedding_endpoint(), s.rag.cfg.search_results,
-             s.rag.cfg.query_expansion, s.rag.cfg.llm_reranking,
-             s.rag.cfg.chunk_compression)
+            (!s.rag.chunks.is_empty() && s.rag.cfg.enabled, cfg.embedding_endpoint())
+        };
+
+        // Lazy-start the embed server; on failure, skip RAG and still generate.
+        let should_search = have_index && match ensure_embed_ready(st) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("[rag] embed unavailable, generating without retrieval: {e}");
+                send_sse(stream, &serde_json::json!({"rag_info": {"error": e}}));
+                false
+            }
         };
 
         if should_search {
             const RAG_CANDIDATE_POOL: usize = 30;
 
-            // ── Stage A: Query expansion ─────────────────────────
-            let search_query = if do_expand {
-                expand_query(cfg.llama_port, &req.description)
-            } else {
-                req.description.clone()
-            };
-
-            // ── Stage B: Embed + retrieve ────────────────────────
-            match get_embedding(&endpoint, &search_query, &cfg.embed.query_prefix) {
+            match get_embedding(&endpoint, &req.description, &cfg.embed.query_prefix) {
                 Ok(query_vec) => {
                     let s = st.lock().unwrap();
                     let hits = s.rag.search_local(
-                        &query_vec, RAG_CANDIDATE_POOL, &search_query,
+                        &query_vec, RAG_CANDIDATE_POOL, &req.description,
                     );
                     drop(s);
 
                     if !hits.is_empty() {
-                        // ── Stage C: LLM reranking ───────────────
-                        let ranked = if do_rerank {
-                            rerank_chunks(cfg.llama_port, &req.description, &hits)
-                        } else {
-                            hits
-                        };
-
-                        // ── Stage D: Fill budget (3 stops) ───────
                         let header = "\n--- retrieved context (RAG) ---\n";
                         rag_context.push_str(header);
                         let mut rag_used: u64 = estimate_tokens(header);
-                        let mut selected: Vec<(String, String, f32)> = Vec::new();
+                        let mut selected: Vec<(&String, &String, &f32)> = Vec::new();
 
-                        let top_score = ranked[0].2;
-                        let score_floor = top_score * 0.5;
-
-                        for (source, text, score) in &ranked {
-                            if selected.len() >= max_chunks {
-                                eprintln!("[rag] stopping: max chunks ({})", max_chunks);
-                                break;
-                            }
-                            if !selected.is_empty() && *score < score_floor {
-                                eprintln!(
-                                    "[rag] stopping: score {:.4} < floor {:.4}",
-                                    score, score_floor
-                                );
-                                break;
-                            }
-
-                            // Optionally compress before measuring cost
-                            let final_text = if do_compress {
-                                compress_chunk(cfg.llama_port, text)
-                            } else {
-                                text.clone()
-                            };
-
+                        for (source, text, dist) in &hits {
                             let chunk_block = format!(
-                                "# {} (score: {:.4})\n{}\n\n", source, score, final_text
+                                "# {} (score: {:.4})\n{}\n\n", source, dist, text
                             );
                             let cost = estimate_tokens_lang(&chunk_block, &req.language);
 
@@ -3033,40 +2846,27 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
                                 if selected.is_empty() {
                                     rag_context.push_str(&chunk_block);
                                     rag_used += cost;
-                                    selected.push((source.clone(), final_text, *score));
+                                    selected.push((source, text, dist));
                                 }
-                                eprintln!("[rag] stopping: budget exhausted ({}/{})", rag_used, context_budget);
                                 break;
                             }
 
                             rag_context.push_str(&chunk_block);
                             rag_used += cost;
-                            selected.push((source.clone(), final_text, *score));
+                            selected.push((source, text, dist));
                         }
 
                         budget.rag_tokens = rag_used;
                         rag_chunks_used = selected.len();
-                        let remaining = budget.model_ctx.saturating_sub(
-                            budget.system_tokens + budget.desc_tokens + rag_used
-                        );
                         eprintln!(
-                            "[rag] {} chunks, {} tok, ~{} tok remaining for response{}{}{}",
-                            rag_chunks_used, rag_used, remaining,
-                            if do_expand { " [expanded]" } else { "" },
-                            if do_rerank { " [reranked]" } else { "" },
-                            if do_compress { " [compressed]" } else { "" },
+                            "[rag] {} chunks, {} tok (context budget {} tok)",
+                            rag_chunks_used, rag_used, context_budget
                         );
                         send_sse(stream, &serde_json::json!({
                             "rag_info": {
                                 "chunks_retrieved": rag_chunks_used,
-                                "max_chunks": max_chunks,
                                 "rag_tokens": rag_used,
-                                "response_budget": remaining,
-                                "top_score": top_score,
-                                "score_floor": score_floor,
-                                "query_expanded": do_expand,
-                                "llm_reranked": do_rerank,
-                                "chunks_compressed": do_compress,
+                                "context_budget": context_budget,
                                 "sources": selected.iter().map(|(s, _, d)| {
                                     serde_json::json!({"source": s, "score": d})
                                 }).collect::<Vec<_>>(),
@@ -3092,12 +2892,12 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
     };
 
     let ctx_result = assemble_context(
-        &req.files, &req.context, &rag_context,
+        &req.files, &rag_context,
         &req.description, &req.language, cfg.ctx, &system,
     );
 
     let remaining = ctx_result.model_ctx.saturating_sub(ctx_result.total_input_tokens);
-    if !req.files.is_empty() || !req.context.is_empty() || rag_chunks_used > 0 {
+    if !req.files.is_empty() || rag_chunks_used > 0 {
         let mut info = serde_json::json!({
             "context_info": {
                 "model_ctx": budget.model_ctx,

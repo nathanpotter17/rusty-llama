@@ -175,15 +175,14 @@
     const detail = $('#budget-detail');
 
     const totalFileTokens = contextFiles.reduce((s, f) => s + f.tokens, 0);
-    const ctxTokens = estimateTokens($('#write-ctx').value || '');
     const descTokens = estimateTokens($('#write-desc').value || '');
     const systemTokens = 80;
 
-    const inputUsed = totalFileTokens + ctxTokens + descTokens + systemTokens;
+    const inputUsed = totalFileTokens + descTokens + systemTokens;
     const remaining = Math.max(0, modelCtx - inputUsed);
     const pct = modelCtx > 0 ? Math.min((inputUsed / modelCtx) * 100, 100) : 0;
 
-    if (totalFileTokens === 0 && ctxTokens === 0) {
+    if (totalFileTokens === 0) {
       bar.classList.add('hidden');
       return;
     }
@@ -211,7 +210,6 @@
   }
 
   $('#write-desc').addEventListener('input', updateBudget);
-  $('#write-ctx').addEventListener('input', updateBudget);
 
   // ── Drag & drop ──
 
@@ -768,7 +766,6 @@
           description: desc,
           language: lang,
           mode: currentMode,
-          context: $('#write-ctx').value.trim() || undefined,
           files: filesPayload.length > 0 ? filesPayload : undefined,
           use_rag: useRag,
         }),

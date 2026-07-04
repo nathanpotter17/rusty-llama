@@ -300,11 +300,12 @@ body {
 
 /* ── Textareas ─────────────────────────────────────── */
 
-.desc-input,
-.code-input {
+.desc-input {
   width: 100%;
+  flex: 1;
   font-size: 14px;
   font-family: var(--font-mono);
+  line-height: 1.6;
   resize: none;
   background-color: var(--bg);
   color: var(--text);
@@ -314,28 +315,13 @@ body {
   transition: background-color 0.15s ease;
 }
 
-.desc-input {
-  line-height: 1.6;
-  flex: none;
-  border-bottom: 1px solid var(--border-subtle);
-  min-height: 100px;
-}
-
-.desc-input::placeholder,
-.code-input::placeholder {
+.desc-input::placeholder {
   color: var(--text-muted);
   font-style: italic;
 }
 
-.desc-input:focus,
-.code-input:focus {
+.desc-input:focus {
   background-color: var(--bg-input);
-}
-
-.code-input {
-  flex: 1;
-  line-height: 1.7;
-  tab-size: 4;
 }
 
 /* ── File Upload Zone ──────────────────────────────── */
