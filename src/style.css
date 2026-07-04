@@ -553,6 +553,64 @@ body {
   background-color: var(--bg);
 }
 
+/* ── Chat transcript ───────────────────────────────── */
+
+.chat-transcript {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 820px;
+  margin: 0 auto;
+}
+
+.chat-msg {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.chat-role {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  color: var(--text-muted);
+}
+
+.chat-body {
+  font-size: 14px;
+  line-height: 1.6;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.chat-user .chat-body {
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-subtle);
+  align-self: flex-end;
+  max-width: 85%;
+}
+
+.chat-user {
+  align-items: flex-end;
+}
+
+.chat-assistant .chat-body {
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border);
+}
+
+/* In chat mode the language picker and file budget bar are irrelevant. */
+body.mode-chat #lang-select,
+body.mode-chat .budget-bar {
+  display: none;
+}
+body.mode-chat .drop-hint {
+  display: none;
+}
+
 .placeholder-msg {
   color: var(--text-muted);
   font-family: var(--font-mono);

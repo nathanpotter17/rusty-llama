@@ -44,7 +44,10 @@
   let modelsData = [];
   let currentMode = 'write';
   let ragIndexed = 0;
+  let ragCode = 0;
+  let ragText = 0;
   let ragEnabled = false;
+  let chatHistory = [];   // client-owned chat thread; server is stateless
 
   // ── Destination toggle ──
 
@@ -67,13 +70,26 @@
 
       const writeBtn = $('#write-btn');
       const descInput = $('#write-desc');
+      document.body.classList.toggle('mode-chat', currentMode === 'chat');
+
       if (currentMode === 'review') {
         writeBtn.textContent = 'Review →';
         descInput.placeholder = 'What should be reviewed? (e.g. "Check for bugs and performance issues")';
+      } else if (currentMode === 'chat') {
+        writeBtn.textContent = 'Send →';
+        descInput.placeholder = 'Ask anything, or discuss a long thread. Enter to send, Shift+Enter for newline.';
+        $('#output-title').textContent = 'Chat';
+        renderChat(null);
       } else {
         writeBtn.innerHTML = 'Write &rarr;';
         descInput.placeholder = 'Describe what you need...';
       }
+
+      if (currentMode !== 'chat') {
+        $('#output-title').textContent = 'Output';
+        $('#chat-new-btn').classList.add('hidden');
+      }
+      updateRagBadge();
     });
   });
 
@@ -257,38 +273,32 @@
 
   function updateRagBadge() {
     const badge = $('#rag-badge');
+    const domain = currentMode === 'chat' ? 'text' : 'code';
+    const count = domain === 'text' ? ragText : ragCode;
     if (!ragEnabled) {
       badge.textContent = 'RAG off';
       badge.className = 'badge badge-idle';
       badge.title = 'RAG disabled';
-    } else if (!embedReady) {
-      badge.textContent = 'Embed ✗';
-      badge.className = 'badge badge-idle';
-      badge.title = 'Embed server not running — start it in settings';
-    } else if (ragIndexed > 0) {
-      badge.textContent = `RAG ${ragIndexed}`;
+    } else if (count > 0) {
+      badge.textContent = `RAG ${count}`;
       badge.className = 'badge badge-ready';
-      badge.title = `${ragIndexed} chunks indexed · embed server ready`;
+      badge.title = `${count} ${domain} chunks indexed${embedReady ? ' · embed ready' : ' · embed starts on use'}`;
     } else {
       badge.textContent = 'RAG 0';
-      badge.className = 'badge badge-ready';
-      badge.title = 'Embed server ready · no files indexed yet';
+      badge.className = 'badge badge-idle';
+      badge.title = `No ${domain} chunks indexed yet — embed server starts on first use`;
     }
   }
 
   // Index RAG files, then auto-clear the RAG queue
   $('#rag-index-btn').onclick = async () => {
     if (ragFiles.length === 0) return;
-    if (!embedReady) {
-      $('#rag-index-status').textContent = 'Start embed server first (settings)';
-      $('#rag-index-status').className = 'rag-index-status rag-error';
-      return;
-    }
 
+    const domain = currentMode === 'chat' ? 'text' : 'code';
     const btn = $('#rag-index-btn');
     const status = $('#rag-index-status');
     btn.disabled = true;
-    status.textContent = 'Indexing...';
+    status.textContent = embedReady ? 'Indexing...' : 'Starting embed server & indexing...';
     status.className = 'rag-index-status rag-indexing';
 
     const filesPayload = ragFiles.map((f) => ({
@@ -300,7 +310,7 @@
     try {
       const res = await fetch('/api/rag/index', {
         method: 'POST',
-        body: JSON.stringify({ files: filesPayload }),
+        body: JSON.stringify({ files: filesPayload, domain }),
       });
       const d = await res.json();
 
@@ -308,8 +318,10 @@
         status.textContent = d.error;
         status.className = 'rag-index-status rag-error';
       } else {
-        ragIndexed = d.chunks_indexed || 0;
-        status.textContent = `${ragIndexed} chunks indexed`;
+        if (domain === 'text') ragText = d.chunks_indexed || 0;
+        else ragCode = d.chunks_indexed || 0;
+        embedReady = true;   // lazy start succeeded
+        status.textContent = `${d.chunks_indexed || 0} ${domain} chunks indexed`;
         status.className = 'rag-index-status rag-success';
         updateRagBadge();
         $('#rag-checkbox').checked = true;
@@ -442,12 +454,14 @@
     try {
       const d = await fetch('/api/rag/status').then((r) => r.json());
       ragIndexed = d.chunks || 0;
+      ragCode = d.chunks_code || 0;
+      ragText = d.chunks_text || 0;
       ragEnabled = d.enabled || false;
       updateRagBadge();
 
       const el = $('#rag-settings-status');
       let lines = [`Status: ${ragEnabled ? 'enabled' : 'disabled'}`];
-      lines.push(`Chunks indexed: ${ragIndexed}`);
+      lines.push(`Chunks: ${ragIndexed} (code ${ragCode}, text ${ragText})`);
       if (d.vector_dim) lines.push(`Vector dimension: ${d.vector_dim}`);
       if (d.files && d.files.length) lines.push(`Files: ${d.files.join(', ')}`);
       lines.push(`DB: ${d.db_path || 'N/A'}`);
@@ -522,6 +536,8 @@
       // Sync RAG status from models endpoint too
       if (d.rag) {
         ragIndexed = d.rag.chunks || 0;
+        ragCode = d.rag.chunks_code || 0;
+        ragText = d.rag.chunks_text || 0;
         ragEnabled = d.rag.enabled || false;
       }
       // Sync embed server status
@@ -705,11 +721,154 @@
 
   $('#write-btn').onclick = doWrite;
   $('#write-desc').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    if (e.key !== 'Enter') return;
+    if (currentMode === 'chat') {
+      if (!e.shiftKey) { e.preventDefault(); doWrite(); }   // Enter sends, Shift+Enter newline
+    } else if (e.ctrlKey || e.metaKey) {
       e.preventDefault();
       doWrite();
     }
   });
+
+  $('#chat-new-btn').onclick = () => {
+    if (abortCtrl) abortCtrl.abort();
+    chatHistory = [];
+    renderChat(null);
+    $('#stats').textContent = '';
+    $('#context-info').classList.add('hidden');
+  };
+
+  // Render the chat transcript. Pass a string to append a live streaming
+  // assistant bubble; pass null when idle.
+  function renderChat(streaming) {
+    const output = $('#output');
+    $('#chat-new-btn').classList.toggle('hidden', chatHistory.length === 0 && streaming == null);
+    if (chatHistory.length === 0 && streaming == null) {
+      output.innerHTML = '<div class="placeholder-msg">Start a conversation — ask a question or paste text to discuss. Toggle RAG to ground answers in your indexed text.</div>';
+      return;
+    }
+    let html = '<div class="chat-transcript">';
+    for (const m of chatHistory) {
+      const body = m.role === 'assistant' ? renderReview(m.content) : esc(m.content);
+      html += `<div class="chat-msg chat-${m.role}"><div class="chat-role">${m.role}</div><div class="chat-body">${body}</div></div>`;
+    }
+    if (streaming != null) {
+      html += `<div class="chat-msg chat-assistant"><div class="chat-role">assistant</div><div class="chat-body streaming-cursor">${renderReview(streaming)}</div></div>`;
+    }
+    html += '</div>';
+    output.innerHTML = html;
+    output.scrollTop = output.scrollHeight;
+  }
+
+  // Minimal SSE frame reader shared by the chat pipeline. onEvent may return
+  // 'stop' to end the stream early.
+  async function readSSE(res, onEvent) {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) !== -1) {
+        const line = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        if (!line.startsWith('data: ')) continue;
+        let data;
+        try { data = JSON.parse(line.slice(6)); } catch { continue; }
+        if (onEvent(data) === 'stop') return;
+      }
+    }
+  }
+
+  async function doChat() {
+    const input = $('#write-desc');
+    const text = input.value.trim();
+    if (!text) return;
+
+    if (abortCtrl) abortCtrl.abort();
+    abortCtrl = new AbortController();
+
+    chatHistory.push({ role: 'user', content: text });
+    input.value = '';
+    renderChat('');
+    setGenerating(true);
+
+    const statsEl = $('#stats');
+    const ctxInfo = $('#context-info');
+    statsEl.textContent = '';
+    ctxInfo.classList.add('hidden');
+    ctxInfo.innerHTML = '';
+
+    const useRag = $('#rag-checkbox').checked && ragText > 0;
+    let assistantText = '';
+    let tokenCount = 0;
+    const genStart = Date.now();
+
+    try {
+      const res = await fetch('/api/write', {
+        method: 'POST',
+        signal: abortCtrl.signal,
+        body: JSON.stringify({ mode: 'chat', messages: chatHistory, use_rag: useRag }),
+      });
+
+      await readSSE(res, (data) => {
+        if (data.error) {
+          renderChat(null);
+          const out = $('#output');
+          out.insertAdjacentHTML('beforeend', `<div class="error-msg">${esc(data.error)}</div>`);
+          return 'stop';
+        }
+        if (data.rag_info) {
+          if (data.rag_info.error) console.warn('[chat rag]', data.rag_info.error);
+          return;
+        }
+        if (data.context_info) {
+          const ci = data.context_info;
+          const parts = [];
+          if (ci.rag_chunks) parts.push(`<span class="ctx-rag">${ci.rag_chunks} RAG</span>`);
+          if (ci.turns_kept != null && ci.turns_total != null && ci.turns_kept < ci.turns_total) {
+            parts.push(`<span class="ctx-dropped">${ci.turns_total - ci.turns_kept} older turns trimmed</span>`);
+          }
+          if (ci.remaining_tokens != null) parts.push(`${formatTokens(ci.remaining_tokens)} left for reply`);
+          if (parts.length) {
+            ctxInfo.innerHTML = parts.join(' · ');
+            ctxInfo.classList.remove('hidden');
+          }
+          return;
+        }
+        if (data.token) {
+          assistantText += data.token;
+          tokenCount++;
+          renderChat(assistantText);
+        }
+        if (data.done) {
+          const secs = ((data.elapsed_ms || 0) / 1000).toFixed(1);
+          const p = [`${data.tokens || 0} tok`, `${secs}s`];
+          if (data.rag_chunks) p.push(`${data.rag_chunks} RAG`);
+          if (data.turns_kept) p.push(`${data.turns_kept} turns`);
+          statsEl.textContent = p.join(' · ');
+        }
+      });
+
+      if (assistantText) chatHistory.push({ role: 'assistant', content: assistantText });
+      renderChat(null);
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        if (assistantText) chatHistory.push({ role: 'assistant', content: assistantText });
+        renderChat(null);
+        const secs = ((Date.now() - genStart) / 1000).toFixed(1);
+        statsEl.textContent = `${tokenCount} tok · ${secs}s · stopped`;
+      } else {
+        renderChat(null);
+        $('#output').insertAdjacentHTML('beforeend', `<div class="error-msg">Error: ${esc(String(e))}</div>`);
+      }
+    } finally {
+      abortCtrl = null;
+      setGenerating(false);
+    }
+  }
 
   function setGenerating(on) {
     const writeBtn = $('#write-btn');
@@ -724,6 +883,7 @@
   }
 
   async function doWrite() {
+    if (currentMode === 'chat') return doChat();
     const desc = $('#write-desc').value.trim();
     if (!desc) return;
 
@@ -735,7 +895,7 @@
     const statsEl = $('#stats');
     const ctxInfo = $('#context-info');
     const isReview = currentMode === 'review';
-    const useRag = $('#rag-checkbox').checked && ragIndexed > 0 && embedReady;
+    const useRag = $('#rag-checkbox').checked && ragCode > 0;
 
     const loadingLabel = isReview ? 'Reviewing code...' : (useRag ? 'Searching index & writing...' : 'Writing code...');
     output.innerHTML = `<div class="loading"><div class="spinner"></div>${loadingLabel}</div>`;

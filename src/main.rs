@@ -81,7 +81,8 @@ struct DefaultsCfg {
     cache_type_k: String,
     cache_type_v: String,
     draft_model: String,
-    draft_max: u32,
+    spec_type: String,
+    spec_draft_n_max: u32,
     gpu_layers_draft: i32,
 }
 impl Default for DefaultsCfg {
@@ -91,7 +92,7 @@ impl Default for DefaultsCfg {
             context_size: 0, flash_attention: true, temperature: 0.7,
             top_k: 40, top_p: 0.9, repeat_penalty: 1.1,
             cache_type_k: String::new(), cache_type_v: String::new(),
-            draft_model: String::new(), draft_max: 0, gpu_layers_draft: 99,
+            draft_model: String::new(), spec_type: String::new(), spec_draft_n_max: 2, gpu_layers_draft: 99,
         }
     }
 }
@@ -198,6 +199,15 @@ struct ModelEntry {
     top_p: f32,
     #[serde(default = "def_rp")]
     repeat_penalty: f32,
+    // Speculative decoding (per-model — spec capability is a model property).
+    #[serde(default)]
+    spec_type: String,               // "" = off | "draft-mtp" | "draft-model" | "eagle" | ...
+    #[serde(default = "def_spec_nmax")]
+    spec_draft_n_max: u32,           // --spec-draft-n-max
+    #[serde(default)]
+    draft_model: String,             // used only when spec_type == "draft-model"
+    #[serde(default = "def_ngl_draft")]
+    gpu_layers_draft: i32,           // draft-model offload
 }
 
 fn def_family() -> String { "unknown".into() }
@@ -208,6 +218,8 @@ fn def_temp() -> f32 { 0.7 }
 fn def_topk() -> u32 { 40 }
 fn def_topp() -> f32 { 0.9 }
 fn def_rp() -> f32 { 1.1 }
+fn def_spec_nmax() -> u32 { 2 }
+fn def_ngl_draft() -> i32 { 99 }
 
 // ── Runtime state ───────────────────────────────────────────
 
@@ -232,7 +244,8 @@ struct RuntimeCfg {
     cache_type_k: String,
     cache_type_v: String,
     draft_model: String,
-    draft_max: u32,
+    spec_type: String,
+    spec_draft_n_max: u32,
     gpu_layers_draft: i32,
     threads: usize,           // generation threads, derived from SystemInfo
     auto_ctx: u32,            // VRAM-derived context default (used when ctx unset)
@@ -270,6 +283,10 @@ struct Model {
     top_k: u32,
     top_p: f32,
     repeat_penalty: f32,
+    spec_type: String,
+    spec_draft_n_max: u32,
+    draft_model: String,
+    gpu_layers_draft: i32,
 }
 
 fn discover_models(dir: &str, known: &[ModelEntry], defaults: &DefaultsCfg, exclude: &[&str]) -> Vec<Model> {
@@ -292,6 +309,8 @@ fn discover_models(dir: &str, known: &[ModelEntry], defaults: &DefaultsCfg, excl
                     context_size: k.context_size, flash_attention: k.flash_attention,
                     temperature: k.temperature, top_k: k.top_k, top_p: k.top_p,
                     repeat_penalty: k.repeat_penalty,
+                    spec_type: k.spec_type.clone(), spec_draft_n_max: k.spec_draft_n_max,
+                    draft_model: k.draft_model.clone(), gpu_layers_draft: k.gpu_layers_draft,
                 }
             } else {
                 Model {
@@ -300,6 +319,8 @@ fn discover_models(dir: &str, known: &[ModelEntry], defaults: &DefaultsCfg, excl
                     context_size: if defaults.context_size > 0 { defaults.context_size } else { 4096 },
                     flash_attention: defaults.flash_attention, temperature: defaults.temperature,
                     top_k: defaults.top_k, top_p: defaults.top_p, repeat_penalty: defaults.repeat_penalty,
+                    spec_type: defaults.spec_type.clone(), spec_draft_n_max: defaults.spec_draft_n_max,
+                    draft_model: defaults.draft_model.clone(), gpu_layers_draft: defaults.gpu_layers_draft,
                 }
             })
         })
@@ -353,6 +374,39 @@ fn chunk_code_file_simple(name: &str, content: &str, chunk_size: usize, overlap:
         chunks.push((label, enriched, "block".to_string(), name.to_string()));
         if end == lines.len() { break; }
         i += chunk_size.saturating_sub(overlap);
+    }
+    chunks
+}
+
+// Text-domain (chat) embedding prefixes. The configured [embed] prefixes are
+// code-retrieval instructions; prose retrieval needs its own framing. These
+// are domain defaults, not user config.
+const TEXT_QUERY_PREFIX: &str = "Instruct: Retrieve passages relevant to the question\nQuery: ";
+const TEXT_DOC_PREFIX: &str = "";
+
+// Prose window sizing (in words). Smaller, focused windows retrieve better
+// than code-sized blocks for natural-language Q&A.
+const TEXT_CHUNK_WORDS: usize = 180;
+const TEXT_OVERLAP_WORDS: usize = 30;
+
+/// Prose-aware chunker for the "text" domain: packs whitespace-delimited
+/// words into overlapping windows on paragraph-friendly boundaries. No code
+/// construct detection or metadata header. Returns (source, text, kind, file).
+fn chunk_text_file(name: &str, content: &str) -> Vec<(String, String, String, String)> {
+    let words: Vec<&str> = content.split_whitespace().collect();
+    if words.is_empty() { return Vec::new(); }
+    let step = TEXT_CHUNK_WORDS.saturating_sub(TEXT_OVERLAP_WORDS).max(1);
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut idx = 0;
+    while start < words.len() {
+        let end = (start + TEXT_CHUNK_WORDS).min(words.len());
+        let text = words[start..end].join(" ");
+        let label = format!("{name}#{idx}");
+        chunks.push((label, text, "text".to_string(), name.to_string()));
+        if end == words.len() { break; }
+        start += step;
+        idx += 1;
     }
     chunks
 }
@@ -607,8 +661,9 @@ struct VecChunk {
     text: String,
     source: String,
     vector: Vec<f32>,
-    kind: String,   // "block", "block_part", "file_summary", "gap"
-    file: String,   // originating filename, e.g. "main.rs"
+    kind: String,    // "block", "block_part", "file_summary", "gap", "text"
+    file: String,    // originating filename, e.g. "main.rs"
+    domain: String,  // retrieval corpus: "code" | "text"
 }
 
 /// Cosine distance: 1.0 − cosine_similarity.  Lower = more similar.
@@ -1052,35 +1107,49 @@ impl RagStore {
         file_names: Vec<String>,
         kinds: Vec<String>,
         files: Vec<String>,
+        domain: &str,
     ) -> Result<usize, String> {
         if vectors.is_empty() { return Err("no embeddings".into()); }
         let dim = vectors[0].len();
         if dim == 0 { return Err("embedding dimension is 0".into()); }
-
-        self.chunks.clear();
-        self.chunks.reserve(chunks.len());
-        let iter = chunks.into_iter()
-            .zip(sources.into_iter())
-            .zip(vectors.into_iter())
-            .zip(kinds.into_iter())
-            .zip(files.into_iter());
-        for ((((text, source), vector), kind), file) in iter {
-            self.chunks.push(VecChunk { text, source, vector, kind, file });
+        if let Some(existing) = self.vector_dim() {
+            if existing != dim {
+                return Err(format!(
+                    "embedding dim {dim} != indexed dim {existing} — clear the index before switching embed models"
+                ));
+            }
         }
-        self.indexed_files = file_names;
 
-        // Build HNSW graph over the vectors
+        // Domain-scoped replace: drop only this domain's chunks, keep the
+        // other corpus intact, then append the freshly embedded ones. The
+        // HNSW graph is rebuilt over the union so node ids stay aligned.
+        self.chunks.retain(|c| c.domain != domain);
+        self.chunks.reserve(chunks.len());
+        let added = chunks.len();
+        let iter = chunks.into_iter()
+            .zip(sources)
+            .zip(vectors)
+            .zip(kinds)
+            .zip(files);
+        for ((((text, source), vector), kind), file) in iter {
+            self.chunks.push(VecChunk { text, source, vector, kind, file, domain: domain.to_string() });
+        }
+
+        // Merge indexed_files (union across domains).
+        for f in file_names {
+            if !self.indexed_files.contains(&f) { self.indexed_files.push(f); }
+        }
+
         let t0 = Instant::now();
-        let vecs: Vec<Vec<f32>> = self.chunks.iter().map(|c| c.vector.clone()).collect();
-        self.graph = HnswGraph::new(self.cfg.hnsw_m, self.cfg.hnsw_ef_construction);
-        self.graph.build_all(&vecs);
+        self.rebuild_graph();
         eprintln!("[rag] HNSW built in {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
 
         if let Err(e) = self.save() {
             eprintln!("[rag] save warning: {e}");
         }
-        eprintln!("[rag] indexed {} chunks (dim={}, persisted to {})", self.chunks.len(), dim, self.cfg.db_path);
-        Ok(self.chunks.len())
+        eprintln!("[rag] indexed {added} '{domain}' chunks (dim={dim}, total {} chunks, persisted to {})",
+            self.chunks.len(), self.cfg.db_path);
+        Ok(added)
     }
 
     /// Code-aware BM25 keyword score.
@@ -1141,14 +1210,17 @@ impl RagStore {
         query_vec: &[f32],
         limit: usize,
         query_hint: &str,
+        domain: &str,
     ) -> Vec<(String, String, f32)> {
         if self.chunks.is_empty() { return Vec::new(); }
 
-        // ── Stage 1: Retrieve 3× candidates for hybrid re-ranking + MMR ──
-        let candidate_limit = limit * 3;
+        // ── Stage 1: Retrieve candidates for hybrid re-ranking + MMR ──
+        // Widen retrieval when domain-scoped so the target corpus isn't
+        // starved by nearer neighbours from the other domain.
+        let candidate_limit = limit * 6;
         let use_hybrid = self.cfg.hybrid_weight_bm25 > 0.0 && !query_hint.is_empty();
 
-        let candidates: Vec<(usize, f32)> = if !self.graph.is_empty()
+        let raw: Vec<(usize, f32)> = if !self.graph.is_empty()
             && self.graph.len() == self.chunks.len()
         {
             // HNSW search path — O(log n)
@@ -1172,6 +1244,13 @@ impl RagStore {
                 .map(|(i, d)| (*i, distance_to_similarity(*d)))
                 .collect()
         };
+
+        // Scope to the requested retrieval domain.
+        let candidates: Vec<(usize, f32)> = raw.into_iter()
+            .filter(|(id, _)| self.chunks[*id].domain == domain)
+            .take(limit * 3)
+            .collect();
+        if candidates.is_empty() { return Vec::new(); }
 
         // ── Stage 2: Hybrid BM25 re-scoring ──────────────────────────────
         let mut hybrid_scored: Vec<(usize, f32)> = if use_hybrid {
@@ -1286,14 +1365,35 @@ impl RagStore {
         Ok(())
     }
 
-    /// Persist index in binary format (v2):
-    ///   [u8 x 4  "RAG2" magic]
+    /// Clear only one retrieval domain, preserving the other corpus.
+    fn clear_domain(&mut self, domain: &str) -> Result<(), String> {
+        let before = self.chunks.len();
+        self.chunks.retain(|c| c.domain != domain);
+        let removed = before - self.chunks.len();
+        if self.chunks.is_empty() {
+            return self.clear();
+        }
+        self.indexed_files.retain(|f| self.chunks.iter().any(|c| &c.file == f));
+        self.rebuild_graph();
+        if let Err(e) = self.save() { eprintln!("[rag] save warning: {e}"); }
+        eprintln!("[rag] cleared {removed} '{domain}' chunks ({} remain)", self.chunks.len());
+        Ok(())
+    }
+
+    /// Chunk count for a single domain.
+    fn domain_count(&self, domain: &str) -> usize {
+        self.chunks.iter().filter(|c| c.domain == domain).count()
+    }
+
+    /// Persist index in binary format (v3):
+    ///   [u8 x 4  "RAG3" magic]
     ///   [u32 chunk_count] [u32 vector_dim]
     ///   for each chunk:
     ///     [u32 source_len] [source_bytes]
     ///     [u32 text_len] [text_bytes]
     ///     [u32 kind_len] [kind_bytes]
     ///     [u32 file_len] [file_bytes]
+    ///     [u32 domain_len] [domain_bytes]
     ///     [f32 * dim]
     ///   [HNSW graph bytes]
     fn save(&self) -> Result<(), String> {
@@ -1303,24 +1403,21 @@ impl RagStore {
         let dim = self.chunks.first().map(|c| c.vector.len()).unwrap_or(0) as u32;
         let count = self.chunks.len() as u32;
 
-        let mut buf = Vec::with_capacity(12 + self.chunks.len() * (16 + 200 + dim as usize * 4));
-        buf.extend_from_slice(b"RAG2");
+        let mut buf = Vec::with_capacity(12 + self.chunks.len() * (20 + 200 + dim as usize * 4));
+        buf.extend_from_slice(b"RAG3");
         buf.extend_from_slice(&count.to_le_bytes());
         buf.extend_from_slice(&dim.to_le_bytes());
 
+        let put = |buf: &mut Vec<u8>, s: &[u8]| {
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s);
+        };
         for c in &self.chunks {
-            let src = c.source.as_bytes();
-            let txt = c.text.as_bytes();
-            let knd = c.kind.as_bytes();
-            let fil = c.file.as_bytes();
-            buf.extend_from_slice(&(src.len() as u32).to_le_bytes());
-            buf.extend_from_slice(src);
-            buf.extend_from_slice(&(txt.len() as u32).to_le_bytes());
-            buf.extend_from_slice(txt);
-            buf.extend_from_slice(&(knd.len() as u32).to_le_bytes());
-            buf.extend_from_slice(knd);
-            buf.extend_from_slice(&(fil.len() as u32).to_le_bytes());
-            buf.extend_from_slice(fil);
+            put(&mut buf, c.source.as_bytes());
+            put(&mut buf, c.text.as_bytes());
+            put(&mut buf, c.kind.as_bytes());
+            put(&mut buf, c.file.as_bytes());
+            put(&mut buf, c.domain.as_bytes());
             for &v in &c.vector {
                 buf.extend_from_slice(&v.to_le_bytes());
             }
@@ -1332,7 +1429,7 @@ impl RagStore {
             .map_err(|e| format!("write {}: {e}", self.cfg.db_path))
     }
 
-    /// Load persisted index from disk (v2 format only).
+    /// Load persisted index from disk (v3 format only).
     fn load(&mut self) -> Result<(), String> {
         let path = Path::new(&self.cfg.db_path);
         if !path.exists() { return Ok(()); }
@@ -1340,9 +1437,9 @@ impl RagStore {
             .map_err(|e| format!("read {}: {e}", self.cfg.db_path))?;
         if data.len() < 12 { return Ok(()); }
 
-        // Require RAG2 magic header
-        if &data[0..4] != b"RAG2" {
-            eprintln!("[rag] stale v1 index at {} — delete and re-index", self.cfg.db_path);
+        // Require RAG3 magic — older formats are deleted, not migrated.
+        if &data[0..4] != b"RAG3" {
+            eprintln!("[rag] stale index at {} — delete and re-index", self.cfg.db_path);
             return Ok(());
         }
 
@@ -1353,34 +1450,23 @@ impl RagStore {
         self.chunks.clear();
         self.chunks.reserve(count);
 
+        // Length-prefixed string reader.
+        let read_str = |data: &[u8], pos: &mut usize, i: usize, what: &str| -> Result<String, String> {
+            if *pos + 4 > data.len() { return Err(format!("truncated at chunk {i} ({what} len)")); }
+            let n = u32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap()) as usize;
+            *pos += 4;
+            if *pos + n > data.len() { return Err(format!("truncated at chunk {i} ({what})")); }
+            let s = String::from_utf8_lossy(&data[*pos..*pos+n]).to_string();
+            *pos += n;
+            Ok(s)
+        };
+
         for i in 0..count {
-            if pos + 4 > data.len() { return Err(format!("truncated at chunk {i} (source len)")); }
-            let src_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
-            pos += 4;
-            if pos + src_len > data.len() { return Err(format!("truncated at chunk {i} (source)")); }
-            let source = String::from_utf8_lossy(&data[pos..pos+src_len]).to_string();
-            pos += src_len;
-
-            if pos + 4 > data.len() { return Err(format!("truncated at chunk {i} (text len)")); }
-            let txt_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
-            pos += 4;
-            if pos + txt_len > data.len() { return Err(format!("truncated at chunk {i} (text)")); }
-            let text = String::from_utf8_lossy(&data[pos..pos+txt_len]).to_string();
-            pos += txt_len;
-
-            if pos + 4 > data.len() { return Err(format!("truncated at chunk {i} (kind len)")); }
-            let knd_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
-            pos += 4;
-            if pos + knd_len > data.len() { return Err(format!("truncated at chunk {i} (kind)")); }
-            let kind = String::from_utf8_lossy(&data[pos..pos+knd_len]).to_string();
-            pos += knd_len;
-
-            if pos + 4 > data.len() { return Err(format!("truncated at chunk {i} (file len)")); }
-            let fil_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
-            pos += 4;
-            if pos + fil_len > data.len() { return Err(format!("truncated at chunk {i} (file)")); }
-            let file = String::from_utf8_lossy(&data[pos..pos+fil_len]).to_string();
-            pos += fil_len;
+            let source = read_str(&data, &mut pos, i, "source")?;
+            let text   = read_str(&data, &mut pos, i, "text")?;
+            let kind   = read_str(&data, &mut pos, i, "kind")?;
+            let file   = read_str(&data, &mut pos, i, "file")?;
+            let domain = read_str(&data, &mut pos, i, "domain")?;
 
             let vec_bytes = dim * 4;
             if pos + vec_bytes > data.len() { return Err(format!("truncated at chunk {i} (vector)")); }
@@ -1392,7 +1478,7 @@ impl RagStore {
                 .collect();
             pos += vec_bytes;
 
-            self.chunks.push(VecChunk { text, source, vector, kind, file });
+            self.chunks.push(VecChunk { text, source, vector, kind, file, domain });
         }
 
         // Load HNSW graph
@@ -1406,9 +1492,13 @@ impl RagStore {
             self.rebuild_graph();
         }
 
-        // Reconstruct indexed_files from chunk sources
+        // Reconstruct indexed_files from the file field (domain-agnostic).
         let mut files: Vec<String> = self.chunks.iter()
-            .map(|c| c.source.split(':').next().unwrap_or("").to_string())
+            .map(|c| if c.file.is_empty() {
+                c.source.split(':').next().unwrap_or("").to_string()
+            } else {
+                c.file.clone()
+            })
             .collect();
         files.sort();
         files.dedup();
@@ -1438,6 +1528,8 @@ impl RagStore {
         serde_json::json!({
             "enabled": self.cfg.enabled,
             "chunks": self.chunks.len(),
+            "chunks_code": self.domain_count("code"),
+            "chunks_text": self.domain_count("text"),
             "vector_dim": self.vector_dim(),
             "files": self.indexed_files,
             "db_path": self.cfg.db_path,
@@ -1597,18 +1689,39 @@ fn llama_args(cfg: &RuntimeCfg, model: &Model) -> Vec<String> {
     // the main model keeps maximum KV cache for generation.
     if !cfg.cache_type_k.is_empty() { args.extend(["--cache-type-k".into(), cfg.cache_type_k.clone()]); }
     if !cfg.cache_type_v.is_empty() { args.extend(["--cache-type-v".into(), cfg.cache_type_v.clone()]); }
-    if !cfg.draft_model.is_empty() {
-        let draft_path = format!("{}/{}", cfg.models_dir, cfg.draft_model);
-        if Path::new(&draft_path).exists() {
-            let draft_ngl = if cfg.gpu_layers_draft < 0 { 99 } else { cfg.gpu_layers_draft };
-            eprintln!("[llama]   draft={} (ngl={draft_ngl}, max={})", cfg.draft_model, cfg.draft_max);
-            args.extend([
-                "--model-draft".into(), draft_path,
-                "--gpu-layers-draft".into(), draft_ngl.to_string(),
-                "--draft-max".into(), cfg.draft_max.max(2).to_string(),
-            ]);
+
+    // Speculative decoding via llama.cpp's unified --spec-type interface.
+    // Self-speculation types (draft-mtp, eagle, medusa, ...) use the model's
+    // own heads — no draft checkpoint. Only draft-model type pairs a separate
+    // draft model. Flags are emitted only when the config is complete, so an
+    // invalid draft-model setup never reaches the server as a broken launch.
+    if !cfg.spec_type.is_empty() {
+        let draft_flags: Option<Vec<String>> = if cfg.spec_type == "draft-model" {
+            let draft_path = format!("{}/{}", cfg.models_dir, cfg.draft_model);
+            if cfg.draft_model.is_empty() {
+                eprintln!("[llama]   WARNING: spec_type='draft-model' needs draft_model — speculation disabled");
+                None
+            } else if !Path::new(&draft_path).exists() {
+                eprintln!("[llama]   WARNING: draft model '{draft_path}' not found — speculation disabled");
+                None
+            } else {
+                let draft_ngl = if cfg.gpu_layers_draft < 0 { 99 } else { cfg.gpu_layers_draft };
+                Some(vec![
+                    "--model-draft".into(), draft_path,
+                    "--gpu-layers-draft".into(), draft_ngl.to_string(),
+                ])
+            }
         } else {
-            eprintln!("[llama]   WARNING: draft model '{}' not found", draft_path);
+            Some(Vec::new()) // self-speculation: no draft checkpoint required
+        };
+
+        if let Some(extra) = draft_flags {
+            eprintln!("[llama]   spec={} (n_max={})", cfg.spec_type, cfg.spec_draft_n_max);
+            args.extend(["--spec-type".into(), cfg.spec_type.clone()]);
+            if cfg.spec_draft_n_max > 0 {
+                args.extend(["--spec-draft-n-max".into(), cfg.spec_draft_n_max.to_string()]);
+            }
+            args.extend(extra);
         }
     }
     args
@@ -1998,8 +2111,15 @@ struct FileEntry {
     language: String,
 }
 
+#[derive(Deserialize, Serialize, Clone)]
+struct ChatMsg {
+    role: String,     // "user" | "assistant" (system is server-generated)
+    content: String,
+}
+
 #[derive(Deserialize)]
 struct WriteReq {
+    #[serde(default)]
     description: String,
     #[serde(default = "def_lang")]
     language: String,
@@ -2009,6 +2129,9 @@ struct WriteReq {
     files: Vec<FileEntry>,
     #[serde(default)]
     use_rag: bool,
+    // Chat mode: full client-held thread (server is stateless).
+    #[serde(default)]
+    messages: Vec<ChatMsg>,
 }
 fn def_lang() -> String { "python".into() }
 fn def_mode() -> String { "write".into() }
@@ -2024,7 +2147,8 @@ struct LoadReq {
     #[serde(default)] top_p: Option<f32>,
     #[serde(default)] repeat_penalty: Option<f32>,
     #[serde(default)] draft_model: Option<String>,
-    #[serde(default)] draft_max: Option<u32>,
+    #[serde(default)] spec_type: Option<String>,
+    #[serde(default)] spec_draft_n_max: Option<u32>,
     #[serde(default)] gpu_layers_draft: Option<i32>,
 }
 
@@ -2040,6 +2164,8 @@ struct ParamsReq {
 struct RagIndexReq {
     #[serde(default)]
     files: Vec<FileEntry>,
+    #[serde(default = "def_domain")]
+    domain: String,   // "code" | "text"
 }
 
 #[derive(Deserialize)]
@@ -2047,7 +2173,17 @@ struct RagSearchReq {
     query: String,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default = "def_domain")]
+    domain: String,
 }
+
+#[derive(Deserialize)]
+struct RagClearReq {
+    #[serde(default)]
+    domain: Option<String>,   // None = clear all domains
+}
+
+fn def_domain() -> String { "code".into() }
 
 #[derive(Deserialize)]
 struct EmbedPrefixReq {
@@ -2151,7 +2287,8 @@ fn main() {
         cache_type_k: file_cfg.defaults.cache_type_k.clone(),
         cache_type_v: file_cfg.defaults.cache_type_v.clone(),
         draft_model: file_cfg.defaults.draft_model.clone(),
-        draft_max: file_cfg.defaults.draft_max,
+        spec_type: file_cfg.defaults.spec_type.clone(),
+        spec_draft_n_max: file_cfg.defaults.spec_draft_n_max,
         gpu_layers_draft: file_cfg.defaults.gpu_layers_draft,
         threads: sys.gen_threads(),
         auto_ctx,
@@ -2213,6 +2350,10 @@ fn apply_model_params(cfg: &mut RuntimeCfg, m: &Model) {
     cfg.top_k = m.top_k;
     cfg.top_p = m.top_p;
     cfg.repeat_penalty = m.repeat_penalty;
+    cfg.spec_type = m.spec_type.clone();
+    cfg.spec_draft_n_max = m.spec_draft_n_max;
+    cfg.draft_model = m.draft_model.clone();
+    cfg.gpu_layers_draft = m.gpu_layers_draft;
 }
 
 // ── HTTP server ─────────────────────────────────────────────
@@ -2264,7 +2405,7 @@ fn serve(mut stream: TcpStream, st: &Shared) {
         ("GET", "/api/rag/status")   => respond_json(&mut stream, &handle_rag_status(st)),
         ("POST", "/api/rag/index")   => respond_json(&mut stream, &handle_rag_index(st, &body)),
         ("POST", "/api/rag/search")  => respond_json(&mut stream, &handle_rag_search(st, &body)),
-        ("POST", "/api/rag/clear")   => respond_json(&mut stream, &handle_rag_clear(st)),
+        ("POST", "/api/rag/clear")   => respond_json(&mut stream, &handle_rag_clear(st, &body)),
         _ => respond(&mut stream, 404, "text/plain", "not found"),
     }
 }
@@ -2301,10 +2442,11 @@ fn handle_models(st: &Shared) -> serde_json::Value {
         "models": s.models,
         "active": s.cfg.active_model,
         "draft_candidates": draft_candidates,
-        "draft": {
-            "model": if s.cfg.draft_model.is_empty() { None } else { Some(&s.cfg.draft_model) },
-            "max": s.cfg.draft_max,
-            "ngl": s.cfg.gpu_layers_draft,
+        "spec": {
+            "type": if s.cfg.spec_type.is_empty() { None } else { Some(&s.cfg.spec_type) },
+            "draft_n_max": s.cfg.spec_draft_n_max,
+            "draft_model": if s.cfg.draft_model.is_empty() { None } else { Some(&s.cfg.draft_model) },
+            "gpu_layers_draft": s.cfg.gpu_layers_draft,
         },
         "params": {
             "ngl": s.cfg.ngl, "ctx": s.cfg.ctx, "flash_attn": s.cfg.flash_attn,
@@ -2355,7 +2497,8 @@ fn handle_load(st: &Shared, body: &str) -> serde_json::Value {
     if let Some(v) = req.top_p { cfg.top_p = v; }
     if let Some(v) = req.repeat_penalty { cfg.repeat_penalty = v; }
     if let Some(v) = req.draft_model { cfg.draft_model = v; }
-    if let Some(v) = req.draft_max { cfg.draft_max = v; }
+    if let Some(v) = req.spec_type { cfg.spec_type = v; }
+    if let Some(v) = req.spec_draft_n_max { cfg.spec_draft_n_max = v; }
     if let Some(v) = req.gpu_layers_draft { cfg.gpu_layers_draft = v; }
 
     eprintln!("[llama] starting {} (ngl={}, ctx={}, fa={})",
@@ -2480,21 +2623,39 @@ fn handle_rag_index(st: &Shared, body: &str) -> serde_json::Value {
         return serde_json::json!({"error": "no files to index"});
     }
 
+    let domain = if req.domain == "text" { "text" } else { "code" };
+
     // Lazy-start the embed server on first index (blocks until ready).
     if let Err(e) = ensure_embed_ready(st) {
         return serde_json::json!({"error": e});
     }
 
     // Phase 1: lock briefly to read config
-    let (endpoint, doc_prefix, chunk_size, chunk_overlap, chunker_tool) = {
+    let (endpoint, code_doc_prefix, chunk_size, chunk_overlap, chunker_tool) = {
         let s = st.lock().unwrap();
         (s.cfg.embedding_endpoint(), s.cfg.embed.doc_prefix.clone(),
          s.rag.cfg.chunk_size, s.rag.cfg.chunk_overlap, s.rag.cfg.chunker_tool.clone())
     };
     // Lock released here
 
-    // Phase 1b: chunk files outside the lock (may spawn external process)
-    let (all_chunks, all_sources, all_kinds, all_files) = if let Some(ext_chunks) =
+    // Phase 1b: chunk files outside the lock.
+    // Text domain uses the prose chunker; code domain tries the external
+    // syntax-aware chunker, falling back to the internal line-window one.
+    let (all_chunks, all_sources, all_kinds, all_files) = if domain == "text" {
+        let mut chunks = Vec::new();
+        let mut sources = Vec::new();
+        let mut kinds = Vec::new();
+        let mut files = Vec::new();
+        for f in &req.files {
+            for (label, text, kind, file) in chunk_text_file(&f.name, &f.content) {
+                sources.push(label);
+                chunks.push(text);
+                kinds.push(kind);
+                files.push(file);
+            }
+        }
+        (chunks, sources, kinds, files)
+    } else if let Some(ext_chunks) =
         try_external_chunker(&chunker_tool, &req.files, chunk_size, chunk_overlap)
     {
         let mut chunks = Vec::with_capacity(ext_chunks.len());
@@ -2509,7 +2670,6 @@ fn handle_rag_index(st: &Shared, body: &str) -> serde_json::Value {
         }
         (chunks, sources, kinds, files)
     } else {
-        // Fallback: internal chunker (lock-free, uses only config values)
         eprintln!("[rag] using internal fallback chunker");
         let mut chunks: Vec<String> = Vec::new();
         let mut sources: Vec<String> = Vec::new();
@@ -2530,8 +2690,11 @@ fn handle_rag_index(st: &Shared, body: &str) -> serde_json::Value {
         return serde_json::json!({"error": "no chunks produced from files"});
     }
 
+    // Domain-appropriate document embedding prefix.
+    let doc_prefix = if domain == "text" { TEXT_DOC_PREFIX.to_string() } else { code_doc_prefix };
+
     // Phase 2: embedding call (network I/O, no lock held)
-    eprintln!("[rag] embedding {} chunks from {} files...", all_chunks.len(), req.files.len());
+    eprintln!("[rag] embedding {} '{domain}' chunks from {} files...", all_chunks.len(), req.files.len());
     let t0 = Instant::now();
 
     let vectors = match get_embeddings_batch(&endpoint, &all_chunks, &doc_prefix) {
@@ -2544,9 +2707,10 @@ fn handle_rag_index(st: &Shared, body: &str) -> serde_json::Value {
     // Phase 3: lock briefly to store results
     let file_names: Vec<String> = req.files.iter().map(|f| f.name.clone()).collect();
     let mut s = st.lock().unwrap();
-    match s.rag.store_embeddings(all_chunks, all_sources, vectors, file_names, all_kinds, all_files) {
+    match s.rag.store_embeddings(all_chunks, all_sources, vectors, file_names, all_kinds, all_files, domain) {
         Ok(count) => serde_json::json!({
             "ok": true,
+            "domain": domain,
             "chunks_indexed": count,
             "files": req.files.iter().map(|f| &f.name).collect::<Vec<_>>(),
         }),
@@ -2559,17 +2723,21 @@ fn handle_rag_search(st: &Shared, body: &str) -> serde_json::Value {
         Ok(r) => r,
         Err(e) => return serde_json::json!({"error": e.to_string()}),
     };
+    let domain = if req.domain == "text" { "text" } else { "code" };
 
     // Phase 1: lock briefly to get config
-    let (endpoint, query_prefix, search_limit, has_chunks) = {
+    let (endpoint, code_query_prefix, search_limit, has_chunks) = {
         let s = st.lock().unwrap();
         (s.cfg.embedding_endpoint(), s.cfg.embed.query_prefix.clone(),
-         s.rag.cfg.search_results, !s.rag.chunks.is_empty())
+         s.rag.cfg.search_results, s.rag.domain_count(domain) > 0)
     };
 
     if !has_chunks {
         return serde_json::json!({"ok": true, "results": []});
     }
+
+    // Domain-appropriate query prefix.
+    let query_prefix = if domain == "text" { TEXT_QUERY_PREFIX.to_string() } else { code_query_prefix };
 
     // Phase 2: embed query (no lock)
     let limit = req.limit.unwrap_or(search_limit);
@@ -2580,16 +2748,22 @@ fn handle_rag_search(st: &Shared, body: &str) -> serde_json::Value {
 
     // Phase 3: lock briefly for similarity search (CPU only, fast)
     let s = st.lock().unwrap();
-    let hits = s.rag.search_local(&query_vec, limit, &req.query);
+    let hits = s.rag.search_local(&query_vec, limit, &req.query, domain);
     let results: Vec<serde_json::Value> = hits.iter().map(|(src, text, dist)| {
         serde_json::json!({"source": src, "text": text, "distance": dist})
     }).collect();
     serde_json::json!({"ok": true, "results": results})
 }
 
-fn handle_rag_clear(st: &Shared) -> serde_json::Value {
+fn handle_rag_clear(st: &Shared, body: &str) -> serde_json::Value {
+    let req: RagClearReq = serde_json::from_str(body).unwrap_or(RagClearReq { domain: None });
     let mut s = st.lock().unwrap();
-    match s.rag.clear() {
+    let result = match req.domain.as_deref() {
+        Some("text") => s.rag.clear_domain("text"),
+        Some("code") => s.rag.clear_domain("code"),
+        _ => s.rag.clear(),
+    };
+    match result {
         Ok(()) => serde_json::json!({"ok": true}),
         Err(e) => serde_json::json!({"error": e}),
     }
@@ -2701,8 +2875,15 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
         Ok(r) => r,
         Err(e) => { send_sse_error(stream, &e.to_string()); return; }
     };
-    if req.description.is_empty() {
-        send_sse_error(stream, "No description provided");
+
+    let is_chat = req.mode == "chat";
+    let has_input = if is_chat {
+        req.messages.iter().any(|m| m.role == "user" && !m.content.trim().is_empty())
+    } else {
+        !req.description.is_empty()
+    };
+    if !has_input {
+        send_sse_error(stream, if is_chat { "No message provided" } else { "No description provided" });
         return;
     }
 
@@ -2724,6 +2905,11 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
          Access-Control-Allow-Origin: *\r\n\r\n"
     );
     let _ = stream.flush();
+
+    if is_chat {
+        handle_chat_stream(stream, st, &req, &cfg);
+        return;
+    }
 
     let is_review = req.mode == "review";
 
@@ -2826,7 +3012,7 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
                 Ok(query_vec) => {
                     let s = st.lock().unwrap();
                     let hits = s.rag.search_local(
-                        &query_vec, RAG_CANDIDATE_POOL, &req.description,
+                        &query_vec, RAG_CANDIDATE_POOL, &req.description, "code",
                     );
                     drop(s);
 
@@ -2959,7 +3145,29 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
         "stream": true,
     });
 
-    let tmp = format!("/tmp/cw_{}.json", std::process::id());
+    stream_completion(
+        stream, st, &cfg.endpoint(), &llama_req,
+        serde_json::json!({"rag_chunks": rag_chunks_used}),
+    );
+}
+
+/// Stream a chat-completions request to the llama server, relaying tokens to
+/// the client as SSE. Shared by the write/review and chat pipelines. Kills the
+/// upstream generation if the client disconnects, and folds `done_extra` into
+/// the terminal `{done:true,...}` event. Updates session token counters.
+fn stream_completion(
+    stream: &mut TcpStream,
+    st: &Shared,
+    endpoint: &str,
+    llama_req: &serde_json::Value,
+    done_extra: serde_json::Value,
+) {
+    // Unique temp path per call — concurrent requests must not collide.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = format!("/tmp/cw_{}_{}.json", std::process::id(), seq);
+
     if fs::write(&tmp, llama_req.to_string()).is_err() {
         send_sse(stream, &serde_json::json!({"error": "failed to write temp file"}));
         return;
@@ -2968,7 +3176,7 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
     let child = Command::new(curl_cmd())
         .args([
             "-s", "--no-buffer", "-X", "POST",
-            &cfg.endpoint(),
+            endpoint,
             "-H", "content-type: application/json",
             "--max-time", "300",
             "-d", &format!("@{tmp}"),
@@ -3000,8 +3208,8 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
                 if !content.is_empty() {
                     token_count += 1;
                     if !send_sse(stream, &serde_json::json!({"token": content})) {
-                        // Client disconnected (abort) — kill curl to stop generation
-                        eprintln!("[write] client disconnected after {token_count} tokens, killing generation");
+                        // Client disconnected (abort) — kill curl to stop generation.
+                        eprintln!("[gen] client disconnected after {token_count} tokens, killing generation");
                         let _ = child.kill();
                         aborted = true;
                         break;
@@ -3013,10 +3221,13 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
 
     let elapsed_ms = t0.elapsed().as_millis() as u64;
     if !aborted {
-        send_sse(stream, &serde_json::json!({
+        let mut ev = serde_json::json!({
             "done": true, "tokens": token_count, "elapsed_ms": elapsed_ms,
-            "rag_chunks": rag_chunks_used,
-        }));
+        });
+        if let Some(obj) = done_extra.as_object() {
+            for (k, v) in obj { ev[k] = v.clone(); }
+        }
+        send_sse(stream, &ev);
     }
 
     let _ = fs::remove_file(&tmp);
@@ -3025,6 +3236,143 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
     let mut s = st.lock().unwrap();
     s.tokens_session += token_count;
     s.requests += 1;
+}
+
+// ── Streaming chat (multi-turn, text-domain RAG) ────────────
+//
+// Stateless server: the client owns the thread and sends it whole each turn
+// (`req.messages`). The server prepends a general-assistant system prompt,
+// optionally grounds it with retrieved *text* chunks, trims oldest turns to
+// fit the context window, and streams the reply. No server-side session map —
+// there is nothing to evict, persist, or race on.
+fn handle_chat_stream(stream: &mut TcpStream, st: &Shared, req: &WriteReq, cfg: &RuntimeCfg) {
+    const OUTPUT_RESERVE: u64 = 512;   // roomier reserve for conversational replies
+    const RAG_CANDIDATE_POOL: usize = 20;
+    const PER_MSG_OVERHEAD: u64 = 8;   // role/formatting tokens per message
+
+    let model_ctx = cfg.ctx as u64;
+
+    let mut system = "You are a helpful, knowledgeable assistant in an ongoing \
+        conversation. Answer clearly and concisely, using the conversation history \
+        for context. When reference material is provided below, ground your answers \
+        in it and say so if it does not cover the question.".to_string();
+
+    // ── Optional RAG over the text corpus ──
+    let mut rag_chunks_used = 0usize;
+    if req.use_rag {
+        let query = req.messages.iter().rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+
+        let have_index = {
+            let s = st.lock().unwrap();
+            s.rag.cfg.enabled && s.rag.domain_count("text") > 0
+        };
+
+        if have_index && !query.trim().is_empty() {
+            match ensure_embed_ready(st) {
+                Ok(()) => {
+                    let endpoint = cfg.embedding_endpoint();
+                    match get_embedding(&endpoint, &query, TEXT_QUERY_PREFIX) {
+                        Ok(qv) => {
+                            let hits = {
+                                let s = st.lock().unwrap();
+                                s.rag.search_local(&qv, RAG_CANDIDATE_POOL, &query, "text")
+                            };
+                            if !hits.is_empty() {
+                                let rag_budget = (model_ctx * 2) / 5;  // ≤40% of ctx
+                                let mut block = String::from("\n\n--- reference material ---\n");
+                                let mut used = estimate_tokens(&block);
+                                let mut sources = Vec::new();
+                                for (source, text, score) in &hits {
+                                    let piece = format!("[{source}]\n{text}\n\n");
+                                    let cost = estimate_tokens(&piece);
+                                    if used + cost > rag_budget && rag_chunks_used > 0 { break; }
+                                    block.push_str(&piece);
+                                    used += cost;
+                                    rag_chunks_used += 1;
+                                    sources.push(serde_json::json!({"source": source, "score": score}));
+                                }
+                                system.push_str(&block);
+                                send_sse(stream, &serde_json::json!({
+                                    "rag_info": {
+                                        "chunks_retrieved": rag_chunks_used,
+                                        "rag_tokens": used,
+                                        "sources": sources,
+                                    }
+                                }));
+                            }
+                        }
+                        Err(e) => { send_sse(stream, &serde_json::json!({"rag_info": {"error": e}})); }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[chat] embed unavailable, answering without retrieval: {e}");
+                    send_sse(stream, &serde_json::json!({"rag_info": {"error": e}}));
+                }
+            }
+        }
+    }
+
+    // ── Trim history newest-first to fit the context window ──
+    let system_tokens = estimate_tokens(&system);
+    let mut budget_used = system_tokens + OUTPUT_RESERVE;
+    let mut kept: Vec<&ChatMsg> = Vec::new();
+    for m in req.messages.iter().rev() {
+        if m.role != "user" && m.role != "assistant" { continue; }
+        let cost = estimate_tokens(&m.content) + PER_MSG_OVERHEAD;
+        if budget_used + cost > model_ctx && !kept.is_empty() { break; }
+        budget_used += cost;
+        kept.push(m);
+    }
+    kept.reverse();
+
+    let turns_kept = kept.len();
+    let turns_total = req.messages.iter()
+        .filter(|m| m.role == "user" || m.role == "assistant").count();
+
+    let mut messages = vec![serde_json::json!({"role": "system", "content": system})];
+    for m in &kept {
+        messages.push(serde_json::json!({"role": m.role, "content": m.content}));
+    }
+
+    let input_tokens = budget_used - OUTPUT_RESERVE;
+    let max_tokens = model_ctx.saturating_sub(input_tokens);
+    if max_tokens < MIN_OUTPUT_TOKENS {
+        send_sse(stream, &serde_json::json!({
+            "error": format!(
+                "Thread too long — input ~{} of {} tokens. Start a new chat or clear older turns.",
+                input_tokens, model_ctx)
+        }));
+        return;
+    }
+
+    send_sse(stream, &serde_json::json!({
+        "context_info": {
+            "model_ctx": model_ctx,
+            "turns_kept": turns_kept,
+            "turns_total": turns_total,
+            "input_tokens": input_tokens,
+            "remaining_tokens": max_tokens,
+            "rag_chunks": rag_chunks_used,
+        }
+    }));
+
+    let llama_req = serde_json::json!({
+        "model": "local",
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": cfg.temp,
+        "top_p": cfg.top_p,
+        "repeat_penalty": cfg.repeat_penalty,
+        "stream": true,
+    });
+
+    stream_completion(
+        stream, st, &cfg.endpoint(), &llama_req,
+        serde_json::json!({"rag_chunks": rag_chunks_used, "turns_kept": turns_kept}),
+    );
 }
 
 /// Send an SSE event to the client.  Returns `false` if the write fails

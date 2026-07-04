@@ -117,6 +117,28 @@ chunk_compression = true
 # ── Models ──────────────────────────────────────────────────
 
 [[models]]
+filename = "Huihui-Qwythos-9B-Claude-Mythos-5-1M-abliterated-Q6_K.gguf"
+name = "Qwythos 9B (Mythos-5, 1M, abliterated Q6_K)"
+family = "qwen"
+gpu_layers = 12
+context_size = 16256
+temperature = 0.7
+top_k = 40
+top_p = 0.9
+repeat_penalty = 1.1
+spec_type = "draft-mtp"
+spec_draft_n_max = 2
+
+[[models]]
+filename = "Qwen2.5-Coder-7B-Instruct-abliterated-Q5_K_M.gguf"
+name = "Qwen 2.5 7B Coder Abliterated"
+context_size = 32768
+temperature = 0.7
+top_k = 40
+top_p = 0.9
+repeat_penalty = 1.1
+
+[[models]]
 filename = "qwen2.5-0.5b-instruct-q8_0.gguf"
 name = "Qwen2.5 0.5B Instruct (Q8_0)"
 family = "qwen"

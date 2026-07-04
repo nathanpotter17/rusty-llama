@@ -43,6 +43,7 @@
         <div class="mode-toggle">
           <button class="mode-btn active" data-mode="write">Write</button>
           <button class="mode-btn" data-mode="review">Review</button>
+          <button class="mode-btn" data-mode="chat">Chat</button>
         </div>
         <label class="rag-toggle" id="rag-toggle" title="Use RAG: retrieve relevant code chunks from the index before generating">
           <input type="checkbox" id="rag-checkbox">
@@ -115,8 +116,9 @@
     </div>
     <div class="pane pane-output">
       <div class="pane-header">
-        <span class="pane-title">Output</span>
+        <span class="pane-title" id="output-title">Output</span>
         <div id="context-info" class="context-info hidden"></div>
+        <button id="chat-new-btn" class="small-btn hidden" title="Clear the conversation thread">New chat</button>
         <button id="copy-btn" class="small-btn hidden">Copy</button>
         <span id="stats" class="stats"></span>
       </div>
