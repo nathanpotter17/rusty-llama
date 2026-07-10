@@ -1,44 +1,47 @@
 # CodeWriter — config.toml
 
+# ── Hardware ────────────────────────────────────────────────
+# One knob. Set your GPU's VRAM class and every hardware-shaped parameter
+# (context size, KV-cache quantization, flash-attention gating, parallel
+# slots, embed-server sizing) is derived for you. Real free VRAM — read live
+# from nvidia-smi — further caps the launch context per model, using the
+# actual model weight size, so a card is used to its full extent while a busy
+# desktop never triggers an out-of-memory launch.
+#   "4GB"  — small cards (GTX 1650, RTX 3050 laptop, ...)
+#   "8GB"  — mainstream cards (RTX 3060 / 4060, ...)
+#   "cpu"  — no CUDA GPU; CPU inference
+[hardware]
+vram = "4GB"
+
 [server]
 port = 8090
 
 [llama]
 binary = ""              # auto-detect if empty
 port = 8079
-parallel_slots = 1
 startup_timeout = 120
 
 [limits]
 session_tokens = 0       # 0 = unlimited
 daily_tokens = 0
 
+# ── Defaults ────────────────────────────────────────────────
+# Model identity + sampling only. Per-model [[models]] entries override the
+# sampling values. All hardware knobs come from [hardware].
 [defaults]
 model = "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
 models_dir = "models"
-gpu_layers = -1           # -1 = per-model default
-context_size = 0          # 0 = per-model default
-flash_attention = true
 temperature = 0.7
 top_k = 40
 top_p = 0.9
 repeat_penalty = 1.1
 
-# KV cache quantization
-cache_type_k = "q8_0"
-cache_type_v = "q8_0"
-
-# Speculative decoding
-draft_model = ""
-draft_max = 10
-gpu_layers_draft = 99
-
 # ── Embed Server ────────────────────────────────────────────
-# A second llama-server process dedicated to embeddings.
-# Runs on a separate port so the main model can generate while
-# the embed model produces vectors. Both PIDs are managed by
-# the main binary — start/stop from the settings panel or
-# automatically on boot.
+# A second llama-server process dedicated to embeddings, on its own port so
+# the main model can generate while the embed model produces vectors. Both
+# PIDs are managed by the main binary. GPU offload and context are derived
+# from the [hardware] tier; only the model, port, and retrieval prefixes are
+# set here.
 #
 # pooling: "mean", "cls", "last", or "" (let server auto-detect).
 #   - embeddinggemma: "" (auto / mean)
@@ -48,61 +51,46 @@ gpu_layers_draft = 99
 # query_prefix / doc_prefix: text prepended before embedding.
 #   Different models require different prefixes for best retrieval.
 #   Leave both empty for models that don't use prefixes (e.g. embeddinggemma).
-#
-#   nomic-embed-code:
-#     query_prefix = "Represent this query for searching relevant code: "
-#     doc_prefix = ""
-#
-#   qwen3-embedding:
-#     query_prefix = "Instruct: Find code relevant to this description\nQuery: "
-#     doc_prefix = ""
-
 [embed]
-enabled = true
+enabled = false
 model = "Qwen3-Embedding-0.6B-Q8_0.gguf"
 port = 8078
-gpu_layers = 99           # full offload
-context_size = 4096       # supports up to 32k
-parallel_slots = 1
 startup_timeout = 30
-pooling = ""              # auto-detect from GGUF metadata
+pooling = ""             # auto-detect from GGUF metadata
 query_prefix = "Instruct: Find code relevant to this description\nQuery: "
 doc_prefix = ""
 
 # ── RAG (Retrieval-Augmented Generation) ────────────────────
-# Indexes uploaded files into a local vector store using the embed
-# server. Semantic search retrieves relevant code chunks and injects
-# them into the prompt before generation.
+# Indexes uploaded files into a local vector store using the embed server.
+# Semantic search retrieves relevant code chunks and injects them into the
+# prompt before generation.
 #
 # chunk_size = lines per chunk for code files
 # chunk_overlap = overlapping lines between consecutive chunks
 # search_results = number of chunks to retrieve per query
 #
-# min_similarity = cosine similarity threshold (0.0-1.0); chunks
-#   scoring below this are discarded even if they're the "best" match.
-#   Prevents injecting irrelevant context when no good match exists.
-#   Recommended: 0.20-0.35 depending on embedding model.
+# min_similarity = cosine similarity threshold (0.0-1.0); chunks scoring below
+#   this are discarded even if they're the "best" match. Recommended 0.20-0.35.
 #
-# hybrid_weight_vector / hybrid_weight_bm25 = weights for combining
-#   vector cosine similarity and BM25 keyword scoring. Should sum to 1.0.
-#   Set hybrid_weight_bm25 = 0.0 to disable hybrid search.
-#   Typical: 0.7/0.3 (vector-heavy) or 0.5/0.5 (balanced).
+# hybrid_weight_vector / hybrid_weight_bm25 = weights for combining vector
+#   cosine similarity and BM25 keyword scoring. Should sum to 1.0. Set
+#   hybrid_weight_bm25 = 0.0 to disable hybrid search.
 #
-# chunker_tool = path to external chunker script. When set, the indexer
-#   spawns this tool for syntax-aware code chunking (respects function,
-#   struct, impl, class boundaries). Falls back to internal line-window
-#   chunker if the tool is missing or fails. Set to "" to disable.
+# chunker_tool = path to external chunker script. When set, the indexer spawns
+#   this tool for syntax-aware code chunking (respects function, struct, impl,
+#   class boundaries). Falls back to internal line-window chunker if the tool
+#   is missing or fails. Set to "" to disable.
 #
 # HNSW graph parameters (approximate nearest neighbor search):
 # hnsw_m = max connections per node per layer (layer 0 gets 2×M)
-# hnsw_ef_construction = beam width during index build (higher = better graph, slower build)
-# hnsw_ef_search = beam width during query (higher = more accurate, slower search)
+# hnsw_ef_construction = beam width during index build
+# hnsw_ef_search = beam width during query (higher = more accurate, slower)
 [rag]
 enabled = true
 db_path = "data/rag_index.json"
 chunk_size = 60
 chunk_overlap = 10
-search_results = 12
+search_results = 5
 min_similarity = 0.25
 hybrid_weight_vector = 0.7
 hybrid_weight_bm25 = 0.3
@@ -110,33 +98,11 @@ chunker_tool = "tools/chunker.py"
 hnsw_m = 16
 hnsw_ef_construction = 150
 hnsw_ef_search = 64
-query_expansion = true
-llm_reranking = true
-chunk_compression = true
 
 # ── Models ──────────────────────────────────────────────────
-
-[[models]]
-filename = "Huihui-Qwythos-9B-Claude-Mythos-5-1M-abliterated-Q6_K.gguf"
-name = "Qwythos 9B (Mythos-5, 1M, abliterated Q6_K)"
-family = "qwen"
-gpu_layers = 12
-context_size = 16256
-temperature = 0.7
-top_k = 40
-top_p = 0.9
-repeat_penalty = 1.1
-spec_type = "draft-mtp"
-spec_draft_n_max = 2
-
-[[models]]
-filename = "Qwen2.5-Coder-7B-Instruct-abliterated-Q5_K_M.gguf"
-name = "Qwen 2.5 7B Coder Abliterated"
-context_size = 32768
-temperature = 0.7
-top_k = 40
-top_p = 0.9
-repeat_penalty = 1.1
+# The only per-model overrides. gpu_layers and context_size are the model's
+# own properties (layer count, trained context max); the [hardware] tier still
+# caps the effective launch context to what real VRAM can hold.
 
 [[models]]
 filename = "qwen2.5-0.5b-instruct-q8_0.gguf"

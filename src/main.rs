@@ -19,6 +19,7 @@ const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 #[derive(Deserialize)]
 #[serde(default)]
 struct FileConfig {
+    hardware: HardwareCfg,
     server: ServerCfg,
     llama: LlamaCfg,
     defaults: DefaultsCfg,
@@ -32,6 +33,7 @@ struct FileConfig {
 impl Default for FileConfig {
     fn default() -> Self {
         Self {
+            hardware: HardwareCfg::default(),
             server: ServerCfg::default(),
             llama: LlamaCfg::default(),
             defaults: DefaultsCfg::default(),
@@ -41,6 +43,19 @@ impl Default for FileConfig {
             models: Vec::new(),
         }
     }
+}
+
+/// The single hardware knob. `vram` selects a tier ("4GB" | "8GB" | "cpu")
+/// whose preset derives context size, KV-cache quantization, flash-attention
+/// gating, parallel slots, and embed-server sizing. Real free VRAM further
+/// caps the launch context so a busy desktop never triggers an OOM launch.
+#[derive(Deserialize, Clone)]
+#[serde(default)]
+struct HardwareCfg {
+    vram: String,
+}
+impl Default for HardwareCfg {
+    fn default() -> Self { Self { vram: "8GB".into() } }
 }
 
 #[derive(Deserialize, Clone)]
@@ -57,42 +72,33 @@ impl Default for ServerCfg {
 struct LlamaCfg {
     binary: String,
     port: u16,
-    parallel_slots: u32,
     startup_timeout: u64,
 }
 impl Default for LlamaCfg {
     fn default() -> Self {
-        Self { binary: String::new(), port: 8079, parallel_slots: 1, startup_timeout: 120 }
+        Self { binary: String::new(), port: 8079, startup_timeout: 120 }
     }
 }
 
+/// Sampling + model identity only. Every hardware-shaped parameter
+/// (gpu_layers, context, flash-attn, KV quantization, draft offload) is now
+/// derived from the [hardware] preset, not set here. Per-model [[models]]
+/// entries remain the only per-model overrides.
 #[derive(Deserialize, Clone)]
 #[serde(default)]
 struct DefaultsCfg {
     model: String,
     models_dir: String,
-    gpu_layers: i32,
-    context_size: u32,
-    flash_attention: bool,
     temperature: f32,
     top_k: u32,
     top_p: f32,
     repeat_penalty: f32,
-    cache_type_k: String,
-    cache_type_v: String,
-    draft_model: String,
-    spec_type: String,
-    spec_draft_n_max: u32,
-    gpu_layers_draft: i32,
 }
 impl Default for DefaultsCfg {
     fn default() -> Self {
         Self {
-            model: String::new(), models_dir: "models".into(), gpu_layers: -1,
-            context_size: 0, flash_attention: true, temperature: 0.7,
-            top_k: 40, top_p: 0.9, repeat_penalty: 1.1,
-            cache_type_k: String::new(), cache_type_v: String::new(),
-            draft_model: String::new(), spec_type: String::new(), spec_draft_n_max: 2, gpu_layers_draft: 99,
+            model: String::new(), models_dir: "models".into(),
+            temperature: 0.7, top_k: 40, top_p: 0.9, repeat_penalty: 1.1,
         }
     }
 }
@@ -189,8 +195,6 @@ struct ModelEntry {
     gpu_layers: i32,
     #[serde(default = "def_ctx")]
     context_size: u32,
-    #[serde(default = "def_true")]
-    flash_attention: bool,
     #[serde(default = "def_temp")]
     temperature: f32,
     #[serde(default = "def_topk")]
@@ -213,7 +217,6 @@ struct ModelEntry {
 fn def_family() -> String { "unknown".into() }
 fn def_ngl() -> i32 { 15 }
 fn def_ctx() -> u32 { 4096 }
-fn def_true() -> bool { true }
 fn def_temp() -> f32 { 0.7 }
 fn def_topk() -> u32 { 40 }
 fn def_topp() -> f32 { 0.9 }
@@ -248,7 +251,12 @@ struct RuntimeCfg {
     spec_draft_n_max: u32,
     gpu_layers_draft: i32,
     threads: usize,           // generation threads, derived from SystemInfo
-    auto_ctx: u32,            // VRAM-derived context default (used when ctx unset)
+    // Hardware plan: the resolved preset plus the real free-VRAM reading used
+    // to size KV/context per model. Context, flash-attn, KV quantization and
+    // parallel slots are all derived from these — never read from the file.
+    preset: HwPreset,
+    free_vram_mib: Option<u64>,
+    embed_enabled: bool,      // reserve embed VRAM when planning main context
     // Embed server config (cloned from EmbedCfg)
     embed: EmbedCfg,
 }
@@ -278,7 +286,6 @@ struct Model {
     family: String,
     gpu_layers: i32,
     context_size: u32,
-    flash_attention: bool,
     temperature: f32,
     top_k: u32,
     top_p: f32,
@@ -289,7 +296,10 @@ struct Model {
     gpu_layers_draft: i32,
 }
 
-fn discover_models(dir: &str, known: &[ModelEntry], defaults: &DefaultsCfg, exclude: &[&str]) -> Vec<Model> {
+fn discover_models(
+    dir: &str, known: &[ModelEntry], defaults: &DefaultsCfg,
+    default_ngl: i32, default_ctx: u32, exclude: &[&str],
+) -> Vec<Model> {
     let Ok(entries) = fs::read_dir(dir) else {
         eprintln!("  models dir '{dir}' not found");
         return Vec::new();
@@ -306,21 +316,23 @@ fn discover_models(dir: &str, known: &[ModelEntry], defaults: &DefaultsCfg, excl
                     filename: fname, path,
                     name: if k.name.is_empty() { pretty_name(&k.filename) } else { k.name.clone() },
                     family: k.family.clone(), gpu_layers: k.gpu_layers,
-                    context_size: k.context_size, flash_attention: k.flash_attention,
+                    context_size: k.context_size,
                     temperature: k.temperature, top_k: k.top_k, top_p: k.top_p,
                     repeat_penalty: k.repeat_penalty,
                     spec_type: k.spec_type.clone(), spec_draft_n_max: k.spec_draft_n_max,
                     draft_model: k.draft_model.clone(), gpu_layers_draft: k.gpu_layers_draft,
                 }
             } else {
+                // Discovered-on-disk model with no [[models]] entry: hardware
+                // knobs come from the preset, sampling from [defaults].
                 Model {
                     name: pretty_name(&fname), filename: fname, path, family: "unknown".into(),
-                    gpu_layers: defaults.gpu_layers,
-                    context_size: if defaults.context_size > 0 { defaults.context_size } else { 4096 },
-                    flash_attention: defaults.flash_attention, temperature: defaults.temperature,
+                    gpu_layers: default_ngl,
+                    context_size: default_ctx,
+                    temperature: defaults.temperature,
                     top_k: defaults.top_k, top_p: defaults.top_p, repeat_penalty: defaults.repeat_penalty,
-                    spec_type: defaults.spec_type.clone(), spec_draft_n_max: defaults.spec_draft_n_max,
-                    draft_model: defaults.draft_model.clone(), gpu_layers_draft: defaults.gpu_layers_draft,
+                    spec_type: String::new(), spec_draft_n_max: def_spec_nmax(),
+                    draft_model: String::new(), gpu_layers_draft: def_ngl_draft(),
                 }
             })
         })
@@ -1674,7 +1686,9 @@ impl Drop for ManagedServer {
 /// Launch flags for the main generation server.
 fn llama_args(cfg: &RuntimeCfg, model: &Model) -> Vec<String> {
     let ngl = if cfg.ngl < 0 { 99 } else { cfg.ngl };
-    let fa = if cfg.flash_attn { "on" } else { "auto" };
+    // FA is gated on context (see flash_attn_for_ctx): "off" below threshold,
+    // "on" above — never "auto", so the gate is authoritative.
+    let fa = if cfg.flash_attn { "on" } else { "off" };
     let mut args = vec![
         "-m".into(), model.path.clone(),
         "--port".into(), cfg.llama_port.to_string(),
@@ -2013,21 +2027,228 @@ impl SystemInfo {
     }
 }
 
-/// Context ceiling derived from free VRAM. Heuristic, tuned for a 4-7B
-/// Q4/Q5 model with quantized (q8_0) KV cache. Only applied when no
-/// explicit ctx is configured — an explicit per-model ctx is always
-/// honored, never silently clamped.
-fn vram_ctx_ceiling(free_vram_mib: Option<u64>) -> u32 {
-    match free_vram_mib {
-        Some(v) if v >= 20000 => 65536,
-        Some(v) if v >= 12000 => 32768,
-        Some(v) if v >=  8000 => 16384,
-        Some(v) if v >=  5000 => 8192,
-        Some(v) if v >=  3000 => 4096,
-        Some(_)               => 2048,
-        None                  => 8192, // CPU / unknown host: modest default
+// ── Hardware preset + context planning ──────────────────────
+//
+// One knob (`[hardware] vram`) selects a tier. The tier fixes the *policy*
+// knobs (KV quantization, slots, sanity bounds, embed sizing). The actual
+// launch context is then *planned* against the REAL free-VRAM reading and the
+// model's on-disk weight footprint, so an 8GB card headroom is used to its
+// full extent while a loaded desktop is respected — no fixed under-provisioning
+// buckets, no OOM launches.
+
+const MIN_CTX: u32 = 2048;
+/// CUDA context + compute buffers + fragmentation margin.
+const HEADROOM_MIB: u64 = 512;
+/// Resident footprint reserved for the embed server (0.6B Q8 + its KV) so a
+/// later lazy start doesn't OOM a model sized to the whole card.
+const EMBED_RESERVE_MIB: u64 = 900;
+/// Flash attention engages only at/above this context — below it, FA's
+/// overhead isn't paid for a benefit that doesn't materialize on short prompts.
+const FA_CTX_THRESHOLD: u32 = 8192;
+
+#[derive(Clone, Copy)]
+struct HwPreset {
+    ctx_default: u32,       // context when a model declares none
+    ctx_hard_max: u32,      // upper sanity bound regardless of spare VRAM
+    cache_type: &'static str, // KV-cache quantization for both K and V
+    parallel_slots: u32,    // main-server slots
+    default_ngl: i32,       // gpu_layers fallback for undeclared/discovered models
+    embed_ctx: u32,
+    embed_parallel: u32,
+    embed_ngl: i32,         // embed-server GPU layers; 0 = CPU (frees VRAM for the main model)
+}
+
+impl HwPreset {
+    fn from_vram(tag: &str, gpu_present: bool) -> Self {
+        match tag.trim().to_ascii_lowercase().as_str() {
+            // 4GB: a 7B only fits partially — keep the small embed model on CPU
+            // so its VRAM isn't stolen from the main model's KV cache.
+            "4gb" | "4" => Self {
+                ctx_default: 16384, ctx_hard_max: 16384, cache_type: "q8_0",
+                parallel_slots: 1, default_ngl: -1, embed_ctx: 2048, embed_parallel: 1, embed_ngl: 0,
+            },
+            "8gb" | "8" => Self {
+                ctx_default: 32768, ctx_hard_max: 32768, cache_type: "q8_0",
+                parallel_slots: 1, default_ngl: -1, embed_ctx: 4096, embed_parallel: 2, embed_ngl: 99,
+            },
+            "cpu" | "none" => Self {
+                ctx_default: 8192, ctx_hard_max: 16384, cache_type: "q8_0",
+                parallel_slots: 1, default_ngl: 0, embed_ctx: 2048, embed_parallel: 2, embed_ngl: 0,
+            },
+            _ => {
+                // Unrecognized tag: fall back on GPU presence.
+                if gpu_present {
+                    Self { ctx_default: 16384, ctx_hard_max: 32768, cache_type: "q8_0",
+                           parallel_slots: 1, default_ngl: -1, embed_ctx: 4096, embed_parallel: 2, embed_ngl: 99 }
+                } else {
+                    Self { ctx_default: 8192, ctx_hard_max: 16384, cache_type: "q8_0",
+                           parallel_slots: 1, default_ngl: 0, embed_ctx: 2048, embed_parallel: 2, embed_ngl: 0 }
+                }
+            }
+        }
     }
 }
+
+/// Per-token KV-cache cost (MiB), K+V summed across layers, with a small
+/// margin for context-scaling compute buffers. Realistic for GQA 4-8B models —
+/// deliberately not paranoid, so cards keep the context they can actually hold.
+fn kv_mib_per_token(cache_type: &str) -> f64 {
+    match cache_type {
+        "f16" | "" => 0.065,
+        "q8_0"     => 0.035,
+        "q4_0" | "q4_1" | "q5_0" | "q5_1" => 0.020,
+        _ => 0.035,
+    }
+}
+
+/// On-disk GGUF size (MiB) — the model's total weight footprint.
+fn weight_mib(path: &str) -> u64 {
+    fs::metadata(path).map(|m| m.len() / (1024 * 1024)).unwrap_or(0)
+}
+
+/// Transformer block count from GGUF metadata (the `*.block_count` key), used
+/// to scale weight/KV to the offloaded fraction under partial `-ngl`. Returns
+/// None on any parse issue so callers fall back to a whole-model estimate.
+fn gguf_block_count(path: &str) -> Option<u32> {
+    let mut f = fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; 1 << 20];   // metadata lives at the front; 1 MiB is ample
+    let n = f.read(&mut buf).ok()?;
+    let d = &buf[..n];
+    if d.len() < 24 || &d[0..4] != b"GGUF" { return None; }
+
+    let rd_u32 = |d: &[u8], p: &mut usize| -> Option<u32> {
+        let e = *p + 4; let v = u32::from_le_bytes(d.get(*p..e)?.try_into().ok()?); *p = e; Some(v)
+    };
+    let rd_u64 = |d: &[u8], p: &mut usize| -> Option<u64> {
+        let e = *p + 8; let v = u64::from_le_bytes(d.get(*p..e)?.try_into().ok()?); *p = e; Some(v)
+    };
+    let rd_str = |d: &[u8], p: &mut usize| -> Option<String> {
+        let len = rd_u64(d, p)? as usize; let e = *p + len;
+        let s = String::from_utf8_lossy(d.get(*p..e)?).into_owned(); *p = e; Some(s)
+    };
+    // Fixed byte width of a GGUF scalar value type; None for var-width/compound.
+    let scalar_w = |t: u32| -> Option<usize> {
+        match t { 0|1|7 => Some(1), 2|3 => Some(2), 4|5|6 => Some(4), 10|11|12 => Some(8), _ => None }
+    };
+    // Read one value of type `t`, advancing `p`; returns Some(int) for integer
+    // scalars, else Some(-1) after skipping. None on malformed data.
+    fn read_value(
+        d: &[u8], p: &mut usize, t: u32,
+        rd_u32: &dyn Fn(&[u8], &mut usize) -> Option<u32>,
+        rd_u64: &dyn Fn(&[u8], &mut usize) -> Option<u64>,
+        rd_str: &dyn Fn(&[u8], &mut usize) -> Option<String>,
+        scalar_w: &dyn Fn(u32) -> Option<usize>,
+    ) -> Option<i64> {
+        match t {
+            8 => { rd_str(d, p)?; Some(-1) }                       // string
+            9 => {                                                 // array
+                let et = rd_u32(d, p)?; let cnt = rd_u64(d, p)? as usize;
+                for _ in 0..cnt { read_value(d, p, et, rd_u32, rd_u64, rd_str, scalar_w)?; }
+                Some(-1)
+            }
+            0|1|7 => { let v = *d.get(*p)? as i64; *p += 1; Some(v) } // u8/i8/bool
+            2|3 => { let w = scalar_w(t)?; *p += w; Some(-1) }
+            4 => Some(rd_u32(d, p)? as i64),                        // u32
+            5 => Some(rd_u32(d, p)? as i32 as i64),                 // i32
+            10 => Some(rd_u64(d, p)? as i64),                       // u64
+            11 => Some(rd_u64(d, p)? as i64),                       // i64
+            6 => { *p += 4; Some(-1) }                              // f32
+            12 => { *p += 8; Some(-1) }                             // f64
+            _ => None,
+        }
+    }
+
+    let mut p = 4usize;
+    let _version = rd_u32(d, &mut p)?;
+    let _tensor_count = rd_u64(d, &mut p)?;
+    let kv_count = rd_u64(d, &mut p)?;
+    for _ in 0..kv_count {
+        let key = rd_str(d, &mut p)?;
+        let vtype = rd_u32(d, &mut p)?;
+        let is_bc = key.ends_with(".block_count");
+        let v = read_value(d, &mut p, vtype, &rd_u32, &rd_u64, &rd_str, &scalar_w)?;
+        if is_bc && v > 0 { return u32::try_from(v).ok(); }
+    }
+    None
+}
+
+/// VRAM footprint of the offloaded portion: (weight MiB on GPU, KV scale in
+/// (0,1]). Under partial `-ngl`, only `ngl/block_count` of the weights and KV
+/// live on the GPU; full offload (`ngl < 0`) or unknown layout ⇒ whole model.
+fn vram_footprint(path: &str, ngl: i32) -> (u64, f64) {
+    let file_mib = weight_mib(path);
+    if ngl < 0 { return (file_mib, 1.0); }             // all layers offloaded
+    match gguf_block_count(path) {
+        Some(total) if total > 0 => {
+            let off = (ngl as u32).min(total);
+            let frac = (off as f64 / total as f64).clamp(0.0, 1.0);
+            let weight = ((file_mib as f64) * frac) as u64;
+            (weight, frac.max(1.0 / total as f64))     // ≥ one layer's share
+        }
+        _ => (file_mib, 1.0),                           // unknown: conservative
+    }
+}
+
+/// A complete, self-consistent launch plan. Flash-attn and KV quantization are
+/// coupled: llama.cpp requires flash-attn for a quantized V cache, so quantized
+/// KV is used only at/above the FA context threshold; below it, KV is f16.
+struct CtxPlan {
+    ctx: u32,
+    flash_attn: bool,
+    cache_type: &'static str,   // "" ⇒ f16 (no --cache-type flags)
+}
+
+/// Plan the launch context from REAL free VRAM: subtract the offloaded weight,
+/// compute headroom, and (when enabled) the embed reservation, then size KV to
+/// what remains — clamped to the model's declared max and the preset bound.
+/// Two-pass so FA/KV stay legal: try quantized (FA-on) KV first; if that lands
+/// below the FA threshold, fall back to f16 KV with FA off.
+fn plan_context(
+    model_path: &str,
+    ngl: i32,
+    free_vram_mib: Option<u64>,
+    embed_reserve_mib: u64,
+    model_max_ctx: u32,   // 0 = model didn't declare one
+    preset: &HwPreset,
+) -> CtxPlan {
+    let hard_max = if model_max_ctx > 0 {
+        model_max_ctx.min(preset.ctx_hard_max)
+    } else {
+        preset.ctx_hard_max
+    };
+
+    let Some(free) = free_vram_mib else {
+        // CPU / no GPU reading: RAM-bound, keep the preset default.
+        let ctx = preset.ctx_default.min(hard_max).max(MIN_CTX);
+        let fa = flash_attn_for_ctx(ctx);
+        return CtxPlan { ctx, flash_attn: fa, cache_type: if fa { preset.cache_type } else { "" } };
+    };
+
+    let (weight, kv_scale) = vram_footprint(model_path, ngl);
+    let budget_mib = (free as i64) - weight as i64 - HEADROOM_MIB as i64 - embed_reserve_mib as i64;
+    if budget_mib <= 0 {
+        // Below MIN_CTX headroom: run the smallest window on f16 KV (FA off).
+        return CtxPlan { ctx: MIN_CTX, flash_attn: false, cache_type: "" };
+    }
+
+    let fit = |rate: f64| -> u32 {
+        let per = (rate * kv_scale).max(1e-6);
+        let c = ((budget_mib as f64 / per) as u64 / 1024) * 1024;   // → 1024 boundary
+        (c as u32).clamp(MIN_CTX, hard_max)
+    };
+
+    // Pass 1: quantized KV (lighter) assuming FA on.
+    let c_quant = fit(kv_mib_per_token(preset.cache_type));
+    if c_quant >= FA_CTX_THRESHOLD {
+        return CtxPlan { ctx: c_quant, flash_attn: true, cache_type: preset.cache_type };
+    }
+    // Pass 2: below FA threshold ⇒ FA off ⇒ f16 KV required (heavier).
+    let c_f16 = fit(kv_mib_per_token("f16"));
+    CtxPlan { ctx: c_f16, flash_attn: false, cache_type: "" }
+}
+
+/// Flash attention is derived from the planned context, never configured.
+fn flash_attn_for_ctx(ctx: u32) -> bool { ctx >= FA_CTX_THRESHOLD }
 
 fn probe_gpus() -> Vec<GpuInfo> {
     let Ok(out) = Command::new("nvidia-smi")
@@ -2141,7 +2362,6 @@ struct LoadReq {
     model: String,
     #[serde(default)] ngl: Option<i32>,
     #[serde(default)] ctx: Option<u32>,
-    #[serde(default)] flash_attn: Option<bool>,
     #[serde(default)] temp: Option<f32>,
     #[serde(default)] top_k: Option<u32>,
     #[serde(default)] top_p: Option<f32>,
@@ -2223,10 +2443,28 @@ fn main() {
         file_cfg.llama.binary.clone()
     };
 
+    // Probe the host up front: the preset needs GPU presence, and discovery
+    // needs the preset's default ngl/context for models with no [[models]] entry.
+    let sys = SystemInfo::probe();
+    let gpu_present = !sys.gpus.is_empty();
+    let preset = HwPreset::from_vram(&file_cfg.hardware.vram, gpu_present);
+    let free_vram = sys.free_vram_mib();
+
+    // Embed server sizing is preset-derived: a small model, always fully
+    // offloaded, with a tier-appropriate context.
+    let mut embed_cfg = file_cfg.embed.clone();
+    embed_cfg.gpu_layers = preset.embed_ngl;       // 0 = CPU on tight cards
+    embed_cfg.context_size = preset.embed_ctx;
+    embed_cfg.parallel_slots = preset.embed_parallel;
+    let embed_enabled = embed_cfg.enabled && !embed_cfg.model.is_empty();
+
     // Exclude the embed model from generation model discovery
-    let embed_model = &file_cfg.embed.model;
+    let embed_model = file_cfg.embed.model.clone();
     let exclude: Vec<&str> = if embed_model.is_empty() { vec![] } else { vec![embed_model.as_str()] };
-    let models = discover_models(&file_cfg.defaults.models_dir, &file_cfg.models, &file_cfg.defaults, &exclude);
+    let models = discover_models(
+        &file_cfg.defaults.models_dir, &file_cfg.models, &file_cfg.defaults,
+        preset.default_ngl, preset.ctx_default, &exclude,
+    );
 
     eprintln!("\n  CODEWRITER + RAG");
     eprintln!("  {} models in {}/", models.len(), file_cfg.defaults.models_dir);
@@ -2234,10 +2472,10 @@ fn main() {
         eprintln!("    {} [{}] ngl={} ctx={}", m.name, m.family, m.gpu_layers, m.context_size);
     }
     eprintln!("  llama-server: {llama_binary}");
-    if file_cfg.embed.enabled && !file_cfg.embed.model.is_empty() {
+    if embed_enabled {
         eprintln!("  embed-server: {} (port={}, ngl={}, ctx={})",
-            file_cfg.embed.model, file_cfg.embed.port,
-            file_cfg.embed.gpu_layers, file_cfg.embed.context_size);
+            embed_cfg.model, embed_cfg.port,
+            embed_cfg.gpu_layers, embed_cfg.context_size);
     } else {
         eprintln!("  embed-server: disabled");
     }
@@ -2259,40 +2497,41 @@ fn main() {
         eprintln!("  WARNING: '{llama_binary}' not found or not executable");
     }
 
-    // Read the host once; drives thread count and the auto context default.
-    let sys = SystemInfo::probe();
     sys.print();
-    let auto_ctx = vram_ctx_ceiling(sys.free_vram_mib());
-    if file_cfg.defaults.context_size == 0 {
-        eprintln!("  auto ctx: {auto_ctx} (from free VRAM); threads: {}", sys.gen_threads());
-    }
+    eprintln!(
+        "  hardware: vram=\"{}\" → ctx≤{}, kv={}, slots={}, embed_ctx={}; threads={}",
+        file_cfg.hardware.vram, preset.ctx_hard_max, preset.cache_type,
+        preset.parallel_slots, preset.embed_ctx, sys.gen_threads(),
+    );
 
     let mut cfg = RuntimeCfg {
         port: file_cfg.server.port,
         llama_binary,
         llama_port: file_cfg.llama.port,
-        parallel_slots: file_cfg.llama.parallel_slots,
+        parallel_slots: preset.parallel_slots,
         startup_timeout: file_cfg.llama.startup_timeout,
         session_limit: file_cfg.limits.session_tokens,
         daily_limit: file_cfg.limits.daily_tokens,
         models_dir: file_cfg.defaults.models_dir.clone(),
         active_model: String::new(),
-        ngl: file_cfg.defaults.gpu_layers,
-        ctx: if file_cfg.defaults.context_size > 0 { file_cfg.defaults.context_size } else { auto_ctx },
-        flash_attn: file_cfg.defaults.flash_attention,
+        ngl: preset.default_ngl,
+        ctx: preset.ctx_default,                         // replaced per-model at load
+        flash_attn: flash_attn_for_ctx(preset.ctx_default),
         temp: file_cfg.defaults.temperature,
         top_k: file_cfg.defaults.top_k,
         top_p: file_cfg.defaults.top_p,
         repeat_penalty: file_cfg.defaults.repeat_penalty,
-        cache_type_k: file_cfg.defaults.cache_type_k.clone(),
-        cache_type_v: file_cfg.defaults.cache_type_v.clone(),
-        draft_model: file_cfg.defaults.draft_model.clone(),
-        spec_type: file_cfg.defaults.spec_type.clone(),
-        spec_draft_n_max: file_cfg.defaults.spec_draft_n_max,
-        gpu_layers_draft: file_cfg.defaults.gpu_layers_draft,
+        cache_type_k: preset.cache_type.into(),
+        cache_type_v: preset.cache_type.into(),
+        draft_model: String::new(),
+        spec_type: String::new(),
+        spec_draft_n_max: def_spec_nmax(),
+        gpu_layers_draft: def_ngl_draft(),
         threads: sys.gen_threads(),
-        auto_ctx,
-        embed: file_cfg.embed.clone(),
+        preset,
+        free_vram_mib: free_vram,
+        embed_enabled,
+        embed: embed_cfg,
     };
 
     let mut llama = ManagedServer::new("llama", cfg.llama_port);
@@ -2311,7 +2550,7 @@ fn main() {
             apply_model_params(&mut cfg, m);
             eprintln!("[llama] starting {} (ngl={}, ctx={}, fa={})",
                 m.name, if cfg.ngl < 0 { 99 } else { cfg.ngl }, cfg.ctx,
-                if cfg.flash_attn { "on" } else { "auto" });
+                if cfg.flash_attn { "on" } else { "off" });
             if llama.spawn(&cfg.llama_binary, &llama_args(&cfg, m), &m.filename, cfg.llama_port).is_ok() {
                 llama.wait_ready(cfg.startup_timeout);
             }
@@ -2344,8 +2583,20 @@ fn main() {
 fn apply_model_params(cfg: &mut RuntimeCfg, m: &Model) {
     cfg.active_model = m.filename.clone();
     cfg.ngl = m.gpu_layers;
-    cfg.ctx = if m.context_size > 0 { m.context_size } else { cfg.auto_ctx };
-    cfg.flash_attn = m.flash_attention;
+
+    // Context is planned against real free VRAM and this model's *offloaded*
+    // footprint; flash-attn and KV quantization come back coupled and legal.
+    // Only reserve embed VRAM when the embed server actually offloads to GPU.
+    let embed_reserve = if cfg.embed_enabled && cfg.preset.embed_ngl > 0 { EMBED_RESERVE_MIB } else { 0 };
+    let plan = plan_context(
+        &m.path, m.gpu_layers, cfg.free_vram_mib,
+        embed_reserve, m.context_size, &cfg.preset,
+    );
+    cfg.ctx = plan.ctx;
+    cfg.flash_attn = plan.flash_attn;
+    cfg.cache_type_k = plan.cache_type.to_string();
+    cfg.cache_type_v = plan.cache_type.to_string();
+
     cfg.temp = m.temperature;
     cfg.top_k = m.top_k;
     cfg.top_p = m.top_p;
@@ -2488,10 +2739,24 @@ fn handle_load(st: &Shared, body: &str) -> serde_json::Value {
         (m, s.cfg.clone())
     };
 
+    // Stop the current model first so its VRAM frees before we re-measure, then
+    // plan the new context against the REAL free-VRAM reading (the boot-time
+    // value is stale once a model has been loaded/unloaded).
+    { st.lock().unwrap().llama.stop(); }
+    cfg.free_vram_mib = probe_gpus().iter().map(|g| g.free_mib).max();
+
     apply_model_params(&mut cfg, &model);
     if let Some(v) = req.ngl { cfg.ngl = v; }
-    if let Some(v) = req.ctx { cfg.ctx = v.max(2048); }
-    if let Some(v) = req.flash_attn { cfg.flash_attn = v; }
+    // Manual ctx is advisory: it may only lower the planned figure, never push
+    // past what real VRAM can hold. Flash-attn re-derives from the result.
+    if let Some(v) = req.ctx {
+        cfg.ctx = v.clamp(MIN_CTX, cfg.ctx);
+        cfg.flash_attn = flash_attn_for_ctx(cfg.ctx);
+        // Keep KV quantization legal: quantized V cache needs flash-attn.
+        let ct = if cfg.flash_attn { cfg.preset.cache_type } else { "" };
+        cfg.cache_type_k = ct.to_string();
+        cfg.cache_type_v = ct.to_string();
+    }
     if let Some(v) = req.temp { cfg.temp = v; }
     if let Some(v) = req.top_k { cfg.top_k = v; }
     if let Some(v) = req.top_p { cfg.top_p = v; }
@@ -2503,12 +2768,11 @@ fn handle_load(st: &Shared, body: &str) -> serde_json::Value {
 
     eprintln!("[llama] starting {} (ngl={}, ctx={}, fa={})",
         model.name, if cfg.ngl < 0 { 99 } else { cfg.ngl }, cfg.ctx,
-        if cfg.flash_attn { "on" } else { "auto" });
+        if cfg.flash_attn { "on" } else { "off" });
 
-    // Stop old model + spawn new one under one lock (embed server untouched).
+    // Spawn the new model (embed server untouched). The old one is already stopped.
     let status = {
         let mut s = st.lock().unwrap();
-        s.llama.stop();
         if let Err(e) = s.llama.spawn(&cfg.llama_binary, &llama_args(&cfg, &model), &model.filename, cfg.llama_port) {
             s.cfg.active_model.clear();
             return serde_json::json!({"error": e});
@@ -3252,10 +3516,60 @@ fn handle_chat_stream(stream: &mut TcpStream, st: &Shared, req: &WriteReq, cfg: 
 
     let model_ctx = cfg.ctx as u64;
 
-    let mut system = "You are a helpful, knowledgeable assistant in an ongoing \
-        conversation. Answer clearly and concisely, using the conversation history \
-        for context. When reference material is provided below, ground your answers \
-        in it and say so if it does not cover the question.".to_string();
+    let mut system = "You are a senior engineer in an ongoing pair-programming \
+        conversation. Answer the user's actual question clearly and concretely, \
+        using the whole conversation history for context. When code is provided \
+        below under \"pinned code context\", treat it as the code under \
+        discussion: quote exact fields, types, and signatures from it rather \
+        than paraphrasing from memory, and show the relevant snippet in a fenced \
+        block when you reference it. If retrieved reference material is present, \
+        ground your answer in it and say so when it doesn't cover the question."
+        .to_string();
+
+    // ── Pinned code context ──────────────────────────────────
+    // The files the user attached are the subject of the review. They must
+    // survive for the ENTIRE thread regardless of how long the dialogue grows,
+    // so they live in the system message (reserved up front, trimmed only if a
+    // single paste is enormous) instead of competing with conversation turns.
+    let mut pinned_files: Vec<String> = Vec::new();
+    if !req.files.is_empty() {
+        let pin_budget = model_ctx / 2;   // pinned code may claim ≤ half the window
+        let mut block = String::from(
+            "\n\n--- pinned code context (persists across the whole conversation) ---\n");
+        let mut used = estimate_tokens(&block);
+        for f in &req.files {
+            let lang = if f.language.is_empty() { "text" } else { &f.language };
+            let piece = format!("\n--- {} ---\n```{}\n{}\n```\n", f.name, lang, f.content);
+            let cost = estimate_tokens_lang(&piece, lang);
+            if used + cost > pin_budget {
+                // Out of pin budget: fit a truncated head of this file if there's
+                // meaningful room left, then stop pinning further files.
+                let remaining = pin_budget.saturating_sub(used);
+                if remaining > 64 && pinned_files.is_empty() {
+                    let ratio = match lang {
+                        "rust" | "c" | "c++" | "cpp" | "java" | "csharp" => 2.6,
+                        "go" | "swift" | "kotlin" | "zig" => 2.8,
+                        "javascript" | "typescript" => 2.9,
+                        "python" | "ruby" | "lua" => 3.4,
+                        _ => 3.2,
+                    };
+                    let max_chars = ((remaining - 32) as f64 * ratio) as usize;
+                    if max_chars < f.content.len() {
+                        let slice = &f.content[..max_chars.min(f.content.len())];
+                        let cut = slice.rfind('\n').map(|nl| &f.content[..nl + 1]).unwrap_or(slice);
+                        block.push_str(&format!(
+                            "\n--- {} (truncated) ---\n```{}\n{}\n```\n", f.name, lang, cut));
+                        pinned_files.push(format!("{} (truncated)", f.name));
+                    }
+                }
+                break;
+            }
+            block.push_str(&piece);
+            used += cost;
+            pinned_files.push(f.name.clone());
+        }
+        system.push_str(&block);
+    }
 
     // ── Optional RAG over the text corpus ──
     let mut rag_chunks_used = 0usize;
@@ -3281,7 +3595,13 @@ fn handle_chat_stream(stream: &mut TcpStream, st: &Shared, req: &WriteReq, cfg: 
                                 s.rag.search_local(&qv, RAG_CANDIDATE_POOL, &query, "text")
                             };
                             if !hits.is_empty() {
-                                let rag_budget = (model_ctx * 2) / 5;  // ≤40% of ctx
+                                // RAG shares the window with pinned code and the
+                                // dialogue: cap at 40% of ctx AND whatever is
+                                // actually free after the system block + output.
+                                let sys_so_far = estimate_tokens(&system);
+                                let free_after_sys = model_ctx
+                                    .saturating_sub(sys_so_far + OUTPUT_RESERVE + 256);
+                                let rag_budget = ((model_ctx * 2) / 5).min(free_after_sys);
                                 let mut block = String::from("\n\n--- reference material ---\n");
                                 let mut used = estimate_tokens(&block);
                                 let mut sources = Vec::new();
@@ -3356,6 +3676,7 @@ fn handle_chat_stream(stream: &mut TcpStream, st: &Shared, req: &WriteReq, cfg: 
             "input_tokens": input_tokens,
             "remaining_tokens": max_tokens,
             "rag_chunks": rag_chunks_used,
+            "pinned_files": pinned_files,
         }
     }));
 
