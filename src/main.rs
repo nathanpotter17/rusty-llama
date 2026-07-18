@@ -23,7 +23,6 @@ struct FileConfig {
     server: ServerCfg,
     llama: LlamaCfg,
     defaults: DefaultsCfg,
-    limits: LimitsCfg,
     embed: EmbedCfg,
     rag: RagCfg,
     #[serde(default)]
@@ -37,7 +36,6 @@ impl Default for FileConfig {
             server: ServerCfg::default(),
             llama: LlamaCfg::default(),
             defaults: DefaultsCfg::default(),
-            limits: LimitsCfg::default(),
             embed: EmbedCfg::default(),
             rag: RagCfg::default(),
             models: Vec::new(),
@@ -103,16 +101,6 @@ impl Default for DefaultsCfg {
     }
 }
 
-#[derive(Deserialize, Clone)]
-#[serde(default)]
-struct LimitsCfg {
-    session_tokens: u64,
-    daily_tokens: u64,
-}
-impl Default for LimitsCfg {
-    fn default() -> Self { Self { session_tokens: 0, daily_tokens: 0 } }
-}
-
 /// Dedicated embedding server — runs a second llama-server process
 /// on a separate port with --embedding enabled.
 #[derive(Deserialize, Clone)]
@@ -169,7 +157,7 @@ impl Default for RagCfg {
     fn default() -> Self {
         Self {
             enabled: true,
-            db_path: "data/rag_index.json".into(),
+            db_path: "data/rag_index.bin".into(),
             chunk_size: 60,
             chunk_overlap: 10,
             search_results: 5,
@@ -184,7 +172,7 @@ impl Default for RagCfg {
     }
 }
 
-#[derive(Deserialize, Clone, Serialize)]
+#[derive(Deserialize, Clone)]
 struct ModelEntry {
     filename: String,
     #[serde(default)]
@@ -233,8 +221,6 @@ struct RuntimeCfg {
     llama_port: u16,
     parallel_slots: u32,
     startup_timeout: u64,
-    session_limit: u64,
-    daily_limit: u64,
     models_dir: String,
     active_model: String,
     ngl: i32,
@@ -351,10 +337,12 @@ fn estimate_tokens(s: &str) -> u64 {
     estimate_tokens_lang(s, "")
 }
 
-/// Per-language token estimation — code-heavy languages pack more tokens
+/// Chars-per-token ratio by language — code-heavy languages pack more tokens
 /// per character due to operators, short identifiers, and punctuation.
-fn estimate_tokens_lang(s: &str, lang: &str) -> u64 {
-    let ratio = match lang {
+/// SINGLE source of truth: token estimation and truncation char budgets both
+/// derive from this table.
+fn chars_per_token(lang: &str) -> f64 {
+    match lang {
         "rust" | "c" | "c++" | "cpp" | "java" | "csharp" => 2.6,
         "go" | "swift" | "kotlin" | "zig" => 2.8,
         "javascript" | "typescript" => 2.9,
@@ -364,28 +352,61 @@ fn estimate_tokens_lang(s: &str, lang: &str) -> u64 {
         "bash" | "sh" => 3.0,
         "markdown" | "md" | "text" => 3.8,
         _ => 3.2,
-    };
-    (s.len() as f64 / ratio).ceil() as u64
+    }
+}
+
+/// Per-language token estimation.
+fn estimate_tokens_lang(s: &str, lang: &str) -> u64 {
+    (s.len() as f64 / chars_per_token(lang)).ceil() as u64
+}
+
+/// Largest prefix of `s` that is ≤ `max_bytes` and ends on a char boundary.
+/// Byte-index slicing into user content panics mid-codepoint without this.
+fn prefix_at_boundary(s: &str, max_bytes: usize) -> &str {
+    if max_bytes >= s.len() { return s; }
+    let mut i = max_bytes;
+    while i > 0 && !s.is_char_boundary(i) { i -= 1; }
+    &s[..i]
+}
+
+/// Boundary-safe prefix cut back to the last complete line when possible.
+fn prefix_at_line(s: &str, max_bytes: usize) -> &str {
+    let p = prefix_at_boundary(s, max_bytes);
+    if p.len() == s.len() { return s; }
+    match p.rfind('\n') { Some(nl) => &s[..nl + 1], None => p }
 }
 
 // ── RAG: Text chunking ─────────────────────────────────────
 
+/// One retrieval unit produced by any chunker.
+#[derive(Clone)]
+struct Chunk {
+    source: String,   // display label, e.g. "main.rs:1-60" or "notes.md#3"
+    text: String,
+    kind: String,     // "block", "block_part", "file_summary", "gap", "text"
+    file: String,     // originating filename
+}
+
 /// Simple line-window chunker — used as fallback when the external
 /// chunker tool is unavailable or fails.
-fn chunk_code_file_simple(name: &str, content: &str, chunk_size: usize, overlap: usize) -> Vec<(String, String, String, String)> {
+fn chunk_code_file_simple(name: &str, content: &str, chunk_size: usize, overlap: usize) -> Vec<Chunk> {
     let lines: Vec<&str> = content.lines().collect();
     if lines.is_empty() { return Vec::new(); }
     let mut chunks = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        let end = std::cmp::min(i + chunk_size, lines.len());
-        let chunk = lines[i..end].join("\n");
-        let label = format!("{}:{}-{}", name, i + 1, end);
-        // Add metadata header for better embedding quality
-        let enriched = enrich_chunk_metadata(name, &chunk, i + 1, end);
-        chunks.push((label, enriched, "block".to_string(), name.to_string()));
+        let end = (i + chunk_size).min(lines.len());
+        let body = lines[i..end].join("\n");
+        chunks.push(Chunk {
+            source: format!("{}:{}-{}", name, i + 1, end),
+            // Metadata header improves embedding quality.
+            text: enrich_chunk_metadata(name, &body, i + 1, end),
+            kind: "block".into(),
+            file: name.into(),
+        });
         if end == lines.len() { break; }
-        i += chunk_size.saturating_sub(overlap);
+        // .max(1): overlap >= chunk_size must not stall the window.
+        i += chunk_size.saturating_sub(overlap).max(1);
     }
     chunks
 }
@@ -403,8 +424,8 @@ const TEXT_OVERLAP_WORDS: usize = 30;
 
 /// Prose-aware chunker for the "text" domain: packs whitespace-delimited
 /// words into overlapping windows on paragraph-friendly boundaries. No code
-/// construct detection or metadata header. Returns (source, text, kind, file).
-fn chunk_text_file(name: &str, content: &str) -> Vec<(String, String, String, String)> {
+/// construct detection or metadata header.
+fn chunk_text_file(name: &str, content: &str) -> Vec<Chunk> {
     let words: Vec<&str> = content.split_whitespace().collect();
     if words.is_empty() { return Vec::new(); }
     let step = TEXT_CHUNK_WORDS.saturating_sub(TEXT_OVERLAP_WORDS).max(1);
@@ -413,9 +434,12 @@ fn chunk_text_file(name: &str, content: &str) -> Vec<(String, String, String, St
     let mut idx = 0;
     while start < words.len() {
         let end = (start + TEXT_CHUNK_WORDS).min(words.len());
-        let text = words[start..end].join(" ");
-        let label = format!("{name}#{idx}");
-        chunks.push((label, text, "text".to_string(), name.to_string()));
+        chunks.push(Chunk {
+            source: format!("{name}#{idx}"),
+            text: words[start..end].join(" "),
+            kind: "text".into(),
+            file: name.into(),
+        });
         if end == words.len() { break; }
         start += step;
         idx += 1;
@@ -478,7 +502,7 @@ fn enrich_chunk_metadata(filename: &str, text: &str, start_line: usize, end_line
 /// Returns None if the tool is not available or fails.
 fn try_external_chunker(
     tool_path: &str, files: &[FileEntry], chunk_size: usize, overlap: usize,
-) -> Option<Vec<(String, String, String, String)>> {
+) -> Option<Vec<Chunk>> {
     if tool_path.is_empty() { return None; }
 
     // Check tool exists
@@ -549,15 +573,16 @@ fn try_external_chunker(
         }
     };
 
-    let mut result: Vec<(String, String, String, String)> = Vec::with_capacity(parsed.len());
+    let mut result: Vec<Chunk> = Vec::with_capacity(parsed.len());
     for item in &parsed {
-        let source = item["source"].as_str().unwrap_or("unknown").to_string();
-        let text   = item["text"].as_str().unwrap_or("").to_string();
-        let kind   = item["kind"].as_str().unwrap_or("block").to_string();
-        let file   = item["file"].as_str().unwrap_or("").to_string();
-        if !text.trim().is_empty() {
-            result.push((source, text, kind, file));
-        }
+        let text = item["text"].as_str().unwrap_or("").to_string();
+        if text.trim().is_empty() { continue; }
+        result.push(Chunk {
+            source: item["source"].as_str().unwrap_or("unknown").to_string(),
+            text,
+            kind: item["kind"].as_str().unwrap_or("block").to_string(),
+            file: item["file"].as_str().unwrap_or("").to_string(),
+        });
     }
 
     eprintln!("[rag] external chunker produced {} chunks in {:.1}ms",
@@ -596,35 +621,30 @@ fn get_embedding(endpoint: &str, text: &str, prefix: &str) -> Result<Vec<f32>, S
     let body_str = req_body.to_string();
     let resp_body = http_post_json(host, port, &path, &body_str, 60)?;
     let resp: serde_json::Value = serde_json::from_str(&resp_body)
-        .map_err(|e| format!("parse: {e} — body: {}", &resp_body[..resp_body.len().min(200)]))?;
+        .map_err(|e| format!("parse: {e} — body: {}", prefix_at_boundary(&resp_body, 200)))?;
     parse_single_embedding(&resp)
 }
 
 /// Send all texts in a single batched request: { "input": [...], "model": "local" }.
-/// Falls back to sequential if the server doesn't support batch input.
-fn get_embeddings_batch(endpoint: &str, texts: &[String], prefix: &str) -> Result<Vec<Vec<f32>>, String> {
+/// Falls back to sequential requests if the server doesn't support batch input.
+fn get_embeddings_batch(endpoint: &str, texts: &[&str], prefix: &str) -> Result<Vec<Vec<f32>>, String> {
     if texts.is_empty() { return Ok(Vec::new()); }
     if texts.len() == 1 {
-        return get_embedding(endpoint, &texts[0], prefix).map(|v| vec![v]);
+        return get_embedding(endpoint, texts[0], prefix).map(|v| vec![v]);
     }
-
-    let prefixed: Vec<String> = if prefix.is_empty() {
-        texts.to_vec()
-    } else {
-        texts.iter().map(|t| format!("{prefix}{t}")).collect()
-    };
-
     let (host, port, path) = parse_endpoint(endpoint)?;
 
-    // Try batched request first
-    let req_body = serde_json::json!({
-        "input": prefixed,
-        "model": "local"
-    });
+    // Try batched request first.
+    let req_body = if prefix.is_empty() {
+        serde_json::json!({ "input": texts, "model": "local" })
+    } else {
+        let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
+        serde_json::json!({ "input": prefixed, "model": "local" })
+    };
     let body_str = req_body.to_string();
     let resp_body = http_post_json(host, port, &path, &body_str, 120)?;
     let resp: serde_json::Value = serde_json::from_str(&resp_body)
-        .map_err(|e| format!("parse: {e} — body: {}", &resp_body[..resp_body.len().min(200)]))?;
+        .map_err(|e| format!("parse: {e} — body: {}", prefix_at_boundary(&resp_body, 200)))?;
 
     // OpenAI-compatible batch: { "data": [{ "embedding": [...] }, ...] }
     if let Some(data) = resp["data"].as_array() {
@@ -641,7 +661,7 @@ fn get_embeddings_batch(endpoint: &str, texts: &[String], prefix: &str) -> Resul
         }
     }
 
-    // Batch not supported — fall back to sequential (still using direct HTTP, not curl)
+    // Batch not supported — fall back to sequential requests.
     eprintln!("[embed] batch response didn't match, falling back to sequential");
     let mut results = Vec::with_capacity(texts.len());
     for (i, text) in texts.iter().enumerate() {
@@ -663,7 +683,7 @@ fn parse_single_embedding(resp: &serde_json::Value) -> Result<Vec<f32>, String> 
         return Ok(arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect());
     }
     let s = resp.to_string();
-    Err(format!("no embedding in response: {}", &s[..s.len().min(300)]))
+    Err(format!("no embedding in response: {}", prefix_at_boundary(&s, 300)))
 }
 
 // ── RAG: In-memory vector store with HNSW index ────────────
@@ -676,6 +696,18 @@ struct VecChunk {
     kind: String,    // "block", "block_part", "file_summary", "gap", "text"
     file: String,    // originating filename, e.g. "main.rs"
     domain: String,  // retrieval corpus: "code" | "text"
+    // Derived at insert/load, never persisted — shared across every search so
+    // BM25 needs zero per-search allocations against the corpus.
+    text_lc: String, // lowercased text for tf/df substring scans
+    words: u32,      // whitespace word count for length normalization
+}
+
+impl VecChunk {
+    fn new(source: String, text: String, kind: String, file: String, domain: String, vector: Vec<f32>) -> Self {
+        let text_lc = text.to_lowercase();
+        let words = text.split_whitespace().count() as u32;
+        Self { text, source, vector, kind, file, domain, text_lc, words }
+    }
 }
 
 /// Cosine distance: 1.0 − cosine_similarity.  Lower = more similar.
@@ -859,13 +891,13 @@ impl HnswGraph {
 
     /// Prune a node's neighbor list on a given layer to at most `max_m`,
     /// keeping the closest neighbors by distance.
-    fn prune(&mut self, node_id: usize, layer: usize, vectors: &[Vec<f32>]) {
+    fn prune<V: AsRef<[f32]>>(&mut self, node_id: usize, layer: usize, vectors: &[V]) {
         let max_m = self.max_neighbors(layer);
         let neighbors = &self.nodes[node_id].neighbors[layer];
         if neighbors.len() <= max_m { return; }
 
         let mut scored: Vec<(f32, usize)> = neighbors.iter()
-            .map(|&nid| (cosine_distance(&vectors[node_id], &vectors[nid]), nid))
+            .map(|&nid| (cosine_distance(vectors[node_id].as_ref(), vectors[nid].as_ref()), nid))
             .collect();
         scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(max_m);
@@ -875,7 +907,7 @@ impl HnswGraph {
 
     /// Insert a single node into the graph.  `node_id` must already be
     /// appended to `self.nodes` (with empty neighbors) before calling.
-    fn insert(&mut self, node_id: usize, vectors: &[Vec<f32>]) {
+    fn insert<V: AsRef<[f32]>>(&mut self, node_id: usize, vectors: &[V]) {
         let level = self.nodes[node_id].level;
 
         // First node — just set as entry point
@@ -893,7 +925,7 @@ impl HnswGraph {
         if start_layer > level {
             for lc in ((level + 1)..=start_layer).rev() {
                 let results = self.search_layer(
-                    &vectors[node_id], &[current_ep], 1, lc, vectors,
+                    vectors[node_id].as_ref(), &[current_ep], 1, lc, vectors,
                 );
                 if let Some(nearest) = results.into_iter()
                     .min_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal))
@@ -909,7 +941,7 @@ impl HnswGraph {
 
         for lc in (0..=insert_top).rev() {
             let results = self.search_layer(
-                &vectors[node_id], &entry_points, self.ef_construction, lc, vectors,
+                vectors[node_id].as_ref(), &entry_points, self.ef_construction, lc, vectors,
             );
             let max_m = self.max_neighbors(lc);
             let selected = Self::select_neighbors(&results, max_m);
@@ -972,7 +1004,7 @@ impl HnswGraph {
     }
 
     /// Build the entire graph from scratch for all vectors.
-    fn build_all(&mut self, vectors: &[Vec<f32>]) {
+    fn build_all<V: AsRef<[f32]>>(&mut self, vectors: &[V]) {
         let n = vectors.len();
         self.nodes.clear();
         self.nodes.reserve(n);
@@ -1100,6 +1132,15 @@ struct RagStore {
     indexed_files: Vec<String>,
 }
 
+/// Query-side BM25 state, computed ONCE per search: tokenized terms, per-term
+/// IDF over the whole corpus, and average document length. Per-candidate
+/// scoring is then O(terms) with no allocations.
+struct Bm25Query {
+    terms: Vec<String>,
+    idf: Vec<f32>,
+    avg_len: f32,
+}
+
 impl RagStore {
     fn new(cfg: RagCfg) -> Self {
         let graph = HnswGraph::new(cfg.hnsw_m, cfg.hnsw_ef_construction);
@@ -1110,18 +1151,21 @@ impl RagStore {
         store
     }
 
-    /// Store pre-computed embeddings and build the HNSW graph.
+    /// Store pre-computed embeddings and rebuild the HNSW graph.
+    /// Domain-scoped replace: drop only this domain's chunks, keep the other
+    /// corpus intact, then append the freshly embedded ones. The graph is
+    /// rebuilt over the union so node ids stay aligned.
     fn store_embeddings(
         &mut self,
-        chunks: Vec<String>,
-        sources: Vec<String>,
+        chunks: Vec<Chunk>,
         vectors: Vec<Vec<f32>>,
         file_names: Vec<String>,
-        kinds: Vec<String>,
-        files: Vec<String>,
         domain: &str,
     ) -> Result<usize, String> {
         if vectors.is_empty() { return Err("no embeddings".into()); }
+        if vectors.len() != chunks.len() {
+            return Err(format!("embedding count {} != chunk count {}", vectors.len(), chunks.len()));
+        }
         let dim = vectors[0].len();
         if dim == 0 { return Err("embedding dimension is 0".into()); }
         if let Some(existing) = self.vector_dim() {
@@ -1132,19 +1176,11 @@ impl RagStore {
             }
         }
 
-        // Domain-scoped replace: drop only this domain's chunks, keep the
-        // other corpus intact, then append the freshly embedded ones. The
-        // HNSW graph is rebuilt over the union so node ids stay aligned.
         self.chunks.retain(|c| c.domain != domain);
         self.chunks.reserve(chunks.len());
         let added = chunks.len();
-        let iter = chunks.into_iter()
-            .zip(sources)
-            .zip(vectors)
-            .zip(kinds)
-            .zip(files);
-        for ((((text, source), vector), kind), file) in iter {
-            self.chunks.push(VecChunk { text, source, vector, kind, file, domain: domain.to_string() });
+        for (c, vector) in chunks.into_iter().zip(vectors) {
+            self.chunks.push(VecChunk::new(c.source, c.text, c.kind, c.file, domain.to_string(), vector));
         }
 
         // Merge indexed_files (union across domains).
@@ -1164,53 +1200,56 @@ impl RagStore {
         Ok(added)
     }
 
-    /// Code-aware BM25 keyword score.
-    /// Splits on whitespace AND code punctuation, uses a code-specific
-    /// stopword list, and accepts short tokens (code has 1-2 char identifiers).
-    fn bm25_score(&self, query: &str, chunk_idx: usize) -> f32 {
-        const STOP: &[&str] = &[
-            // English
-            "the", "and", "for", "this", "that", "with", "from", "are", "was",
-            "not", "but", "can", "will", "has", "had", "its", "all", "any",
-            // Rust keywords too common to discriminate
-            "let", "mut", "pub", "use", "mod", "ref", "str", "self",
-            "true", "false", "crate", "super", "where",
-            // Common types
-            "i32", "u32", "i64", "u64", "f32", "f64", "usize", "bool",
-            "fn", "impl", "struct", "enum", "type", "const",
-            // Common in all languages
-            "var", "val", "new", "return", "if", "else", "while",
-            "for", "in", "to", "of", "is", "it", "be", "as", "do",
-        ];
+    /// Code-aware stopwords: English filler, Rust keywords, common types.
+    /// Short tokens are otherwise accepted — code has 1-2 char identifiers.
+    const BM25_STOP: &'static [&'static str] = &[
+        // English
+        "the", "and", "for", "this", "that", "with", "from", "are", "was",
+        "not", "but", "can", "will", "has", "had", "its", "all", "any",
+        // Rust keywords too common to discriminate
+        "let", "mut", "pub", "use", "mod", "ref", "str", "self",
+        "true", "false", "crate", "super", "where",
+        // Common types
+        "i32", "u32", "i64", "u64", "f32", "f64", "usize", "bool",
+        "fn", "impl", "struct", "enum", "type", "const",
+        // Common in all languages
+        "var", "val", "new", "return", "if", "else", "while",
+        "for", "in", "to", "of", "is", "it", "be", "as", "do",
+    ];
 
-        let query_terms: Vec<String> = query
-            .split(|c: char| c.is_whitespace() || c == ':' || c == '.' || c == '(' || c == ')')
+    /// Tokenize the query (whitespace AND code punctuation) and precompute
+    /// per-term IDF plus corpus average length. One corpus pass per term —
+    /// done once per search, never per candidate. Returns None when the query
+    /// has no scoreable terms.
+    fn bm25_prepare(&self, query: &str) -> Option<Bm25Query> {
+        if self.chunks.is_empty() { return None; }
+        let terms: Vec<String> = query
+            .split(|c: char| c.is_whitespace() || matches!(c, ':' | '.' | '(' | ')'))
             .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric() && c != '_').to_lowercase())
-            .filter(|t| !t.is_empty() && !STOP.contains(&t.as_str()))
+            .filter(|t| !t.is_empty() && !Self::BM25_STOP.contains(&t.as_str()))
             .collect();
-        if query_terms.is_empty() { return 0.0; }
+        if terms.is_empty() { return None; }
 
-        let text = self.chunks[chunk_idx].text.to_lowercase();
-        let doc_len = text.split_whitespace().count() as f32;
-        let avg_len = if self.chunks.is_empty() { doc_len } else {
-            self.chunks.iter()
-                .map(|c| c.text.split_whitespace().count())
-                .sum::<usize>() as f32 / self.chunks.len() as f32
-        };
-
-        let k1: f32 = 1.2;
-        let b: f32 = 0.75;
         let n = self.chunks.len() as f32;
-        let mut score: f32 = 0.0;
+        let idf: Vec<f32> = terms.iter().map(|term| {
+            let df = self.chunks.iter().filter(|c| c.text_lc.contains(term.as_str())).count() as f32;
+            ((n - df + 0.5) / (df + 0.5) + 1.0).ln()
+        }).collect();
+        let avg_len = (self.chunks.iter().map(|c| c.words as u64).sum::<u64>() as f32 / n).max(1.0);
+        Some(Bm25Query { terms, idf, avg_len })
+    }
 
-        for term in &query_terms {
-            let tf = text.matches(term.as_str()).count() as f32;
+    /// Okapi BM25 for one chunk against a prepared query — O(terms), no allocs.
+    fn bm25_score(&self, q: &Bm25Query, chunk_idx: usize) -> f32 {
+        const K1: f32 = 1.2;
+        const B: f32 = 0.75;
+        let c = &self.chunks[chunk_idx];
+        let doc_len = c.words as f32;
+        let mut score = 0.0f32;
+        for (term, idf) in q.terms.iter().zip(&q.idf) {
+            let tf = c.text_lc.matches(term.as_str()).count() as f32;
             if tf == 0.0 { continue; }
-            let df = self.chunks.iter()
-                .filter(|c| c.text.to_lowercase().contains(term.as_str()))
-                .count() as f32;
-            let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
-            score += idf * (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * doc_len / avg_len));
+            score += idf * (tf * (K1 + 1.0)) / (tf + K1 * (1.0 - B + B * doc_len / q.avg_len));
         }
         score
     }
@@ -1230,7 +1269,6 @@ impl RagStore {
         // Widen retrieval when domain-scoped so the target corpus isn't
         // starved by nearer neighbours from the other domain.
         let candidate_limit = limit * 6;
-        let use_hybrid = self.cfg.hybrid_weight_bm25 > 0.0 && !query_hint.is_empty();
 
         let raw: Vec<(usize, f32)> = if !self.graph.is_empty()
             && self.graph.len() == self.chunks.len()
@@ -1265,14 +1303,15 @@ impl RagStore {
         if candidates.is_empty() { return Vec::new(); }
 
         // ── Stage 2: Hybrid BM25 re-scoring ──────────────────────────────
-        let mut hybrid_scored: Vec<(usize, f32)> = if use_hybrid {
+        // Corpus-wide stats (IDF, avg length) prepared once; each candidate
+        // then costs O(terms) with no allocations.
+        let bm25 = if self.cfg.hybrid_weight_bm25 > 0.0 { self.bm25_prepare(query_hint) } else { None };
+        let mut hybrid_scored: Vec<(usize, f32)> = if let Some(q) = &bm25 {
             let wv = self.cfg.hybrid_weight_vector;
             let wb = self.cfg.hybrid_weight_bm25;
             candidates.iter().map(|(id, vec_sim)| {
-                let bm25_raw = self.bm25_score(query_hint, *id);
-                let bm25_norm = bm25_raw / (bm25_raw + 1.0);
-                let combined = wv * vec_sim + wb * bm25_norm;
-                (*id, combined)
+                let raw = self.bm25_score(q, *id);
+                (*id, wv * vec_sim + wb * (raw / (raw + 1.0)))
             }).collect()
         } else {
             candidates
@@ -1490,7 +1529,7 @@ impl RagStore {
                 .collect();
             pos += vec_bytes;
 
-            self.chunks.push(VecChunk { text, source, vector, kind, file, domain });
+            self.chunks.push(VecChunk::new(source, text, kind, file, domain, vector));
         }
 
         // Load HNSW graph
@@ -1519,14 +1558,15 @@ impl RagStore {
         Ok(())
     }
 
-    /// Rebuild the HNSW graph from the current chunk vectors.
+    /// Rebuild the HNSW graph from the current chunk vectors — borrowed
+    /// slices, no corpus copy.
     fn rebuild_graph(&mut self) {
         if self.chunks.is_empty() {
             self.graph.clear();
             return;
         }
         let t0 = Instant::now();
-        let vecs: Vec<Vec<f32>> = self.chunks.iter().map(|c| c.vector.clone()).collect();
+        let vecs: Vec<&[f32]> = self.chunks.iter().map(|c| c.vector.as_slice()).collect();
         self.graph = HnswGraph::new(self.cfg.hnsw_m, self.cfg.hnsw_ef_construction);
         self.graph.build_all(&vecs);
         eprintln!("[rag] graph rebuilt in {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
@@ -1763,37 +1803,41 @@ fn embed_args(model_path: &str, cfg: &EmbedCfg) -> Vec<String> {
 #[derive(Clone, Copy)]
 enum Which { Llama, Embed }
 
-/// Background readiness poll — updates `State` under short locks so other
-/// requests aren't blocked while a server warms up. Shared by /api/load
-/// and /api/embed/start.
+/// Poll `which` until Ready/Dead/timeout, updating `State` status under short
+/// locks so other requests aren't blocked while a server warms up.
+/// SINGLE readiness loop — used synchronously (lazy embed start) and from a
+/// background thread (/api/load, /api/embed/start).
+fn poll_until_ready(st: &Shared, which: Which, timeout_secs: u64) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    std::thread::sleep(Duration::from_millis(500));
+    loop {
+        if Instant::now() >= deadline {
+            let msg = format!("timeout ({timeout_secs}s)");
+            st.lock().unwrap().server_mut(which).status = ServerStatus::Error(msg.clone());
+            return Err(msg);
+        }
+        let outcome = st.lock().unwrap().server_mut(which).poll_once();
+        match outcome {
+            PollOutcome::Ready => {
+                let mut s = st.lock().unwrap();
+                let srv = s.server_mut(which);
+                srv.status = ServerStatus::Ready;
+                eprintln!("[{}] ready (pid {:?})", srv.kind, srv.pid);
+                return Ok(());
+            }
+            PollOutcome::Dead(e) => {
+                st.lock().unwrap().server_mut(which).status = ServerStatus::Error(e.clone());
+                return Err(e);
+            }
+            PollOutcome::Pending => std::thread::sleep(Duration::from_millis(700)),
+        }
+    }
+}
+
+/// Background readiness poll. Shared by /api/load and /api/embed/start.
 fn spawn_ready_poll(st: &Shared, which: Which, timeout_secs: u64) {
     let bg = Arc::clone(st);
-    std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-        std::thread::sleep(Duration::from_millis(500));
-        loop {
-            if Instant::now() >= deadline {
-                bg.lock().unwrap().server_mut(which).status =
-                    ServerStatus::Error(format!("timeout ({timeout_secs}s)"));
-                return;
-            }
-            let outcome = bg.lock().unwrap().server_mut(which).poll_once();
-            match outcome {
-                PollOutcome::Ready => {
-                    let mut s = bg.lock().unwrap();
-                    let srv = s.server_mut(which);
-                    srv.status = ServerStatus::Ready;
-                    eprintln!("[{}] ready (pid {:?})", srv.kind, srv.pid);
-                    return;
-                }
-                PollOutcome::Dead(e) => {
-                    bg.lock().unwrap().server_mut(which).status = ServerStatus::Error(e);
-                    return;
-                }
-                PollOutcome::Pending => std::thread::sleep(Duration::from_millis(700)),
-            }
-        }
-    });
+    std::thread::spawn(move || { let _ = poll_until_ready(&bg, which, timeout_secs); });
 }
 
 /// Lazy-start the embed server on first RAG use and block until ready.
@@ -1831,36 +1875,12 @@ fn ensure_embed_ready(st: &Shared) -> Result<(), String> {
         }
     }
 
-    // Wait for readiness with short status-update locks.
-    let deadline = Instant::now() + Duration::from_secs(timeout);
-    std::thread::sleep(Duration::from_millis(400));
-    loop {
-        if Instant::now() >= deadline {
-            st.lock().unwrap().embed.status = ServerStatus::Error(format!("timeout ({timeout}s)"));
-            return Err(format!("embed server timeout ({timeout}s)"));
-        }
-        let outcome = st.lock().unwrap().embed.poll_once();
-        match outcome {
-            PollOutcome::Ready => {
-                let mut s = st.lock().unwrap();
-                s.embed.status = ServerStatus::Ready;
-                eprintln!("[embed] ready (pid {:?})", s.embed.pid);
-                return Ok(());
-            }
-            PollOutcome::Dead(e) => {
-                st.lock().unwrap().embed.status = ServerStatus::Error(e.clone());
-                return Err(format!("embed server failed: {e}"));
-            }
-            PollOutcome::Pending => std::thread::sleep(Duration::from_millis(500)),
-        }
-    }
+    // Wait for readiness — shared poll loop, short status-update locks.
+    poll_until_ready(st, Which::Embed, timeout)
+        .map_err(|e| format!("embed server not ready: {e}"))
 }
 
-fn curl_cmd() -> &'static str {
-    if cfg!(windows) { "curl.exe" } else { "curl" }
-}
-
-// ── Direct HTTP client (replaces curl for non-streaming) ────
+// ── Direct HTTP client ──────────────────────────────────────
 
 /// Simple HTTP GET via raw TcpStream. Returns response body or error.
 fn http_get(host: &str, port: u16, path: &str, timeout_secs: u64) -> Result<String, String> {
@@ -1936,6 +1956,49 @@ fn extract_http_body(raw: &str) -> Result<String, String> {
         Ok(decoded)
     } else {
         Ok(body.to_string())
+    }
+}
+
+/// `Read` adapter that decodes HTTP/1.1 chunked transfer-encoding on the fly,
+/// so SSE lines can be streamed through `BufReader::lines` regardless of how
+/// the upstream frames its chunks. Size lines are read byte-by-byte — they're
+/// tiny and the inner reader is buffered.
+struct ChunkedReader<R: Read> {
+    inner: R,
+    remaining: usize,   // bytes left in the current chunk
+    done: bool,
+}
+
+impl<R: Read> ChunkedReader<R> {
+    fn new(inner: R) -> Self { Self { inner, remaining: 0, done: false } }
+
+    fn read_frame_line(&mut self) -> std::io::Result<String> {
+        let mut line = Vec::with_capacity(16);
+        let mut byte = [0u8; 1];
+        loop {
+            if self.inner.read(&mut byte)? == 0 { break; }
+            if byte[0] == b'\n' { break; }
+            if byte[0] != b'\r' { line.push(byte[0]); }
+        }
+        Ok(String::from_utf8_lossy(&line).into_owned())
+    }
+}
+
+impl<R: Read> Read for ChunkedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.done { return Ok(0); }
+        if self.remaining == 0 {
+            // Skip the CRLF terminating the previous chunk, then read the size line.
+            let mut size_line = self.read_frame_line()?;
+            if size_line.is_empty() { size_line = self.read_frame_line()?; }
+            let size = usize::from_str_radix(size_line.trim(), 16).unwrap_or(0);
+            if size == 0 { self.done = true; return Ok(0); }
+            self.remaining = size;
+        }
+        let n = self.remaining.min(buf.len());
+        let read = self.inner.read(&mut buf[..n])?;
+        self.remaining -= read;
+        Ok(read)
     }
 }
 
@@ -2189,28 +2252,36 @@ fn vram_footprint(path: &str, ngl: i32) -> (u64, f64) {
     }
 }
 
-/// A complete, self-consistent launch plan. Flash-attn and KV quantization are
-/// coupled: llama.cpp requires flash-attn for a quantized V cache, so quantized
-/// KV is used only at/above the FA context threshold; below it, KV is f16.
-struct CtxPlan {
+/// A complete, self-consistent launch plan. `ngl` is planned too: on tight
+/// tiers, shrinking context alone cannot prevent an OOM when the requested
+/// offload's weights exceed free VRAM — the offload itself must be sized.
+/// Flash-attn and KV quantization stay coupled: llama.cpp requires flash-attn
+/// for a quantized V cache, so quantized KV is used only at/above the FA
+/// context threshold; below it, KV is f16.
+struct LaunchPlan {
+    ngl: i32,
     ctx: u32,
     flash_attn: bool,
     cache_type: &'static str,   // "" ⇒ f16 (no --cache-type flags)
 }
 
-/// Plan the launch context from REAL free VRAM: subtract the offloaded weight,
-/// compute headroom, and (when enabled) the embed reservation, then size KV to
-/// what remains — clamped to the model's declared max and the preset bound.
-/// Two-pass so FA/KV stay legal: try quantized (FA-on) KV first; if that lands
-/// below the FA threshold, fall back to f16 KV with FA off.
-fn plan_context(
+/// Plan the launch from REAL free VRAM.
+/// Phase 1 sizes the offload: reserve headroom + embed + a minimal f16 KV
+/// window, then cap the offloaded layer count to what the weight budget can
+/// hold. A requested full offload that fits survives untouched; one that
+/// doesn't is reduced to the largest safe layer count instead of OOMing at
+/// load ("-1" therefore means "offload everything that fits").
+/// Phase 2 sizes the context for that offload — two-pass so FA/KV stay legal:
+/// quantized (FA-on) KV first; if the result lands below the FA threshold,
+/// f16 KV with FA off.
+fn plan_launch(
     model_path: &str,
-    ngl: i32,
+    requested_ngl: i32,
     free_vram_mib: Option<u64>,
     embed_reserve_mib: u64,
     model_max_ctx: u32,   // 0 = model didn't declare one
     preset: &HwPreset,
-) -> CtxPlan {
+) -> LaunchPlan {
     let hard_max = if model_max_ctx > 0 {
         model_max_ctx.min(preset.ctx_hard_max)
     } else {
@@ -2221,14 +2292,48 @@ fn plan_context(
         // CPU / no GPU reading: RAM-bound, keep the preset default.
         let ctx = preset.ctx_default.min(hard_max).max(MIN_CTX);
         let fa = flash_attn_for_ctx(ctx);
-        return CtxPlan { ctx, flash_attn: fa, cache_type: if fa { preset.cache_type } else { "" } };
+        return LaunchPlan {
+            ngl: requested_ngl, ctx, flash_attn: fa,
+            cache_type: if fa { preset.cache_type } else { "" },
+        };
     };
 
+    // ── Phase 1: plan the offload.
+    let file_mib = weight_mib(model_path);
+    let min_kv = (kv_mib_per_token("f16") * MIN_CTX as f64).ceil() as u64;
+    let weight_budget = (free as i64) - HEADROOM_MIB as i64 - embed_reserve_mib as i64 - min_kv as i64;
+
+    let ngl = match gguf_block_count(model_path) {
+        Some(total) if total > 0 && file_mib > 0 => {
+            let per_layer = (file_mib as f64 / total as f64).max(1e-6);
+            let fits = ((weight_budget.max(0) as f64) / per_layer) as i64;
+            let fits = fits.clamp(0, total as i64) as u32;
+            let want = if requested_ngl < 0 { total } else { (requested_ngl as u32).min(total) };
+            let eff = want.min(fits);
+            if eff < want {
+                eprintln!("[plan] VRAM caps offload: {want} → {eff} of {total} layers \
+                           ({file_mib} MiB model, {free} MiB free)");
+            }
+            if requested_ngl < 0 && eff == total { -1 } else { eff as i32 }
+        }
+        // Layer layout unknown: either the whole model fits, or none of it does.
+        _ => {
+            if (file_mib as i64) <= weight_budget {
+                requested_ngl
+            } else {
+                eprintln!("[plan] model ({file_mib} MiB) exceeds VRAM budget \
+                           ({free} MiB free) and layer layout is unknown — CPU inference");
+                0
+            }
+        }
+    };
+
+    // ── Phase 2: size the context for the planned offload.
     let (weight, kv_scale) = vram_footprint(model_path, ngl);
     let budget_mib = (free as i64) - weight as i64 - HEADROOM_MIB as i64 - embed_reserve_mib as i64;
     if budget_mib <= 0 {
         // Below MIN_CTX headroom: run the smallest window on f16 KV (FA off).
-        return CtxPlan { ctx: MIN_CTX, flash_attn: false, cache_type: "" };
+        return LaunchPlan { ngl, ctx: MIN_CTX, flash_attn: false, cache_type: "" };
     }
 
     let fit = |rate: f64| -> u32 {
@@ -2240,11 +2345,11 @@ fn plan_context(
     // Pass 1: quantized KV (lighter) assuming FA on.
     let c_quant = fit(kv_mib_per_token(preset.cache_type));
     if c_quant >= FA_CTX_THRESHOLD {
-        return CtxPlan { ctx: c_quant, flash_attn: true, cache_type: preset.cache_type };
+        return LaunchPlan { ngl, ctx: c_quant, flash_attn: true, cache_type: preset.cache_type };
     }
     // Pass 2: below FA threshold ⇒ FA off ⇒ f16 KV required (heavier).
     let c_f16 = fit(kv_mib_per_token("f16"));
-    CtxPlan { ctx: c_f16, flash_attn: false, cache_type: "" }
+    LaunchPlan { ngl, ctx: c_f16, flash_attn: false, cache_type: "" }
 }
 
 /// Flash attention is derived from the planned context, never configured.
@@ -2418,7 +2523,6 @@ struct ChatChunk {
 #[derive(Deserialize)]
 struct ChunkChoice {
     delta: ChunkDelta,
-    #[serde(default)] finish_reason: Option<String>,
 }
 #[derive(Deserialize)]
 struct ChunkDelta {
@@ -2510,8 +2614,6 @@ fn main() {
         llama_port: file_cfg.llama.port,
         parallel_slots: preset.parallel_slots,
         startup_timeout: file_cfg.llama.startup_timeout,
-        session_limit: file_cfg.limits.session_tokens,
-        daily_limit: file_cfg.limits.daily_tokens,
         models_dir: file_cfg.defaults.models_dir.clone(),
         active_model: String::new(),
         ngl: preset.default_ngl,
@@ -2548,6 +2650,7 @@ fn main() {
         };
         if let Some(m) = target {
             apply_model_params(&mut cfg, m);
+            plan_and_apply_launch(&mut cfg, m);
             eprintln!("[llama] starting {} (ngl={}, ctx={}, fa={})",
                 m.name, if cfg.ngl < 0 { 99 } else { cfg.ngl }, cfg.ctx,
                 if cfg.flash_attn { "on" } else { "off" });
@@ -2580,23 +2683,13 @@ fn main() {
     }
 }
 
+/// Copy model identity + sampling + speculation config. Launch geometry
+/// (ngl/ctx/FA/KV) is set separately by plan_and_apply_launch so callers can
+/// apply request-level ngl overrides BEFORE planning — planning with one ngl
+/// and launching with another is how OOMs happen.
 fn apply_model_params(cfg: &mut RuntimeCfg, m: &Model) {
     cfg.active_model = m.filename.clone();
     cfg.ngl = m.gpu_layers;
-
-    // Context is planned against real free VRAM and this model's *offloaded*
-    // footprint; flash-attn and KV quantization come back coupled and legal.
-    // Only reserve embed VRAM when the embed server actually offloads to GPU.
-    let embed_reserve = if cfg.embed_enabled && cfg.preset.embed_ngl > 0 { EMBED_RESERVE_MIB } else { 0 };
-    let plan = plan_context(
-        &m.path, m.gpu_layers, cfg.free_vram_mib,
-        embed_reserve, m.context_size, &cfg.preset,
-    );
-    cfg.ctx = plan.ctx;
-    cfg.flash_attn = plan.flash_attn;
-    cfg.cache_type_k = plan.cache_type.to_string();
-    cfg.cache_type_v = plan.cache_type.to_string();
-
     cfg.temp = m.temperature;
     cfg.top_k = m.top_k;
     cfg.top_p = m.top_p;
@@ -2605,6 +2698,23 @@ fn apply_model_params(cfg: &mut RuntimeCfg, m: &Model) {
     cfg.spec_draft_n_max = m.spec_draft_n_max;
     cfg.draft_model = m.draft_model.clone();
     cfg.gpu_layers_draft = m.gpu_layers_draft;
+}
+
+/// Plan the launch for the CURRENT cfg.ngl (model default or request
+/// override) against real free VRAM, and write the result into cfg.
+/// Offload, context, flash-attn and KV quantization come back coupled and
+/// legal. Only reserve embed VRAM when the embed server offloads to GPU.
+fn plan_and_apply_launch(cfg: &mut RuntimeCfg, m: &Model) {
+    let embed_reserve =
+        if cfg.embed_enabled && cfg.preset.embed_ngl > 0 { EMBED_RESERVE_MIB } else { 0 };
+    let plan = plan_launch(
+        &m.path, cfg.ngl, cfg.free_vram_mib, embed_reserve, m.context_size, &cfg.preset,
+    );
+    cfg.ngl = plan.ngl;
+    cfg.ctx = plan.ctx;
+    cfg.flash_attn = plan.flash_attn;
+    cfg.cache_type_k = plan.cache_type.to_string();
+    cfg.cache_type_v = plan.cache_type.to_string();
 }
 
 // ── HTTP server ─────────────────────────────────────────────
@@ -2746,7 +2856,10 @@ fn handle_load(st: &Shared, body: &str) -> serde_json::Value {
     cfg.free_vram_mib = probe_gpus().iter().map(|g| g.free_mib).max();
 
     apply_model_params(&mut cfg, &model);
+    // ngl override lands BEFORE planning — ctx/FA/KV are computed for the
+    // offload that will actually launch.
     if let Some(v) = req.ngl { cfg.ngl = v; }
+    plan_and_apply_launch(&mut cfg, &model);
     // Manual ctx is advisory: it may only lower the planned figure, never push
     // past what real VRAM can hold. Flash-attn re-derives from the result.
     if let Some(v) = req.ctx {
@@ -2905,73 +3018,41 @@ fn handle_rag_index(st: &Shared, body: &str) -> serde_json::Value {
     // Phase 1b: chunk files outside the lock.
     // Text domain uses the prose chunker; code domain tries the external
     // syntax-aware chunker, falling back to the internal line-window one.
-    let (all_chunks, all_sources, all_kinds, all_files) = if domain == "text" {
-        let mut chunks = Vec::new();
-        let mut sources = Vec::new();
-        let mut kinds = Vec::new();
-        let mut files = Vec::new();
-        for f in &req.files {
-            for (label, text, kind, file) in chunk_text_file(&f.name, &f.content) {
-                sources.push(label);
-                chunks.push(text);
-                kinds.push(kind);
-                files.push(file);
-            }
-        }
-        (chunks, sources, kinds, files)
-    } else if let Some(ext_chunks) =
+    let chunks: Vec<Chunk> = if domain == "text" {
+        req.files.iter().flat_map(|f| chunk_text_file(&f.name, &f.content)).collect()
+    } else if let Some(ext) =
         try_external_chunker(&chunker_tool, &req.files, chunk_size, chunk_overlap)
     {
-        let mut chunks = Vec::with_capacity(ext_chunks.len());
-        let mut sources = Vec::with_capacity(ext_chunks.len());
-        let mut kinds = Vec::with_capacity(ext_chunks.len());
-        let mut files = Vec::with_capacity(ext_chunks.len());
-        for (source, text, kind, file) in ext_chunks {
-            sources.push(source);
-            chunks.push(text);
-            kinds.push(kind);
-            files.push(file);
-        }
-        (chunks, sources, kinds, files)
+        ext
     } else {
         eprintln!("[rag] using internal fallback chunker");
-        let mut chunks: Vec<String> = Vec::new();
-        let mut sources: Vec<String> = Vec::new();
-        let mut kinds: Vec<String> = Vec::new();
-        let mut files: Vec<String> = Vec::new();
-        for f in &req.files {
-            for (label, text, kind, file) in chunk_code_file_simple(&f.name, &f.content, chunk_size, chunk_overlap) {
-                sources.push(label);
-                chunks.push(text);
-                kinds.push(kind);
-                files.push(file);
-            }
-        }
-        (chunks, sources, kinds, files)
+        req.files.iter()
+            .flat_map(|f| chunk_code_file_simple(&f.name, &f.content, chunk_size, chunk_overlap))
+            .collect()
     };
-
-    if all_chunks.is_empty() {
+    if chunks.is_empty() {
         return serde_json::json!({"error": "no chunks produced from files"});
     }
 
     // Domain-appropriate document embedding prefix.
-    let doc_prefix = if domain == "text" { TEXT_DOC_PREFIX.to_string() } else { code_doc_prefix };
+    let doc_prefix = if domain == "text" { TEXT_DOC_PREFIX } else { code_doc_prefix.as_str() };
 
     // Phase 2: embedding call (network I/O, no lock held)
-    eprintln!("[rag] embedding {} '{domain}' chunks from {} files...", all_chunks.len(), req.files.len());
+    eprintln!("[rag] embedding {} '{domain}' chunks from {} files...",
+        chunks.len(), req.files.len());
     let t0 = Instant::now();
-
-    let vectors = match get_embeddings_batch(&endpoint, &all_chunks, &doc_prefix) {
+    let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+    let vectors = match get_embeddings_batch(&endpoint, &texts, doc_prefix) {
         Ok(v) => v,
         Err(e) => return serde_json::json!({"error": e}),
     };
-
+    drop(texts);   // end the borrow of `chunks` before moving it into the store
     eprintln!("[rag] {} embeddings in {:.1}s", vectors.len(), t0.elapsed().as_secs_f64());
 
     // Phase 3: lock briefly to store results
     let file_names: Vec<String> = req.files.iter().map(|f| f.name.clone()).collect();
     let mut s = st.lock().unwrap();
-    match s.rag.store_embeddings(all_chunks, all_sources, vectors, file_names, all_kinds, all_files, domain) {
+    match s.rag.store_embeddings(chunks, vectors, file_names, domain) {
         Ok(count) => serde_json::json!({
             "ok": true,
             "domain": domain,
@@ -3013,8 +3094,8 @@ fn handle_rag_search(st: &Shared, body: &str) -> serde_json::Value {
     // Phase 3: lock briefly for similarity search (CPU only, fast)
     let s = st.lock().unwrap();
     let hits = s.rag.search_local(&query_vec, limit, &req.query, domain);
-    let results: Vec<serde_json::Value> = hits.iter().map(|(src, text, dist)| {
-        serde_json::json!({"source": src, "text": text, "distance": dist})
+    let results: Vec<serde_json::Value> = hits.iter().map(|(src, text, score)| {
+        serde_json::json!({"source": src, "text": text, "score": score})
     }).collect();
     serde_json::json!({"ok": true, "results": results})
 }
@@ -3103,19 +3184,8 @@ fn assemble_context(
         } else if files_used < file_budget {
             let remaining = file_budget - files_used;
             if remaining > 15 {
-                // Use per-language ratio for truncation char budget
-                let ratio = match lang_tag {
-                    "rust" | "c" | "c++" | "java" | "csharp" => 2.6,
-                    "go" | "swift" | "kotlin" | "zig" => 2.8,
-                    "javascript" | "typescript" => 2.9,
-                    "python" | "ruby" | "lua" => 3.4,
-                    _ => 3.2,
-                };
-                let max_chars = ((remaining - 15) as f64 * ratio) as usize;
-                let truncated = if max_chars < f.content.len() {
-                    let slice = &f.content[..max_chars.min(f.content.len())];
-                    slice.rfind('\n').map(|nl| &f.content[..nl + 1]).unwrap_or(slice)
-                } else { &f.content };
+                let max_chars = ((remaining - 15) as f64 * chars_per_token(lang_tag)) as usize;
+                let truncated = prefix_at_line(&f.content, max_chars);
                 let block = format!("\n--- {} (truncated) ---\n```{}\n{}\n```\n", f.name, lang_tag, truncated);
                 files_used += estimate_tokens_lang(&block, lang_tag);
                 result.context_block.push_str(&block);
@@ -3162,12 +3232,7 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
         s.cfg.clone()
     };
 
-    let _ = write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-         Cache-Control: no-cache\r\nConnection: keep-alive\r\n\
-         Access-Control-Allow-Origin: *\r\n\r\n"
-    );
+    let _ = stream.write_all(SSE_HEADERS.as_bytes());
     let _ = stream.flush();
 
     if is_chat {
@@ -3404,6 +3469,7 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
         ],
         "max_tokens": max_tokens,
         "temperature": cfg.temp,
+        "top_k": cfg.top_k,
         "top_p": cfg.top_p,
         "repeat_penalty": cfg.repeat_penalty,
         "stream": true,
@@ -3416,9 +3482,12 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
 }
 
 /// Stream a chat-completions request to the llama server, relaying tokens to
-/// the client as SSE. Shared by the write/review and chat pipelines. Kills the
-/// upstream generation if the client disconnects, and folds `done_extra` into
-/// the terminal `{done:true,...}` event. Updates session token counters.
+/// the client as SSE. Shared by the write/review and chat pipelines. Native
+/// HTTP over TcpStream — no external processes, no temp files, works on every
+/// supported OS. On client disconnect the upstream connection is dropped,
+/// which cancels the generation server-side (llama-server aborts a slot when
+/// its client goes away). Folds `done_extra` into the terminal
+/// `{done:true,...}` event and updates session token counters.
 fn stream_completion(
     stream: &mut TcpStream,
     st: &Shared,
@@ -3426,45 +3495,72 @@ fn stream_completion(
     llama_req: &serde_json::Value,
     done_extra: serde_json::Value,
 ) {
-    // Unique temp path per call — concurrent requests must not collide.
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = format!("/tmp/cw_{}_{}.json", std::process::id(), seq);
+    let (host, port, path) = match parse_endpoint(endpoint) {
+        Ok(v) => v,
+        Err(e) => { send_sse(stream, &serde_json::json!({"error": e})); return; }
+    };
+    let body = llama_req.to_string();
 
-    if fs::write(&tmp, llama_req.to_string()).is_err() {
-        send_sse(stream, &serde_json::json!({"error": "failed to write temp file"}));
-        return;
-    }
-
-    let child = Command::new(curl_cmd())
-        .args([
-            "-s", "--no-buffer", "-X", "POST",
-            endpoint,
-            "-H", "content-type: application/json",
-            "--max-time", "300",
-            "-d", &format!("@{tmp}"),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn();
-
-    let mut child = match child {
-        Ok(c) => c,
+    let mut upstream = match TcpStream::connect((host, port)) {
+        Ok(s) => s,
         Err(e) => {
-            send_sse(stream, &serde_json::json!({"error": format!("curl: {e}")}));
-            let _ = fs::remove_file(&tmp);
+            send_sse(stream, &serde_json::json!({"error": format!("connect {host}:{port}: {e}")}));
             return;
         }
     };
+    // Long read timeout bounds a stalled generation without capping total
+    // stream duration — the timer resets on every received byte.
+    upstream.set_read_timeout(Some(Duration::from_secs(300))).ok();
+    upstream.set_write_timeout(Some(Duration::from_secs(10))).ok();
 
-    let stdout = child.stdout.take().unwrap();
-    let reader = BufReader::new(stdout);
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    if let Err(e) = upstream.write_all(req.as_bytes()) {
+        send_sse(stream, &serde_json::json!({"error": format!("write: {e}")}));
+        return;
+    }
+
+    let mut reader = BufReader::new(upstream);
+
+    // Status line + headers.
+    let mut status_line = String::new();
+    if reader.read_line(&mut status_line).is_err() || status_line.is_empty() {
+        send_sse(stream, &serde_json::json!({"error": "no response from llama server"}));
+        return;
+    }
+    let ok = status_line.split_whitespace().nth(1) == Some("200");
+    let mut chunked = false;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_err() || line.trim().is_empty() { break; }
+        let l = line.to_ascii_lowercase();
+        if l.starts_with("transfer-encoding:") && l.contains("chunked") { chunked = true; }
+    }
+    if !ok {
+        let mut rest = String::new();
+        let _ = reader.read_to_string(&mut rest);
+        send_sse(stream, &serde_json::json!({
+            "error": format!("llama server: {} {}",
+                status_line.trim(), prefix_at_boundary(&rest, 200)),
+        }));
+        return;
+    }
+
+    let body_reader: Box<dyn BufRead> = if chunked {
+        Box::new(BufReader::new(ChunkedReader::new(reader)))
+    } else {
+        Box::new(reader)
+    };
+
     let t0 = Instant::now();
     let mut token_count = 0u64;
     let mut aborted = false;
 
-    for line in reader.lines().flatten() {
+    for line in body_reader.lines().map_while(Result::ok) {
         let Some(data) = line.strip_prefix("data: ") else { continue };
         if data == "[DONE]" { break; }
         if let Ok(chunk) = serde_json::from_str::<ChatChunk>(data) {
@@ -3472,9 +3568,9 @@ fn stream_completion(
                 if !content.is_empty() {
                     token_count += 1;
                     if !send_sse(stream, &serde_json::json!({"token": content})) {
-                        // Client disconnected (abort) — kill curl to stop generation.
-                        eprintln!("[gen] client disconnected after {token_count} tokens, killing generation");
-                        let _ = child.kill();
+                        // Client disconnected — dropping the upstream connection
+                        // (end of scope) cancels the generation server-side.
+                        eprintln!("[gen] client disconnected after {token_count} tokens, cancelling");
                         aborted = true;
                         break;
                     }
@@ -3483,19 +3579,16 @@ fn stream_completion(
         }
     }
 
-    let elapsed_ms = t0.elapsed().as_millis() as u64;
     if !aborted {
         let mut ev = serde_json::json!({
-            "done": true, "tokens": token_count, "elapsed_ms": elapsed_ms,
+            "done": true, "tokens": token_count,
+            "elapsed_ms": t0.elapsed().as_millis() as u64,
         });
         if let Some(obj) = done_extra.as_object() {
             for (k, v) in obj { ev[k] = v.clone(); }
         }
         send_sse(stream, &ev);
     }
-
-    let _ = fs::remove_file(&tmp);
-    let _ = child.wait();
 
     let mut s = st.lock().unwrap();
     s.tokens_session += token_count;
@@ -3546,17 +3639,9 @@ fn handle_chat_stream(stream: &mut TcpStream, st: &Shared, req: &WriteReq, cfg: 
                 // meaningful room left, then stop pinning further files.
                 let remaining = pin_budget.saturating_sub(used);
                 if remaining > 64 && pinned_files.is_empty() {
-                    let ratio = match lang {
-                        "rust" | "c" | "c++" | "cpp" | "java" | "csharp" => 2.6,
-                        "go" | "swift" | "kotlin" | "zig" => 2.8,
-                        "javascript" | "typescript" => 2.9,
-                        "python" | "ruby" | "lua" => 3.4,
-                        _ => 3.2,
-                    };
-                    let max_chars = ((remaining - 32) as f64 * ratio) as usize;
+                    let max_chars = ((remaining - 32) as f64 * chars_per_token(lang)) as usize;
                     if max_chars < f.content.len() {
-                        let slice = &f.content[..max_chars.min(f.content.len())];
-                        let cut = slice.rfind('\n').map(|nl| &f.content[..nl + 1]).unwrap_or(slice);
+                        let cut = prefix_at_line(&f.content, max_chars);
                         block.push_str(&format!(
                             "\n--- {} (truncated) ---\n```{}\n{}\n```\n", f.name, lang, cut));
                         pinned_files.push(format!("{} (truncated)", f.name));
@@ -3685,6 +3770,7 @@ fn handle_chat_stream(stream: &mut TcpStream, st: &Shared, req: &WriteReq, cfg: 
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": cfg.temp,
+        "top_k": cfg.top_k,
         "top_p": cfg.top_p,
         "repeat_penalty": cfg.repeat_penalty,
         "stream": true,
@@ -3696,6 +3782,12 @@ fn handle_chat_stream(stream: &mut TcpStream, st: &Shared, req: &WriteReq, cfg: 
     );
 }
 
+/// SSE response preamble — shared by the streaming handlers and error path.
+const SSE_HEADERS: &str =
+    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+     Cache-Control: no-cache\r\nConnection: keep-alive\r\n\
+     Access-Control-Allow-Origin: *\r\n\r\n";
+
 /// Send an SSE event to the client.  Returns `false` if the write fails
 /// (client disconnected), allowing the caller to abort early.
 fn send_sse(stream: &mut TcpStream, val: &serde_json::Value) -> bool {
@@ -3705,12 +3797,7 @@ fn send_sse(stream: &mut TcpStream, val: &serde_json::Value) -> bool {
 }
 
 fn send_sse_error(stream: &mut TcpStream, msg: &str) {
-    let _ = write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
-         Cache-Control: no-cache\r\nConnection: keep-alive\r\n\
-         Access-Control-Allow-Origin: *\r\n\r\n"
-    );
+    let _ = stream.write_all(SSE_HEADERS.as_bytes());
     send_sse(stream, &serde_json::json!({"error": msg}));
 }
 
@@ -3718,4 +3805,4 @@ fn send_sse_error(stream: &mut TcpStream, msg: &str) {
 
 const INDEX: &str = include_str!("index.html");
 const STYLE: &str = include_str!("style.css");
-const SCRIPT: &str = include_str!("app.js");
+const SCRIPT: &str = include_str!("app.js");

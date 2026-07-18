@@ -1,15 +1,9 @@
-# CodeWriter — config.toml
-
-# ── Hardware ────────────────────────────────────────────────
-# One knob. Set your GPU's VRAM class and every hardware-shaped parameter
-# (context size, KV-cache quantization, flash-attention gating, parallel
-# slots, embed-server sizing) is derived for you. Real free VRAM — read live
-# from nvidia-smi — further caps the launch context per model, using the
-# actual model weight size, so a card is used to its full extent while a busy
-# desktop never triggers an out-of-memory launch.
+# ── Hardware
+# One knob. Set your GPU's VRAM class.
 #   "4GB"  — small cards (GTX 1650, RTX 3050 laptop, ...)
 #   "8GB"  — mainstream cards (RTX 3060 / 4060, ...)
 #   "cpu"  — no CUDA GPU; CPU inference
+
 [hardware]
 vram = "4GB"
 
@@ -21,13 +15,7 @@ binary = ""              # auto-detect if empty
 port = 8079
 startup_timeout = 120
 
-[limits]
-session_tokens = 0       # 0 = unlimited
-daily_tokens = 0
-
-# ── Defaults ────────────────────────────────────────────────
-# Model identity + sampling only. Per-model [[models]] entries override the
-# sampling values. All hardware knobs come from [hardware].
+# ── Defaults
 [defaults]
 model = "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
 models_dir = "models"
@@ -36,21 +24,10 @@ top_k = 40
 top_p = 0.9
 repeat_penalty = 1.1
 
-# ── Embed Server ────────────────────────────────────────────
-# A second llama-server process dedicated to embeddings, on its own port so
-# the main model can generate while the embed model produces vectors. Both
-# PIDs are managed by the main binary. GPU offload and context are derived
-# from the [hardware] tier; only the model, port, and retrieval prefixes are
-# set here.
-#
-# pooling: "mean", "cls", "last", or "" (let server auto-detect).
-#   - embeddinggemma: "" (auto / mean)
-#   - nomic-embed-code: "last"
-#   - qwen3-embedding: "" (auto / mean)
-#
-# query_prefix / doc_prefix: text prepended before embedding.
-#   Different models require different prefixes for best retrieval.
-#   Leave both empty for models that don't use prefixes (e.g. embeddinggemma).
+# ── Embed Server
+# A second llama-server process dedicated to embeddings. GPU offload and context are derived
+# from the [hardware] tier; only the model, port, and retrieval prefixes are set here.
+
 [embed]
 enabled = false
 model = "Qwen3-Embedding-0.6B-Q8_0.gguf"
@@ -60,34 +37,19 @@ pooling = ""             # auto-detect from GGUF metadata
 query_prefix = "Instruct: Find code relevant to this description\nQuery: "
 doc_prefix = ""
 
-# ── RAG (Retrieval-Augmented Generation) ────────────────────
+# ── RAG
 # Indexes uploaded files into a local vector store using the embed server.
 # Semantic search retrieves relevant code chunks and injects them into the
 # prompt before generation.
-#
-# chunk_size = lines per chunk for code files
-# chunk_overlap = overlapping lines between consecutive chunks
-# search_results = number of chunks to retrieve per query
-#
-# min_similarity = cosine similarity threshold (0.0-1.0); chunks scoring below
-#   this are discarded even if they're the "best" match. Recommended 0.20-0.35.
-#
-# hybrid_weight_vector / hybrid_weight_bm25 = weights for combining vector
-#   cosine similarity and BM25 keyword scoring. Should sum to 1.0. Set
-#   hybrid_weight_bm25 = 0.0 to disable hybrid search.
-#
-# chunker_tool = path to external chunker script. When set, the indexer spawns
-#   this tool for syntax-aware code chunking (respects function, struct, impl,
-#   class boundaries). Falls back to internal line-window chunker if the tool
-#   is missing or fails. Set to "" to disable.
 #
 # HNSW graph parameters (approximate nearest neighbor search):
 # hnsw_m = max connections per node per layer (layer 0 gets 2×M)
 # hnsw_ef_construction = beam width during index build
 # hnsw_ef_search = beam width during query (higher = more accurate, slower)
+
 [rag]
 enabled = true
-db_path = "data/rag_index.json"
+db_path = "data/rag_index.bin"
 chunk_size = 60
 chunk_overlap = 10
 search_results = 5
@@ -99,10 +61,7 @@ hnsw_m = 16
 hnsw_ef_construction = 150
 hnsw_ef_search = 64
 
-# ── Models ──────────────────────────────────────────────────
-# The only per-model overrides. gpu_layers and context_size are the model's
-# own properties (layer count, trained context max); the [hardware] tier still
-# caps the effective launch context to what real VRAM can hold.
+# ── Models
 
 [[models]]
 filename = "qwen2.5-0.5b-instruct-q8_0.gguf"

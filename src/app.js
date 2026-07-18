@@ -509,11 +509,11 @@
         o.textContent = fname.replace('.gguf', '');
         draftSel.appendChild(o);
       }
-      if (d.draft) {
-        draftSel.value = d.draft.model || '';
-        $('#p-draft-max').value = d.draft.max || 10;
-        $('#p-draft-ngl').value = d.draft.ngl ?? 99;
-        updateDraftInfo(d.draft.model, d.draft.max);
+      if (d.spec) {
+        draftSel.value = d.spec.draft_model || '';
+        $('#p-draft-max').value = d.spec.draft_n_max || 2;
+        $('#p-draft-ngl').value = d.spec.gpu_layers_draft ?? 99;
+        updateDraftInfo(d.spec.draft_model, d.spec.draft_n_max);
       }
 
       const activeModel = modelsData.find((m) => m.filename === d.active);
@@ -559,7 +559,7 @@
       el.textContent = 'Speculative decoding disabled. No VRAM used for draft KV cache.';
     } else {
       el.textContent = `Draft: ${draftModel.replace('.gguf', '')}\n`
-        + `Proposes up to ${draftMax || 10} tokens per step.\n`
+        + `Proposes up to ${draftMax || 2} tokens per step.\n`
         + `Note: draft model shares the main context window and allocates its own KV cache.`;
     }
   }
@@ -624,14 +624,16 @@
           model,
           ngl: +$('#p-ngl').value,
           ctx: +$('#p-ctx').value,
-          flash_attn: true,
           temp: +$('#p-temp').value,
           top_k: +$('#p-topk').value,
           top_p: +$('#p-topp').value,
           repeat_penalty: +$('#p-rp').value,
-          draft_model: draftModel,
-          draft_max: +$('#p-draft-max').value || 10,
-          gpu_layers_draft: +$('#p-draft-ngl').value,
+          ...(draftModel ? {
+            spec_type: 'draft-model',
+            draft_model: draftModel,
+            spec_draft_n_max: +$('#p-draft-max').value || 2,
+            gpu_layers_draft: +$('#p-draft-ngl').value,
+          } : {}),
         }),
       }).then((r) => r.json());
 
