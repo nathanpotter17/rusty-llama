@@ -127,7 +127,19 @@
           </div>
           <div class="workspace-row">
             <input type="text" id="workspace-path" class="workspace-input" placeholder="/path/to/repo (folder on the server machine)" spellcheck="false">
+            <button id="workspace-browse-btn" class="small-btn" title="Browse the server's filesystem for a folder">Browse…</button>
             <button id="workspace-set-btn" class="small-btn">Set</button>
+          </div>
+          <div id="workspace-browser" class="workspace-browser hidden">
+            <div class="wsb-header">
+              <span id="wsb-path" class="wsb-path"></span>
+              <span id="wsb-git" class="wsb-git hidden">git</span>
+            </div>
+            <div id="wsb-list" class="wsb-list"></div>
+            <div class="wsb-actions">
+              <button id="wsb-select" class="small-btn wsb-select">Use this folder</button>
+              <button id="wsb-cancel" class="small-btn">Cancel</button>
+            </div>
           </div>
         </div>
       </div>

@@ -107,6 +107,10 @@ impl Default for LlamaCfg {
 struct DefaultsCfg {
     model: String,
     models_dir: String,
+    /// Requested context window. Passed straight to the engine — the engine
+    /// owns fitting it (streamer-server sizes its residency tiers around the
+    /// KV budget). Per-model [[models]] context_size overrides this.
+    ctx: u32,
     temperature: f32,
     top_k: u32,
     top_p: f32,
@@ -116,6 +120,7 @@ impl Default for DefaultsCfg {
     fn default() -> Self {
         Self {
             model: String::new(), models_dir: "models".into(),
+            ctx: 32768,
             temperature: 0.7, top_k: 40, top_p: 0.9, repeat_penalty: 1.1,
         }
     }
@@ -239,7 +244,7 @@ struct ModelEntry {
 
 fn def_family() -> String { "unknown".into() }
 fn def_ngl() -> i32 { 15 }
-fn def_ctx() -> u32 { 4096 }
+fn def_ctx() -> u32 { 0 }   // 0 = inherit [defaults] ctx
 fn def_temp() -> f32 { 0.7 }
 fn def_topk() -> u32 { 40 }
 fn def_topp() -> f32 { 0.9 }
@@ -274,12 +279,14 @@ struct RuntimeCfg {
     spec_draft_n_max: u32,
     gpu_layers_draft: i32,
     threads: usize,           // generation threads, derived from SystemInfo
-    // Hardware plan: the resolved preset plus the real free-VRAM reading used
-    // to size KV/context per model. Context, flash-attn, KV quantization and
-    // parallel slots are all derived from these — never read from the file.
+    /// [defaults] ctx — the requested context for models without their own
+    /// [[models]] context_size entry.
+    default_ctx: u32,
+    // Hardware preset: still sizes the embed server, threads, and parallel
+    // slots. Context is NOT planned from VRAM anymore — the engine owns that.
     preset: HwPreset,
     free_vram_mib: Option<u64>,
-    embed_enabled: bool,      // reserve embed VRAM when planning main context
+    embed_enabled: bool,
     // Embed server config (cloned from EmbedCfg)
     embed: EmbedCfg,
 }
@@ -2267,11 +2274,9 @@ impl SystemInfo {
 // buckets, no OOM launches.
 
 const MIN_CTX: u32 = 2048;
-/// CUDA context + compute buffers + fragmentation margin.
-const HEADROOM_MIB: u64 = 512;
-/// Resident footprint reserved for the embed server (0.6B Q8 + its KV) so a
-/// later lazy start doesn't OOM a model sized to the whole card.
-const EMBED_RESERVE_MIB: u64 = 900;
+/// streamer-server's MAX_CTX; llama-server accepts more but nothing we run
+/// wants it.
+const ENGINE_MAX_CTX: u32 = 65536;
 /// Flash attention engages only at/above this context — below it, FA's
 /// overhead isn't paid for a benefit that doesn't materialize on short prompts.
 const FA_CTX_THRESHOLD: u32 = 8192;
@@ -2319,17 +2324,6 @@ impl HwPreset {
     }
 }
 
-/// Per-token KV-cache cost (MiB), K+V summed across layers, with a small
-/// margin for context-scaling compute buffers. Realistic for GQA 4-8B models —
-/// deliberately not paranoid, so cards keep the context they can actually hold.
-fn kv_mib_per_token(cache_type: &str) -> f64 {
-    match cache_type {
-        "f16" | "" => 0.065,
-        "q8_0"     => 0.035,
-        "q4_0" | "q4_1" | "q5_0" | "q5_1" => 0.020,
-        _ => 0.035,
-    }
-}
 
 /// On-disk GGUF size (MiB) — the model's total weight footprint.
 fn weight_mib(path: &str) -> u64 {
@@ -2402,81 +2396,10 @@ fn gguf_block_count(path: &str) -> Option<u32> {
     None
 }
 
-/// VRAM footprint of the offloaded portion: (weight MiB on GPU, KV scale in
-/// (0,1]). Under partial `-ngl`, only `ngl/block_count` of the weights and KV
-/// live on the GPU; full offload (`ngl < 0`) or unknown layout ⇒ whole model.
-fn vram_footprint(path: &str, ngl: i32) -> (u64, f64) {
-    let file_mib = weight_mib(path);
-    if ngl < 0 { return (file_mib, 1.0); }             // all layers offloaded
-    match gguf_block_count(path) {
-        Some(total) if total > 0 => {
-            let off = (ngl as u32).min(total);
-            let frac = (off as f64 / total as f64).clamp(0.0, 1.0);
-            let weight = ((file_mib as f64) * frac) as u64;
-            (weight, frac.max(1.0 / total as f64))     // ≥ one layer's share
-        }
-        _ => (file_mib, 1.0),                           // unknown: conservative
-    }
-}
 
 /// A complete, self-consistent launch plan. Flash-attn and KV quantization are
 /// coupled: llama.cpp requires flash-attn for a quantized V cache, so quantized
 /// KV is used only at/above the FA context threshold; below it, KV is f16.
-struct CtxPlan {
-    ctx: u32,
-    flash_attn: bool,
-    cache_type: &'static str,   // "" ⇒ f16 (no --cache-type flags)
-}
-
-/// Plan the launch context from REAL free VRAM: subtract the offloaded weight,
-/// compute headroom, and (when enabled) the embed reservation, then size KV to
-/// what remains — clamped to the model's declared max and the preset bound.
-/// Two-pass so FA/KV stay legal: try quantized (FA-on) KV first; if that lands
-/// below the FA threshold, fall back to f16 KV with FA off.
-fn plan_context(
-    model_path: &str,
-    ngl: i32,
-    free_vram_mib: Option<u64>,
-    embed_reserve_mib: u64,
-    model_max_ctx: u32,   // 0 = model didn't declare one
-    preset: &HwPreset,
-) -> CtxPlan {
-    let hard_max = if model_max_ctx > 0 {
-        model_max_ctx.min(preset.ctx_hard_max)
-    } else {
-        preset.ctx_hard_max
-    };
-
-    let Some(free) = free_vram_mib else {
-        // CPU / no GPU reading: RAM-bound, keep the preset default.
-        let ctx = preset.ctx_default.min(hard_max).max(MIN_CTX);
-        let fa = flash_attn_for_ctx(ctx);
-        return CtxPlan { ctx, flash_attn: fa, cache_type: if fa { preset.cache_type } else { "" } };
-    };
-
-    let (weight, kv_scale) = vram_footprint(model_path, ngl);
-    let budget_mib = (free as i64) - weight as i64 - HEADROOM_MIB as i64 - embed_reserve_mib as i64;
-    if budget_mib <= 0 {
-        // Below MIN_CTX headroom: run the smallest window on f16 KV (FA off).
-        return CtxPlan { ctx: MIN_CTX, flash_attn: false, cache_type: "" };
-    }
-
-    let fit = |rate: f64| -> u32 {
-        let per = (rate * kv_scale).max(1e-6);
-        let c = ((budget_mib as f64 / per) as u64 / 1024) * 1024;   // → 1024 boundary
-        (c as u32).clamp(MIN_CTX, hard_max)
-    };
-
-    // Pass 1: quantized KV (lighter) assuming FA on.
-    let c_quant = fit(kv_mib_per_token(preset.cache_type));
-    if c_quant >= FA_CTX_THRESHOLD {
-        return CtxPlan { ctx: c_quant, flash_attn: true, cache_type: preset.cache_type };
-    }
-    // Pass 2: below FA threshold ⇒ FA off ⇒ f16 KV required (heavier).
-    let c_f16 = fit(kv_mib_per_token("f16"));
-    CtxPlan { ctx: c_f16, flash_attn: false, cache_type: "" }
-}
-
 /// Flash attention is derived from the planned context, never configured.
 fn flash_attn_for_ctx(ctx: u32) -> bool { ctx >= FA_CTX_THRESHOLD }
 
@@ -2699,7 +2622,7 @@ fn main() {
     let exclude: Vec<&str> = if embed_model.is_empty() { vec![] } else { vec![embed_model.as_str()] };
     let models = discover_models(
         &file_cfg.defaults.models_dir, &file_cfg.models, &file_cfg.defaults,
-        preset.default_ngl, preset.ctx_default, &exclude,
+        preset.default_ngl, 0 /* inherit [defaults] ctx */, &exclude,
     );
 
     eprintln!("\n  CODEWRITER + RAG");
@@ -2735,8 +2658,8 @@ fn main() {
 
     sys.print();
     eprintln!(
-        "  hardware: vram=\"{}\" → ctx≤{}, kv={}, slots={}, embed_ctx={}; threads={}",
-        file_cfg.hardware.vram, preset.ctx_hard_max, preset.cache_type,
+        "  hardware: vram=\"{}\" → ctx={} (engine-owned), kv={}, slots={}, embed_ctx={}; threads={}",
+        file_cfg.hardware.vram, file_cfg.defaults.ctx, preset.cache_type,
         preset.parallel_slots, preset.embed_ctx, sys.gen_threads(),
     );
 
@@ -2751,8 +2674,8 @@ fn main() {
         models_dir: file_cfg.defaults.models_dir.clone(),
         active_model: String::new(),
         ngl: preset.default_ngl,
-        ctx: preset.ctx_default,                         // replaced per-model at load
-        flash_attn: flash_attn_for_ctx(preset.ctx_default),
+        ctx: file_cfg.defaults.ctx,                      // replaced per-model at load
+        flash_attn: flash_attn_for_ctx(file_cfg.defaults.ctx),
         temp: file_cfg.defaults.temperature,
         top_k: file_cfg.defaults.top_k,
         top_p: file_cfg.defaults.top_p,
@@ -2764,6 +2687,7 @@ fn main() {
         spec_draft_n_max: def_spec_nmax(),
         gpu_layers_draft: def_ngl_draft(),
         threads: sys.gen_threads(),
+        default_ctx: file_cfg.defaults.ctx,
         preset,
         free_vram_mib: free_vram,
         embed_enabled,
@@ -2828,18 +2752,18 @@ fn apply_model_params(cfg: &mut RuntimeCfg, m: &Model) {
     cfg.active_model = m.filename.clone();
     cfg.ngl = m.gpu_layers;
 
-    // Context is planned against real free VRAM and this model's *offloaded*
-    // footprint; flash-attn and KV quantization come back coupled and legal.
-    // Only reserve embed VRAM when the embed server actually offloads to GPU.
-    let embed_reserve = if cfg.embed_enabled && cfg.preset.embed_ngl > 0 { EMBED_RESERVE_MIB } else { 0 };
-    let plan = plan_context(
-        &m.path, m.gpu_layers, cfg.free_vram_mib,
-        embed_reserve, m.context_size, &cfg.preset,
-    );
-    cfg.ctx = plan.ctx;
-    cfg.flash_attn = plan.flash_attn;
-    cfg.cache_type_k = plan.cache_type.to_string();
-    cfg.cache_type_v = plan.cache_type.to_string();
+    // Context is a straight request: the per-model context_size when the
+    // [[models]] entry sets one, else [defaults] ctx. No VRAM second-guessing
+    // — that heuristic assumed llama-server-style full-layer offload and
+    // starved streamer-server, whose tiered residency fits models (and KV)
+    // that llama-server cannot hold at all. The engine fails loudly if the
+    // request truly doesn't fit.
+    let requested = if m.context_size > 0 { m.context_size } else { cfg.default_ctx };
+    cfg.ctx = requested.clamp(MIN_CTX, ENGINE_MAX_CTX);
+    cfg.flash_attn = flash_attn_for_ctx(cfg.ctx);
+    let ct = if cfg.flash_attn { cfg.preset.cache_type } else { "" };
+    cfg.cache_type_k = ct.to_string();
+    cfg.cache_type_v = ct.to_string();
 
     cfg.temp = m.temperature;
     cfg.top_k = m.top_k;
@@ -2900,6 +2824,7 @@ fn serve(mut stream: TcpStream, st: &Shared) {
         ("GET", "/api/workspace/status") => respond_json(&mut stream, &handle_workspace_status(st)),
         ("POST", "/api/workspace/set")   => respond_json(&mut stream, &handle_workspace_set(st, &body)),
         ("POST", "/api/workspace/index") => respond_json(&mut stream, &handle_workspace_index(st, &body)),
+        ("POST", "/api/workspace/browse") => respond_json(&mut stream, &handle_workspace_browse(&body)),
 
         ("GET", "/api/rag/status")   => respond_json(&mut stream, &handle_rag_status(st)),
         ("POST", "/api/rag/index")   => respond_json(&mut stream, &handle_rag_index(st, &body)),
@@ -3333,6 +3258,13 @@ fn handle_workspace_status(st: &Shared) -> serde_json::Value {
     })
 }
 
+/// Canonical path without Windows' verbatim `\\?\` prefix (unusable in
+/// shell commands and ugly in the UI).
+fn clean_path(p: &Path) -> String {
+    let s = p.to_string_lossy().to_string();
+    s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
+}
+
 #[derive(Deserialize)]
 struct WorkspaceSetReq {
     path: String,
@@ -3344,7 +3276,7 @@ fn handle_workspace_set(st: &Shared, body: &str) -> serde_json::Value {
         Err(e) => return serde_json::json!({"error": e.to_string()}),
     };
     let canon = match fs::canonicalize(req.path.trim()) {
-        Ok(p) if p.is_dir() => p.to_string_lossy().to_string(),
+        Ok(p) if p.is_dir() => clean_path(&p),
         Ok(_) => return serde_json::json!({"error": "path is not a directory"}),
         Err(e) => return serde_json::json!({"error": format!("bad path: {e}")}),
     };
@@ -3359,6 +3291,48 @@ fn handle_workspace_set(st: &Shared, body: &str) -> serde_json::Value {
         eprintln!("[workspace] manifest save: {e}");
     }
     serde_json::json!({"ok": true, "path": canon})
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct WorkspaceBrowseReq {
+    path: String,
+}
+
+/// Server-side directory listing for the UI's folder picker. Browsers can't
+/// hand over absolute paths, and uploading a repo defeats the point of a
+/// server-side workspace — so the UI navigates the server's own filesystem.
+/// (Same trust level as the agentic tool loop, which already runs shell.)
+fn handle_workspace_browse(body: &str) -> serde_json::Value {
+    let req: WorkspaceBrowseReq = serde_json::from_str(body).unwrap_or_default();
+    let start = if req.path.trim().is_empty() {
+        env::var("HOME")
+            .or_else(|_| env::var("USERPROFILE"))
+            .unwrap_or_else(|_| "/".into())
+    } else {
+        req.path.trim().to_string()
+    };
+    let canon = match fs::canonicalize(&start) {
+        Ok(p) if p.is_dir() => p,
+        _ => return serde_json::json!({"error": format!("not a directory: {start}")}),
+    };
+    let mut dirs: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&canon) {
+        for e in entries.flatten() {
+            let Ok(ft) = e.file_type() else { continue };
+            let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
+            if ft.is_dir() && !name.starts_with('.') {
+                dirs.push(name);
+            }
+        }
+    }
+    dirs.sort_by_key(|a| a.to_lowercase());
+    serde_json::json!({
+        "path": clean_path(&canon),
+        "parent": canon.parent().map(clean_path),
+        "dirs": dirs,
+        "is_git": canon.join(".git").exists(),
+    })
 }
 
 #[derive(Deserialize, Default)]

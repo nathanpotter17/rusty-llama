@@ -140,6 +140,56 @@
     }
   });
 
+  // ── Folder picker (navigates the server's filesystem) ──
+
+  let wsbPath = '';
+
+  async function wsbLoad(path) {
+    const status = $('#workspace-status');
+    try {
+      const d = await (await fetch('/api/workspace/browse', {
+        method: 'POST',
+        body: JSON.stringify({ path: path || '' }),
+      })).json();
+      if (d.error) { status.textContent = d.error; status.className = 'rag-index-status rag-error'; return; }
+      wsbPath = d.path;
+      $('#wsb-path').textContent = d.path;
+      $('#wsb-git').classList.toggle('hidden', !d.is_git);
+      const sep = d.path.includes('\\') ? '\\' : '/';
+      const join = (base, name) =>
+        base.endsWith(sep) ? base + name : base + sep + name;
+      const list = $('#wsb-list');
+      list.innerHTML = '';
+      const row = (label, target, cls) => {
+        const el = document.createElement('div');
+        el.className = 'wsb-entry' + (cls ? ' ' + cls : '');
+        el.textContent = label;
+        el.onclick = () => wsbLoad(target);
+        list.appendChild(el);
+      };
+      if (d.parent) row('..', d.parent, 'wsb-up');
+      for (const name of d.dirs) row(name, join(d.path, name));
+    } catch (e) {
+      status.textContent = String(e);
+      status.className = 'rag-index-status rag-error';
+    }
+  }
+
+  $('#workspace-browse-btn').addEventListener('click', () => {
+    const panel = $('#workspace-browser');
+    panel.classList.toggle('hidden');
+    if (!panel.classList.contains('hidden')) {
+      wsbLoad($('#workspace-path').value.trim());
+    }
+  });
+  $('#wsb-cancel').addEventListener('click', () =>
+    $('#workspace-browser').classList.add('hidden'));
+  $('#wsb-select').addEventListener('click', () => {
+    $('#workspace-path').value = wsbPath;
+    $('#workspace-browser').classList.add('hidden');
+    $('#workspace-set-btn').click();
+  });
+
   $('#workspace-sync-btn').addEventListener('click', async () => {
     const btn = $('#workspace-sync-btn');
     const status = $('#workspace-status');
