@@ -89,8 +89,89 @@
         $('#output-title').textContent = 'Output';
         $('#chat-new-btn').classList.add('hidden');
       }
+      // Agentic exploration only makes sense when the model answers about
+      // existing code (review/chat), not raw generation.
+      $('#agentic-toggle').classList.toggle('hidden', currentMode === 'write');
       updateRagBadge();
     });
+  });
+
+  const isAgentic = () =>
+    currentMode !== 'write' && $('#agentic-checkbox').checked;
+
+  // ── Server-side workspace ──
+
+  async function refreshWorkspace() {
+    try {
+      const d = await (await fetch('/api/workspace/status')).json();
+      if (d.path) {
+        $('#workspace-path').value = d.path;
+        const when = d.last_index_epoch
+          ? new Date(d.last_index_epoch * 1000).toLocaleString()
+          : 'never';
+        $('#workspace-status').textContent =
+          `${d.files_indexed} files · ${d.code_chunks} chunks · synced ${when}`;
+        $('#workspace-status').className = 'rag-index-status';
+      }
+    } catch { /* server not up yet */ }
+  }
+  refreshWorkspace();
+
+  $('#workspace-set-btn').addEventListener('click', async () => {
+    const path = $('#workspace-path').value.trim();
+    const status = $('#workspace-status');
+    if (!path) { status.textContent = 'enter a folder path'; return; }
+    try {
+      const d = await (await fetch('/api/workspace/set', {
+        method: 'POST',
+        body: JSON.stringify({ path }),
+      })).json();
+      if (d.error) {
+        status.textContent = d.error;
+        status.className = 'rag-index-status rag-error';
+      } else {
+        $('#workspace-path').value = d.path;
+        status.textContent = 'workspace set — Sync to index';
+        status.className = 'rag-index-status rag-success';
+      }
+    } catch (e) {
+      status.textContent = String(e);
+      status.className = 'rag-index-status rag-error';
+    }
+  });
+
+  $('#workspace-sync-btn').addEventListener('click', async () => {
+    const btn = $('#workspace-sync-btn');
+    const status = $('#workspace-status');
+    btn.disabled = true;
+    status.textContent = 'walking & indexing…';
+    status.className = 'rag-index-status rag-indexing';
+    try {
+      const d = await (await fetch('/api/workspace/index', {
+        method: 'POST',
+        body: JSON.stringify({}),
+      })).json();
+      if (d.error) {
+        status.textContent = d.error;
+        status.className = 'rag-index-status rag-error';
+      } else if (d.up_to_date) {
+        status.textContent = `up to date (${d.files} files)`;
+        status.className = 'rag-index-status rag-success';
+        $('#rag-checkbox').checked = true;
+      } else {
+        status.textContent =
+          `${d.changed} indexed, ${d.removed} removed, ${d.skipped} skipped · ${d.files} files`;
+        status.className = 'rag-index-status rag-success';
+        $('#rag-checkbox').checked = true;
+        updateRagBadge();
+      }
+    } catch (e) {
+      status.textContent = String(e);
+      status.className = 'rag-index-status rag-error';
+    } finally {
+      btn.disabled = false;
+      refreshRagSettings();   // pick up the new chunk counts for the badge
+    }
   });
 
   function addFile(name, content) {
@@ -810,7 +891,7 @@
       const res = await fetch('/api/write', {
         method: 'POST',
         signal: abortCtrl.signal,
-        body: JSON.stringify({ mode: 'chat', messages: chatHistory, use_rag: useRag }),
+        body: JSON.stringify({ mode: 'chat', messages: chatHistory, use_rag: useRag, agentic: isAgentic() }),
       });
 
       await readSSE(res, (data) => {
@@ -928,6 +1009,7 @@
           mode: currentMode,
           files: filesPayload.length > 0 ? filesPayload : undefined,
           use_rag: useRag,
+          agentic: isAgentic(),
         }),
       });
 

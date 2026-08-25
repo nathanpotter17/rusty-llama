@@ -26,6 +26,7 @@ struct FileConfig {
     limits: LimitsCfg,
     embed: EmbedCfg,
     rag: RagCfg,
+    workspace: WorkspaceCfg,
     #[serde(default)]
     models: Vec<ModelEntry>,
 }
@@ -40,8 +41,25 @@ impl Default for FileConfig {
             limits: LimitsCfg::default(),
             embed: EmbedCfg::default(),
             rag: RagCfg::default(),
+            workspace: WorkspaceCfg::default(),
             models: Vec::new(),
         }
+    }
+}
+
+/// Server-side workspace: a repo root that CodeWriter walks and indexes
+/// itself (no uploading). The path can also be set from the UI; the manifest
+/// (path + per-file mtime/size) persists in data/workspace.json so the RAG
+/// index stays warm across restarts and re-indexing is incremental.
+#[derive(Deserialize, Clone)]
+#[serde(default)]
+struct WorkspaceCfg {
+    path: String,
+    max_file_kb: u64,
+}
+impl Default for WorkspaceCfg {
+    fn default() -> Self {
+        Self { path: String::new(), max_file_kb: 256 }
     }
 }
 
@@ -119,6 +137,10 @@ impl Default for LimitsCfg {
 #[serde(default)]
 struct EmbedCfg {
     enabled: bool,
+    /// Embedding-server binary override. Empty = use [llama].binary — set
+    /// this to a llama-server path when the main binary is streamer-server
+    /// (which has no /embedding endpoint).
+    binary: String,
     model: String,         // .gguf filename inside models_dir
     port: u16,
     gpu_layers: i32,
@@ -133,6 +155,7 @@ impl Default for EmbedCfg {
     fn default() -> Self {
         Self {
             enabled: false,
+            binary: String::new(),
             model: String::new(),
             port: 8078,
             gpu_layers: 99,
@@ -1093,6 +1116,146 @@ impl HnswGraph {
 
 // ── RAG Store (chunks + HNSW) ───────────────────────────────
 
+// ── Workspace: server-side repo walking + incremental indexing ─────────
+
+/// File extensions the workspace indexer accepts (mirrors the UI's upload
+/// accept list), plus a few extensionless well-known names.
+const WS_EXTS: &[&str] = &[
+    "ts", "tsx", "js", "jsx", "rs", "c", "cpp", "h", "hpp", "py", "go",
+    "java", "html", "css", "sql", "sh", "bash", "toml", "yaml", "yml",
+    "json", "md", "txt", "rb", "swift", "kt", "cs", "lua", "zig", "asm",
+    "s", "vue", "svelte", "astro", "graphql", "gql", "proto", "cmake",
+    "mk", "xml", "ini", "cfg", "conf", "hbs", "ejs", "pug", "scss",
+    "sass", "less", "styl", "wat",
+];
+const WS_SPECIAL_FILES: &[&str] = &["makefile", "dockerfile", "cmakelists.txt", ".gitignore", ".env"];
+/// Directories the fallback walker skips (git repos use `git ls-files`
+/// instead, which honors .gitignore exactly).
+const WS_SKIP_DIRS: &[&str] = &[
+    ".git", "target", "node_modules", "dist", "build", "out", "__pycache__",
+    ".venv", "venv", "data", "models", ".idea", ".vscode", "bin", "obj",
+    "vendor", ".next", "coverage",
+];
+const WS_MANIFEST_PATH: &str = "data/workspace.json";
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct WorkspaceManifest {
+    path: String,
+    /// rel path → (mtime seconds, size bytes) at last successful index.
+    files: std::collections::HashMap<String, (u64, u64)>,
+    last_index_epoch: u64,
+}
+
+struct Workspace {
+    manifest: WorkspaceManifest,
+    max_file_kb: u64,
+}
+
+impl Workspace {
+    fn load(cfg: &WorkspaceCfg) -> Self {
+        let mut manifest: WorkspaceManifest = fs::read_to_string(WS_MANIFEST_PATH)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        // Config path seeds the workspace; a UI-set path (persisted in the
+        // manifest) wins over the config default.
+        if manifest.path.is_empty() && !cfg.path.is_empty() {
+            manifest.path = cfg.path.clone();
+        }
+        Self { manifest, max_file_kb: cfg.max_file_kb }
+    }
+
+    fn save(&self) -> Result<(), String> {
+        if let Some(dir) = Path::new(WS_MANIFEST_PATH).parent() {
+            fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let json = serde_json::to_string(&self.manifest).map_err(|e| e.to_string())?;
+        fs::write(WS_MANIFEST_PATH, json).map_err(|e| e.to_string())
+    }
+}
+
+fn ws_name_ok(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    if WS_SPECIAL_FILES.contains(&lower.as_str()) {
+        return true;
+    }
+    lower
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| WS_EXTS.contains(&ext))
+}
+
+/// Walk the workspace, returning relative paths of indexable files. Git
+/// repos go through `git ls-files` (exact .gitignore semantics, including
+/// untracked-but-not-ignored files); everything else gets a recursive walk
+/// with a built-in skip list.
+fn workspace_walk(root: &Path) -> Vec<String> {
+    if root.join(".git").exists() {
+        if let Some(list) = git_ls_files(root) {
+            return list;
+        }
+        eprintln!("[workspace] git ls-files failed — falling back to plain walk");
+    }
+    let mut out = Vec::new();
+    walk_dir(root, root, &mut out, 0);
+    out
+}
+
+fn git_ls_files(root: &Path) -> Option<Vec<String>> {
+    let out = Command::new("git")
+        .args(["-C"])
+        .arg(root)
+        .args(["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Some(
+        text.split('\0')
+            .filter(|p| !p.is_empty())
+            .filter(|p| {
+                let base = p.rsplit('/').next().unwrap_or(p);
+                ws_name_ok(base)
+            })
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+fn walk_dir(root: &Path, dir: &Path, out: &mut Vec<String>, depth: usize) {
+    if depth > 16 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        if path.is_dir() {
+            let lower = name.to_lowercase();
+            if name.starts_with('.') || WS_SKIP_DIRS.contains(&lower.as_str()) {
+                continue;
+            }
+            walk_dir(root, &path, out, depth + 1);
+        } else if ws_name_ok(name) {
+            if let Ok(rel) = path.strip_prefix(root) {
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+}
+
+fn ws_file_stat(root: &Path, rel: &str) -> Option<(u64, u64)> {
+    let meta = fs::metadata(root.join(rel)).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some((mtime, meta.len()))
+}
+
 struct RagStore {
     chunks: Vec<VecChunk>,
     graph: HnswGraph,
@@ -1161,6 +1324,66 @@ impl RagStore {
         }
         eprintln!("[rag] indexed {added} '{domain}' chunks (dim={dim}, total {} chunks, persisted to {})",
             self.chunks.len(), self.cfg.db_path);
+        Ok(added)
+    }
+
+    /// Incremental update: drop this domain's chunks belonging to
+    /// `replaced` or `removed` files, append the freshly embedded chunks
+    /// (which all belong to `replaced` files), rebuild the graph, persist.
+    /// The workspace indexer uses this so unchanged files never re-embed.
+    #[allow(clippy::too_many_arguments)]
+    fn replace_files(
+        &mut self,
+        replaced: &[String],
+        removed: &[String],
+        chunks: Vec<String>,
+        sources: Vec<String>,
+        vectors: Vec<Vec<f32>>,
+        kinds: Vec<String>,
+        files: Vec<String>,
+        domain: &str,
+    ) -> Result<usize, String> {
+        if !vectors.is_empty() {
+            let dim = vectors[0].len();
+            if let Some(existing) = self.vector_dim() {
+                if existing != dim {
+                    return Err(format!(
+                        "embedding dim {dim} != indexed dim {existing} — clear the index before switching embed models"
+                    ));
+                }
+            }
+        }
+        let gone: HashSet<&str> = replaced
+            .iter()
+            .chain(removed.iter())
+            .map(String::as_str)
+            .collect();
+        self.chunks
+            .retain(|c| !(c.domain == domain && gone.contains(c.file.as_str())));
+        let added = chunks.len();
+        let iter = chunks.into_iter().zip(sources).zip(vectors).zip(kinds).zip(files);
+        for ((((text, source), vector), kind), file) in iter {
+            self.chunks.push(VecChunk {
+                text, source, vector, kind, file,
+                domain: domain.to_string(),
+            });
+        }
+        self.indexed_files.retain(|f| !removed.contains(f));
+        for f in replaced {
+            if !self.indexed_files.contains(f) {
+                self.indexed_files.push(f.clone());
+            }
+        }
+        let t0 = Instant::now();
+        self.rebuild_graph();
+        eprintln!("[rag] HNSW rebuilt in {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+        if let Err(e) = self.save() {
+            eprintln!("[rag] save warning: {e}");
+        }
+        eprintln!(
+            "[rag] workspace update: +{added} chunks ({} files replaced, {} removed, {} total chunks)",
+            replaced.len(), removed.len(), self.chunks.len()
+        );
         Ok(added)
     }
 
@@ -1812,7 +2035,14 @@ fn ensure_embed_ready(st: &Shared) -> Result<(), String> {
     let (binary, model_path, model_name, embed_cfg, timeout) = {
         let s = st.lock().unwrap();
         let path = format!("{}/{}", s.cfg.models_dir, s.cfg.embed.model);
-        (s.cfg.llama_binary.clone(), path, s.cfg.embed.model.clone(),
+        // [embed].binary override: keeps embeddings on llama-server when the
+        // main binary is streamer-server.
+        let bin = if s.cfg.embed.binary.is_empty() {
+            s.cfg.llama_binary.clone()
+        } else {
+            s.cfg.embed.binary.clone()
+        };
+        (bin, path, s.cfg.embed.model.clone(),
          s.cfg.embed.clone(), s.cfg.embed.startup_timeout)
     };
     if !Path::new(&model_path).exists() {
@@ -2306,6 +2536,7 @@ struct State {
     llama: ManagedServer,
     embed: ManagedServer,
     rag: RagStore,
+    workspace: Workspace,
     sys_info: serde_json::Value,
     tokens_session: u64,
     requests: u64,
@@ -2350,6 +2581,11 @@ struct WriteReq {
     files: Vec<FileEntry>,
     #[serde(default)]
     use_rag: bool,
+    /// Agentic mode (review/chat): enable the backend's tool loop and point
+    /// the model at the workspace root so it explores the repo itself.
+    /// Requires streamer-server launched with --tools.
+    #[serde(default)]
+    agentic: bool,
     // Chat mode: full client-held thread (server is stateless).
     #[serde(default)]
     messages: Vec<ChatMsg>,
@@ -2570,8 +2806,16 @@ fn main() {
     });
     eprintln!("  http://{addr}\n");
 
+    let workspace = Workspace::load(&file_cfg.workspace);
+    if !workspace.manifest.path.is_empty() {
+        eprintln!(
+            "  workspace: {} ({} files in warm index)",
+            workspace.manifest.path,
+            workspace.manifest.files.len()
+        );
+    }
     let shared: Shared = Arc::new(Mutex::new(State {
-        cfg, models, llama, embed, rag, sys_info, tokens_session: 0, requests: 0,
+        cfg, models, llama, embed, rag, workspace, sys_info, tokens_session: 0, requests: 0,
     }));
 
     for stream in listener.incoming().flatten() {
@@ -2653,6 +2897,10 @@ fn serve(mut stream: TcpStream, st: &Shared) {
         ("POST", "/api/embed/stop")   => respond_json(&mut stream, &handle_embed_stop(st)),
         ("POST", "/api/embed/prefixes") => respond_json(&mut stream, &handle_embed_prefixes(st, &body)),
         // RAG endpoints
+        ("GET", "/api/workspace/status") => respond_json(&mut stream, &handle_workspace_status(st)),
+        ("POST", "/api/workspace/set")   => respond_json(&mut stream, &handle_workspace_set(st, &body)),
+        ("POST", "/api/workspace/index") => respond_json(&mut stream, &handle_workspace_index(st, &body)),
+
         ("GET", "/api/rag/status")   => respond_json(&mut stream, &handle_rag_status(st)),
         ("POST", "/api/rag/index")   => respond_json(&mut stream, &handle_rag_index(st, &body)),
         ("POST", "/api/rag/search")  => respond_json(&mut stream, &handle_rag_search(st, &body)),
@@ -2819,7 +3067,14 @@ fn handle_embed_status(st: &Shared) -> serde_json::Value {
 fn handle_embed_start(st: &Shared) -> serde_json::Value {
     let (binary, models_dir, embed_cfg) = {
         let s = st.lock().unwrap();
-        (s.cfg.llama_binary.clone(), s.cfg.models_dir.clone(), s.cfg.embed.clone())
+        // [embed].binary override: keeps embeddings on llama-server when the
+        // main binary is streamer-server.
+        let bin = if s.cfg.embed.binary.is_empty() {
+            s.cfg.llama_binary.clone()
+        } else {
+            s.cfg.embed.binary.clone()
+        };
+        (bin, s.cfg.models_dir.clone(), s.cfg.embed.clone())
     };
 
     if !embed_cfg.enabled || embed_cfg.model.is_empty() {
@@ -3035,6 +3290,196 @@ fn handle_rag_clear(st: &Shared, body: &str) -> serde_json::Value {
 
 // ── Relevance scoring ───────────────────────────────────────
 
+// ── Workspace handlers ─────────────────────────────────────────────────
+
+/// Chunk code files: external syntax-aware chunker with the internal
+/// line-window fallback (same policy as upload indexing).
+fn chunk_code_files(
+    files: &[FileEntry],
+    chunk_size: usize,
+    chunk_overlap: usize,
+    chunker_tool: &str,
+) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    let raw = if let Some(ext) = try_external_chunker(chunker_tool, files, chunk_size, chunk_overlap) {
+        ext
+    } else {
+        let mut all = Vec::new();
+        for f in files {
+            all.extend(chunk_code_file_simple(&f.name, &f.content, chunk_size, chunk_overlap));
+        }
+        all
+    };
+    let mut chunks = Vec::with_capacity(raw.len());
+    let mut sources = Vec::with_capacity(raw.len());
+    let mut kinds = Vec::with_capacity(raw.len());
+    let mut file_names = Vec::with_capacity(raw.len());
+    for (source, text, kind, file) in raw {
+        sources.push(source);
+        chunks.push(text);
+        kinds.push(kind);
+        file_names.push(file);
+    }
+    (chunks, sources, kinds, file_names)
+}
+
+fn handle_workspace_status(st: &Shared) -> serde_json::Value {
+    let s = st.lock().unwrap();
+    let code_chunks = s.rag.chunks.iter().filter(|c| c.domain == "code").count();
+    serde_json::json!({
+        "path": s.workspace.manifest.path,
+        "files_indexed": s.workspace.manifest.files.len(),
+        "last_index_epoch": s.workspace.manifest.last_index_epoch,
+        "code_chunks": code_chunks,
+    })
+}
+
+#[derive(Deserialize)]
+struct WorkspaceSetReq {
+    path: String,
+}
+
+fn handle_workspace_set(st: &Shared, body: &str) -> serde_json::Value {
+    let req: WorkspaceSetReq = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => return serde_json::json!({"error": e.to_string()}),
+    };
+    let canon = match fs::canonicalize(req.path.trim()) {
+        Ok(p) if p.is_dir() => p.to_string_lossy().to_string(),
+        Ok(_) => return serde_json::json!({"error": "path is not a directory"}),
+        Err(e) => return serde_json::json!({"error": format!("bad path: {e}")}),
+    };
+    let mut s = st.lock().unwrap();
+    if s.workspace.manifest.path != canon {
+        // Switching repos: the old manifest is meaningless for the new tree.
+        s.workspace.manifest.files.clear();
+        s.workspace.manifest.last_index_epoch = 0;
+    }
+    s.workspace.manifest.path = canon.clone();
+    if let Err(e) = s.workspace.save() {
+        eprintln!("[workspace] manifest save: {e}");
+    }
+    serde_json::json!({"ok": true, "path": canon})
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct WorkspaceIndexReq {
+    full: bool,
+}
+
+fn handle_workspace_index(st: &Shared, body: &str) -> serde_json::Value {
+    let req: WorkspaceIndexReq = serde_json::from_str(body).unwrap_or_default();
+
+    let (root, max_kb, prev, endpoint, doc_prefix, chunk_size, chunk_overlap, chunker_tool) = {
+        let s = st.lock().unwrap();
+        (
+            s.workspace.manifest.path.clone(),
+            s.workspace.max_file_kb,
+            s.workspace.manifest.files.clone(),
+            s.cfg.embedding_endpoint(),
+            s.cfg.embed.doc_prefix.clone(),
+            s.rag.cfg.chunk_size,
+            s.rag.cfg.chunk_overlap,
+            s.rag.cfg.chunker_tool.clone(),
+        )
+    };
+    if root.is_empty() {
+        return serde_json::json!({"error": "no workspace set — POST /api/workspace/set first"});
+    }
+    let rootp = Path::new(&root);
+    if !rootp.is_dir() {
+        return serde_json::json!({"error": format!("workspace path missing: {root}")});
+    }
+
+    // Walk, stat, and diff against the manifest.
+    let walked = workspace_walk(rootp);
+    let mut current: std::collections::HashMap<String, (u64, u64)> = std::collections::HashMap::new();
+    let mut changed: Vec<String> = Vec::new();
+    for rel in &walked {
+        let Some(stat) = ws_file_stat(rootp, rel) else { continue };
+        if req.full || prev.get(rel) != Some(&stat) {
+            changed.push(rel.clone());
+        }
+        current.insert(rel.clone(), stat);
+    }
+    let removed: Vec<String> = prev.keys().filter(|k| !current.contains_key(*k)).cloned().collect();
+
+    if changed.is_empty() && removed.is_empty() {
+        return serde_json::json!({
+            "ok": true, "up_to_date": true, "files": current.len(),
+        });
+    }
+
+    // Read the changed files. Oversized or non-UTF-8 files drop out of the
+    // index entirely (their stale chunks are removed too).
+    let mut files_payload: Vec<FileEntry> = Vec::new();
+    let mut replaced: Vec<String> = Vec::new();
+    let mut dropped: Vec<String> = removed.clone();
+    let mut skipped = 0usize;
+    for rel in &changed {
+        let ok_size = current.get(rel).is_some_and(|&(_, size)| size <= max_kb * 1024);
+        let content = if ok_size { fs::read_to_string(rootp.join(rel)).ok() } else { None };
+        match content {
+            Some(content) if !content.trim().is_empty() => {
+                files_payload.push(FileEntry {
+                    name: rel.clone(),
+                    content,
+                    language: String::new(),
+                });
+                replaced.push(rel.clone());
+            }
+            _ => {
+                skipped += 1;
+                dropped.push(rel.clone());
+            }
+        }
+    }
+
+    // Chunk + embed outside the lock.
+    let (chunks, sources, kinds, chunk_files) = if files_payload.is_empty() {
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+    } else {
+        chunk_code_files(&files_payload, chunk_size, chunk_overlap, &chunker_tool)
+    };
+    let vectors = if chunks.is_empty() {
+        Vec::new()
+    } else {
+        if let Err(e) = ensure_embed_ready(st) {
+            return serde_json::json!({"error": e});
+        }
+        eprintln!("[workspace] embedding {} chunks from {} changed files…", chunks.len(), files_payload.len());
+        let t0 = Instant::now();
+        match get_embeddings_batch(&endpoint, &chunks, &doc_prefix) {
+            Ok(v) => {
+                eprintln!("[workspace] {} embeddings in {:.1}s", v.len(), t0.elapsed().as_secs_f64());
+                v
+            }
+            Err(e) => return serde_json::json!({"error": e}),
+        }
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut s = st.lock().unwrap();
+    if let Err(e) = s.rag.replace_files(&replaced, &dropped, chunks, sources, vectors, kinds, chunk_files, "code") {
+        return serde_json::json!({"error": e});
+    }
+    s.workspace.manifest.files = current;
+    s.workspace.manifest.last_index_epoch = now;
+    if let Err(e) = s.workspace.save() {
+        eprintln!("[workspace] manifest save: {e}");
+    }
+    serde_json::json!({
+        "ok": true,
+        "files": s.workspace.manifest.files.len(),
+        "changed": replaced.len(),
+        "removed": removed.len(),
+        "skipped": skipped,
+    })
+}
+
 fn relevance_score(file: &FileEntry, description: &str, target_lang: &str) -> u32 {
     let mut score = 0u32;
     let file_lang = file.language.to_lowercase();
@@ -3191,7 +3636,7 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
     }
 
     // Step 1: Build system prompt base (rag_note appended later if chunks found)
-    let system_base = if is_review {
+    let mut system_base = if is_review {
         format!(
             "You are a senior {} engineer in a pair-programming conversation.\n\
              The user will ask questions, request explanations, or discuss code \
@@ -3222,6 +3667,11 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
             req.language
         )
     };
+
+    if req.agentic && is_review {
+        let ws = { let s = st.lock().unwrap(); s.workspace.manifest.path.clone() };
+        system_base.push_str(&agentic_note(&ws));
+    }
 
     let rag_note = if is_review {
         "\nRelevant code from the project has been retrieved and included below. \
@@ -3407,6 +3857,9 @@ fn handle_write_stream(stream: &mut TcpStream, st: &Shared, body: &str) {
         "top_p": cfg.top_p,
         "repeat_penalty": cfg.repeat_penalty,
         "stream": true,
+        // streamer-server: per-request tool-loop selection (ignored by
+        // llama-server, which has no server-side tool runtime).
+        "tools": req.agentic,
     });
 
     stream_completion(
@@ -3509,6 +3962,27 @@ fn stream_completion(
 // optionally grounds it with retrieved *text* chunks, trims oldest turns to
 // fit the context window, and streams the reply. No server-side session map —
 // there is nothing to evict, persist, or race on.
+/// System-prompt addendum for agentic mode. The tool DECLARATIONS are
+/// appended by streamer-server itself (per-request `tools` flag); this note
+/// only frames the task and hands the model its workspace root.
+fn agentic_note(workspace: &str) -> String {
+    if workspace.is_empty() {
+        "\n\nAgentic mode is on: the runtime appends callable tools to this \
+         message. Use run_bash to inspect any files you need before answering."
+            .to_string()
+    } else {
+        format!(
+            "\n\nAgentic mode is on: the runtime appends callable tools to \
+             this message. The project workspace is at {workspace} — explore \
+             it yourself with run_bash and read only what you need before \
+             answering. Your shell does NOT start in the workspace: prefix \
+             every command with `cd {workspace} && ` (e.g. \
+             `cd {workspace} && grep -rn PATTERN src/`). Cite file paths and \
+             line numbers for every claim about the code."
+        )
+    }
+}
+
 fn handle_chat_stream(stream: &mut TcpStream, st: &Shared, req: &WriteReq, cfg: &RuntimeCfg) {
     const OUTPUT_RESERVE: u64 = 512;   // roomier reserve for conversational replies
     const RAG_CANDIDATE_POOL: usize = 20;
@@ -3525,6 +3999,11 @@ fn handle_chat_stream(stream: &mut TcpStream, st: &Shared, req: &WriteReq, cfg: 
         block when you reference it. If retrieved reference material is present, \
         ground your answer in it and say so when it doesn't cover the question."
         .to_string();
+
+    if req.agentic {
+        let ws = { let s = st.lock().unwrap(); s.workspace.manifest.path.clone() };
+        system.push_str(&agentic_note(&ws));
+    }
 
     // ── Pinned code context ──────────────────────────────────
     // The files the user attached are the subject of the review. They must
@@ -3688,6 +4167,9 @@ fn handle_chat_stream(stream: &mut TcpStream, st: &Shared, req: &WriteReq, cfg: 
         "top_p": cfg.top_p,
         "repeat_penalty": cfg.repeat_penalty,
         "stream": true,
+        // streamer-server: per-request tool-loop selection (ignored by
+        // llama-server, which has no server-side tool runtime).
+        "tools": req.agentic,
     });
 
     stream_completion(

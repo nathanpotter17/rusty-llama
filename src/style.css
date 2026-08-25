@@ -1217,3 +1217,24 @@ pre.code-block {
   .overlay-panel { width: 95vw; max-height: 90vh; border-radius: 12px; }
   .file-list { max-height: 100px; }
 }
+
+/* ── Server-side workspace ── */
+.workspace-row {
+  display: flex;
+  gap: 6px;
+  padding: 6px 10px 8px;
+  align-items: center;
+}
+.workspace-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 12px;
+  font-family: var(--font-mono);
+  padding: 5px 8px;
+}
+.workspace-input:focus { outline: none; border-color: var(--border-focus); }
+.ws-label { color: var(--rag); }

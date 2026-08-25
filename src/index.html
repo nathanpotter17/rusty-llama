@@ -49,6 +49,10 @@
           <input type="checkbox" id="rag-checkbox">
           <span class="rag-toggle-label">RAG</span>
         </label>
+        <label class="rag-toggle hidden" id="agentic-toggle" title="Agentic: the model explores the workspace itself with tools (backend must be streamer-server started with --tools)">
+          <input type="checkbox" id="agentic-checkbox">
+          <span class="rag-toggle-label">Agentic</span>
+        </label>
         <button id="write-btn" class="primary-btn">Write &rarr;</button>
         <button id="abort-btn" class="abort-btn hidden" title="Stop generation (keeps partial output)">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
@@ -111,6 +115,20 @@
             <span id="rag-index-status" class="rag-index-status"></span>
           </div>
           <div id="rag-file-list" class="file-list"></div>
+        </div>
+
+        <!-- Server-side workspace -->
+        <div id="workspace-section" class="file-section">
+          <div class="file-section-header">
+            <span class="file-section-label ws-label">Workspace</span>
+            <span class="file-section-hint">server-side repo, indexed in place</span>
+            <button id="workspace-sync-btn" class="small-btn" title="Walk the workspace and (re)index new/changed files — .gitignore respected">Sync</button>
+            <span id="workspace-status" class="rag-index-status"></span>
+          </div>
+          <div class="workspace-row">
+            <input type="text" id="workspace-path" class="workspace-input" placeholder="/path/to/repo (folder on the server machine)" spellcheck="false">
+            <button id="workspace-set-btn" class="small-btn">Set</button>
+          </div>
         </div>
       </div>
     </div>
