@@ -14,6 +14,29 @@ port = 8090
 binary = ""              # auto-detect if empty
 port = 8079
 startup_timeout = 120
+cache_reuse = 256        # --cache-reuse: min KV chunk (tokens) to salvage via
+                         # cache shift after an edit mid-prompt; 0 = off.
+                         # Verified on build 9870 with q8_0 KV + flash-attn:
+                         # exact-prefix reuse works, and shifted-chunk salvage
+                         # too (a 272-token RAG block moving position cost only
+                         # 227 tokens of re-prefill for the whole turn).
+
+# ── Tools
+# Agentic tool execution — runs model-generated code locally, on purpose.
+# workspace roots the filesystem tools (read/write/edit/list/glob/grep) and is
+# the working directory for run_bash/run_python; empty = fs tools refuse.
+# bash: optional bash path; else Git Bash is autodetected (bare "bash" on
+# Windows hits the System32 WSL relay, which fails without a distro).
+#
+# The declared tool set follows the [hardware] tier: "8GB" declares all ten
+# tools (~1150 tokens of system prefix, one-time per conversation); "4GB" and
+# "cpu" declare the six filesystem tools only (~760 tokens), and the exec
+# tools (run_bash/run_python/save_tool/run_tool) are refused if called.
+
+[tools]
+enabled = false
+workspace = ""
+bash = ""
 
 # ── Defaults
 [defaults]
