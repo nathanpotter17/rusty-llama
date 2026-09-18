@@ -11,6 +11,11 @@
   <header id="toolbar">
     <span class="logo"><span class="logo-dot"></span>CodeWriter</span>
     <div class="toolbar-right">
+      <div id="ctx-bar" class="ctx-bar hidden" title="Context window usage">
+        <span class="ctx-bar-label">ctx</span>
+        <div class="ctx-bar-track"><div id="ctx-bar-fill" class="ctx-bar-fill"></div></div>
+        <span id="ctx-bar-text" class="ctx-bar-text"></span>
+      </div>
       <span id="rag-badge" class="badge badge-idle" title="RAG index status">RAG off</span>
       <span id="model-badge" class="badge badge-idle">No model</span>
       <button id="settings-btn" class="icon-btn" title="Settings">
@@ -48,6 +53,9 @@
       <!-- File upload zone: drops become pinned context. Indexing is by
            path (file or directory), the rusty-streamer convention. -->
       <div id="file-zone" class="file-zone">
+        <!-- Retrieval mode (Agent off): files you add are embedded into the
+             RAG store one at a time; the model sees them through search. -->
+        <div id="retrieval-panel">
         <div id="drop-area" class="drop-area">
           <svg class="drop-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
@@ -67,25 +75,45 @@
           </div>
           <div id="context-file-list" class="file-list"></div>
         </div>
-
-        <!-- Path indexing (server walks the filesystem) -->
-        <div class="index-path-row">
-          <input id="index-path" class="prefix-input" type="text" spellcheck="false"
-                 placeholder="Path to a file or directory to index for retrieval">
-          <button id="index-path-btn" class="small-btn rag-index-btn" title="Index the path into the vector store (per-file upsert; re-index to refresh)">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="11" cy="11" r="8"></circle>
-              <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-            </svg>
-            Index
-          </button>
-        </div>
         <span id="rag-index-status" class="rag-index-status"></span>
+        </div>
+
+        <!-- Server-side workspace: a repo the server indexes in place and
+             keeps warm across restarts, re-embedding only changed files.
+             Restored after the b7980b3 merge dropped this markup while
+             keeping the app.js handlers and /api/workspace/* routes. -->
+        <div id="workspace-section" class="file-section">
+          <div class="file-section-header">
+            <span class="file-section-label ws-label">Workspace</span>
+            <span class="file-section-hint" id="workspace-hint">the agent explores this directory and indexes only what it reads</span>
+            <span id="workspace-status" class="rag-index-status"></span>
+          </div>
+          <div class="workspace-row">
+            <input type="text" id="workspace-path" class="workspace-input" placeholder="/path/to/repo (folder on the server machine)" spellcheck="false">
+            <button id="workspace-browse-btn" class="small-btn" title="Browse the server's filesystem for a folder">Browse…</button>
+            <button id="workspace-set-btn" class="small-btn">Set</button>
+          </div>
+          <div id="workspace-browser" class="workspace-browser hidden">
+            <div class="wsb-header">
+              <span id="wsb-path" class="wsb-path"></span>
+              <span id="wsb-git" class="wsb-git hidden">git</span>
+            </div>
+            <div id="wsb-list" class="wsb-list"></div>
+            <div class="wsb-actions">
+              <button id="wsb-select" class="small-btn wsb-select">Use this folder</button>
+              <button id="wsb-cancel" class="small-btn">Cancel</button>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
     <div class="pane pane-output">
       <div class="pane-header">
         <span class="pane-title" id="output-title">Chat</span>
+        <div id="ctx-meter" class="ctx-meter hidden" title="Context window usage">
+          <div class="ctx-meter-track"><div id="ctx-meter-fill" class="ctx-meter-fill"></div></div>
+          <span id="ctx-meter-label" class="ctx-meter-label"></span>
+        </div>
         <div id="context-info" class="context-info hidden"></div>
         <button id="chat-new-btn" class="small-btn hidden" title="Clear the conversation thread">New chat</button>
         <span id="stats" class="stats"></span>
@@ -168,7 +196,21 @@
             <label>Top-K<input id="p-topk" type="number" value="40" min="1" max="200"></label>
             <label>Top-P<input id="p-topp" type="number" value="0.9" min="0" max="1" step="0.05"></label>
             <label>Repeat Penalty<input id="p-rp" type="number" value="1.1" min="0.5" max="2" step="0.05"></label>
+            <label>Reasoning Effort<select id="p-effort">
+              <option value="">model default</option>
+              <option value="low">low — thinking</option>
+              <option value="medium">medium — thinking</option>
+              <option value="xhigh">xhigh — thinking</option>
+              <option value="einstein">einstein — thinking, ~20 agents</option>
+              <option value="spoon">spoon — thinking, research mode</option>
+              <option value="ilow">ilow — instruct</option>
+              <option value="imedium">imedium — instruct</option>
+              <option value="ixhigh">ixhigh — instruct</option>
+              <option value="ieinstein">ieinstein — instruct</option>
+              <option value="ispoon">ispoon — instruct</option>
+            </select></label>
           </div>
+          <div id="effort-hint" class="status-line" style="margin-top:6px"></div>
           <button id="save-params-btn" class="small-btn" style="margin-top:12px">Apply Params</button>
         </section>
         <section>

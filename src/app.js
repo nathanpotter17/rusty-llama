@@ -18,6 +18,10 @@
     scss: 'scss', sass: 'sass', less: 'less',
   };
 
+  // Mirrors main.rs `lang_domain` — these route to the text chunker, all
+  // other languages to the code chunker. Keep the two lists in step.
+  const TEXT_LANGS = new Set(['markdown', 'text', 'config', 'ini', 'env', 'gitignore']);
+
   function extToLang(filename) {
     const ext = filename.split('.').pop().toLowerCase();
     return EXT_LANG[ext] || 'text';
@@ -51,8 +55,26 @@
   // codified here too). Dropped files always become pinned context; the
   // index is fed by PATH (file or directory), also the streamer convention.
 
-  const isAgentic = () =>
-    currentMode !== 'write' && $('#agentic-checkbox').checked;
+  // ── Input mode ──
+  //
+  // Agent on  → the model walks the workspace itself with tools, so the only
+  //             thing to configure is which directory that is.
+  // Agent off → there is no tool loop, so retrieval is the only way in:
+  //             files you add are auto-indexed and reached through search.
+  // Exactly one panel is live at a time — showing both is what made this
+  // pane read as two competing ways to do the same thing.
+  function applyInputMode() {
+    const toggle = $('#tools-toggle');
+    const agent = toggle && !toggle.classList.contains('hidden')
+      && $('#tools-checkbox').checked;
+    $('#retrieval-panel').classList.toggle('hidden', agent);
+    $('#workspace-section').classList.toggle('hidden', !agent);
+    $('#rag-toggle').classList.toggle('hidden', agent);
+    if (agent) refreshWorkspace();
+    return agent;
+  }
+
+  $('#tools-checkbox').addEventListener('change', applyInputMode);
 
   // ── Server-side workspace ──
 
@@ -61,11 +83,11 @@
       const d = await (await fetch('/api/workspace/status')).json();
       if (d.path) {
         $('#workspace-path').value = d.path;
-        const when = d.last_index_epoch
-          ? new Date(d.last_index_epoch * 1000).toLocaleString()
-          : 'never';
-        $('#workspace-status').textContent =
-          `${d.files_indexed} files · ${d.code_chunks} chunks · synced ${when}`;
+        // Nothing is indexed until the model reads it, so the number worth
+        // showing is what it has chosen to look at — not a corpus size.
+        $('#workspace-status').textContent = d.auto_indexed
+          ? `${d.auto_indexed} file(s) read & indexed · ${d.code_chunks} chunks`
+          : 'ready — nothing indexed yet';
         $('#workspace-status').className = 'rag-index-status';
       }
     } catch { /* server not up yet */ }
@@ -145,46 +167,14 @@
     $('#workspace-set-btn').click();
   });
 
-  $('#workspace-sync-btn').addEventListener('click', async () => {
-    const btn = $('#workspace-sync-btn');
-    const status = $('#workspace-status');
-    btn.disabled = true;
-    status.textContent = 'walking & indexing…';
-    status.className = 'rag-index-status rag-indexing';
-    try {
-      const d = await (await fetch('/api/workspace/index', {
-        method: 'POST',
-        body: JSON.stringify({}),
-      })).json();
-      if (d.error) {
-        status.textContent = d.error;
-        status.className = 'rag-index-status rag-error';
-      } else if (d.up_to_date) {
-        status.textContent = `up to date (${d.files} files)`;
-        status.className = 'rag-index-status rag-success';
-        $('#rag-checkbox').checked = true;
-      } else {
-        status.textContent =
-          `${d.changed} indexed, ${d.removed} removed, ${d.skipped} skipped · ${d.files} files`;
-        status.className = 'rag-index-status rag-success';
-        $('#rag-checkbox').checked = true;
-        updateRagBadge();
-      }
-    } catch (e) {
-      status.textContent = String(e);
-      status.className = 'rag-index-status rag-error';
-    } finally {
-      btn.disabled = false;
-      refreshRagSettings();   // pick up the new chunk counts for the badge
-    }
-  });
-
   function addFile(name, content) {
     const language = extToLang(name);
     const tokens = estimateTokens(content);
     const id = ++fileIdCounter;
-    contextFiles.push({ id, name, content, language, tokens });
+    const file = { id, name, content, language, tokens, state: 'queued' };
+    contextFiles.push(file);
     renderFileLists();
+    enqueueIndex(file);
   }
 
   function removeContextFile(id) {
@@ -201,6 +191,15 @@
     else { ctxSection.classList.add('hidden'); }
   }
 
+  function indexStateLabel(f) {
+    switch (f.state) {
+      case 'indexing': return 'indexing…';
+      case 'indexed':  return f.chunks ? `${f.chunks} chunks` : 'indexed';
+      case 'error':    return 'failed';
+      default:         return 'queued';
+    }
+  }
+
   function renderFileListInto(selector, files, removeFn) {
     const list = $(selector);
     list.innerHTML = '';
@@ -214,6 +213,8 @@
           <polyline points="14 2 14 8 20 8"></polyline>
         </svg>
         <span class="file-name" title="${esc(f.name)}">${esc(f.name)}</span>
+        <span class="file-index-state file-state-${f.state || 'queued'}"
+              title="${esc(f.error || '')}">${indexStateLabel(f)}</span>
         <span class="file-tokens">${formatTokens(f.tokens)} tok</span>
         <button class="file-remove" title="Remove" data-id="${f.id}">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none"
@@ -296,47 +297,77 @@
     }
   }
 
-  // Index a path (single file or whole directory) — the server walks the
-  // filesystem itself, routes each file to the code or text chunker by
-  // extension, and upserts per file, so re-indexing refreshes in place.
-  async function indexPath() {
-    const input = $('#index-path');
-    const path = input.value.trim();
-    if (!path) return;
+  // Auto-index queue. In retrieval mode every file you add is embedded into
+  // the RAG store as soon as it lands — no Index button to forget. Strictly
+  // one at a time: the embed server runs a single slot, and a burst of
+  // parallel /api/rag/index calls would queue inside it anyway while making
+  // per-file progress impossible to report.
+  const indexQueue = [];
+  let indexRunning = false;
 
-    const btn = $('#index-path-btn');
-    const status = $('#rag-index-status');
-    btn.disabled = true;
-    status.textContent = embedReady ? 'Indexing...' : 'Starting embed server & indexing...';
-    status.className = 'rag-index-status rag-indexing';
-
-    try {
-      const res = await fetch('/api/rag/index_path', {
-        method: 'POST',
-        body: JSON.stringify({ path }),
-      });
-      const d = await res.json();
-      if (d.error) throw new Error(d.error);
-      ragCode = d.code_total || 0;
-      ragText = d.text_total || 0;
-      embedReady = true;   // lazy start succeeded
-      const skipped = d.skipped ? ` (${d.skipped} skipped)` : '';
-      status.textContent = `${d.files_indexed} files → ${d.chunks_indexed} chunks${skipped} · index: ${ragCode} code / ${ragText} text`;
-      status.className = 'rag-index-status rag-success';
-      updateRagBadge();
-      $('#rag-checkbox').checked = true;
-    } catch (e) {
-      status.textContent = String(e.message || e);
-      status.className = 'rag-index-status rag-error';
-    } finally {
-      btn.disabled = false;
-    }
+  function enqueueIndex(file) {
+    indexQueue.push(file);
+    if (!indexRunning) drainIndexQueue();
   }
 
-  $('#index-path-btn').onclick = indexPath;
-  $('#index-path').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); indexPath(); }
-  });
+  async function drainIndexQueue() {
+    indexRunning = true;
+    while (indexQueue.length) {
+      const file = indexQueue[0];
+      file.state = 'indexing';
+      renderFileLists();
+      setIndexStatus(
+        embedReady
+          ? `Indexing ${file.name}… (${indexQueue.length} queued)`
+          : `Starting embed server to index ${file.name}…`,
+        'rag-indexing',
+      );
+      try {
+        const d = await fetch('/api/rag/index', {
+          method: 'POST',
+          body: JSON.stringify({
+            files: [{ name: file.name, content: file.content, language: file.language }],
+            domain: TEXT_LANGS.has(file.language) ? 'text' : 'code',
+          }),
+        }).then((r) => r.json());
+        if (d.error) throw new Error(d.error);
+        embedReady = true;               // the lazy start succeeded
+        file.state = 'indexed';
+        file.chunks = d.chunks_indexed || 0;
+      } catch (e) {
+        file.state = 'error';
+        file.error = String(e.message || e);
+        setIndexStatus(`${file.name}: ${file.error}`, 'rag-error');
+      }
+      indexQueue.shift();
+      renderFileLists();
+    }
+    indexRunning = false;
+    await refreshRagCounts();
+    const failed = contextFiles.filter((f) => f.state === 'error').length;
+    if (!failed) {
+      setIndexStatus(`Indexed · ${ragCode} code / ${ragText} text chunks`, 'rag-success');
+      $('#rag-checkbox').checked = true;
+    }
+    updateRagBadge();
+  }
+
+  function setIndexStatus(text, cls) {
+    const el = $('#rag-index-status');
+    if (!el) return;
+    el.textContent = text;
+    el.className = `rag-index-status ${cls || ''}`.trim();
+  }
+
+  async function refreshRagCounts() {
+    try {
+      const d = await fetch('/api/rag/status').then((r) => r.json());
+      ragCode = d.chunks_code || 0;
+      ragText = d.chunks_text || 0;
+      ragIndexed = d.chunks || 0;
+    } catch (_) {}
+  }
+
 
   // Clear RAG index
   $('#rag-clear-btn').onclick = async () => {
@@ -534,6 +565,8 @@
         $('#p-topk').value = d.params.top_k;
         $('#p-topp').value = d.params.top_p;
         $('#p-rp').value = d.params.repeat_penalty;
+        $('#p-effort').value = d.params.reasoning_effort || '';
+        renderEffortHint(d.params);
         modelCtx = d.params.ctx || 4096;
       }
       // Sync RAG status from models endpoint too
@@ -576,6 +609,7 @@
       $('#p-topk').value = m.top_k;
       $('#p-topp').value = m.top_p;
       $('#p-rp').value = m.repeat_penalty;
+      $('#p-effort').value = m.reasoning_effort || '';
     }
   });
 
@@ -630,6 +664,7 @@
           top_k: +$('#p-topk').value,
           top_p: +$('#p-topp').value,
           repeat_penalty: +$('#p-rp').value,
+          reasoning_effort: $('#p-effort').value,
           ...(draftModel ? {
             spec_type: 'draft-model',
             draft_model: draftModel,
@@ -695,16 +730,51 @@
     $('#llama-status').textContent = 'Stopped';
   };
 
-  $('#save-params-btn').onclick = () =>
-    fetch('/api/params', {
+  $('#save-params-btn').onclick = async () => {
+    const d = await fetch('/api/params', {
       method: 'POST',
       body: JSON.stringify({
         temp: +$('#p-temp').value,
         top_k: +$('#p-topk').value,
         top_p: +$('#p-topp').value,
         repeat_penalty: +$('#p-rp').value,
+        reasoning_effort: $('#p-effort').value,
       }),
-    });
+    }).then((r) => r.json());
+    if (d.error) {
+      $('#effort-hint').textContent = d.error;
+      return;
+    }
+    // The server clamps to the hardware tier's ceiling, so echo back what it
+    // actually accepted rather than what was asked for.
+    if (d.reasoning_effort !== undefined) $('#p-effort').value = d.reasoning_effort;
+    refreshModels();
+  };
+
+  // Explains what the selected effort will actually do: which channel carries
+  // the tag to the model, and whether this hardware tier capped it. Without
+  // this, an ignored or clamped selection looks identical to a working one.
+  function renderEffortHint(params) {
+    const el = $('#effort-hint');
+    if (!el) return;
+    const eff = params.reasoning_effort || '';
+    if (!eff) {
+      el.textContent = 'Model default (Qwen 3.8 ships at xhigh thinking).';
+      return;
+    }
+    // No base mode starts with "i", so the prefix is an unambiguous flag.
+    const instruct = eff.startsWith('i');
+    const parts = [
+      `${eff} — ${instruct ? 'instruct (no thinking block)' : 'thinking'}`,
+      params.effort_native
+        ? 'sent as chat_template_kwargs.reasoning_effort'
+        : "template ignores the kwarg — sent as a {REASON:} prompt marker",
+    ];
+    if (params.effort_ceiling && params.effort_ceiling !== 'spoon') {
+      parts.push(`tier ceiling: ${params.effort_ceiling}`);
+    }
+    el.textContent = parts.join(' · ');
+  }
 
   async function refreshStatus() {
     try {
@@ -715,7 +785,10 @@
         modelCtx = d.ctx;
       }
       // The Agent toggle exists only when the server built a tool runtime.
-      if (d.tools) $('#tools-toggle').classList.toggle('hidden', !d.tools.enabled);
+      if (d.tools) {
+        $('#tools-toggle').classList.toggle('hidden', !d.tools.enabled);
+        applyInputMode();
+      }
     } catch (_) {}
   }
 
@@ -735,12 +808,60 @@
     renderChat(null);
     $('#stats').textContent = '';
     $('#context-info').classList.add('hidden');
+    resetCtxMeter();
   };
 
   // Tool status chips for the round in flight, cleared per turn.
   let liveToolChips = [];
 
   // One chip per tool_call on a stored assistant message.
+  // Context window usage. The server prices the assembled prompt with the
+  // real tokenizer and reports it per turn, so this is measured, not an
+  // estimate — but it only arrives while a turn is in flight, so the last
+  // reading is kept on screen between turns rather than blanking out.
+  let lastCtxInfo = null;
+
+  function renderCtxMeter(ci) {
+    if (ci) lastCtxInfo = ci;
+    const info = lastCtxInfo;
+    const meter = $('#ctx-meter');
+    if (!info || !info.model_ctx) { meter.classList.add('hidden'); return; }
+    const used = info.input_tokens || 0;
+    const total = info.model_ctx;
+    const pct = Math.max(0, Math.min(100, (used / total) * 100));
+    $('#ctx-meter-fill').style.width = `${pct.toFixed(1)}%`;
+    // Bands, not a gradient: the number that matters is whether the next turn
+    // still fits, and eviction starts biting well before the window is full.
+    $('#ctx-meter-fill').className =
+      `ctx-meter-fill ${pct >= 90 ? 'ctx-critical' : pct >= 70 ? 'ctx-warn' : ''}`.trim();
+    $('#ctx-meter-label').textContent =
+      `${formatTokens(used)} / ${formatTokens(total)}`;
+    meter.title =
+      `Context window: ${used.toLocaleString()} of ${total.toLocaleString()} tokens used `
+      + `(${pct.toFixed(0)}%)\n`
+      + `${formatTokens(info.remaining_tokens || 0)} left for the reply`
+      + (info.rag_chunks ? `\n${info.rag_chunks} retrieved chunk(s) in this prompt` : '')
+      + (info.pinned_files && info.pinned_files.length
+          ? `\n${info.pinned_files.length} pinned file(s)` : '')
+      + (info.turns_kept != null && info.turns_total != null && info.turns_kept < info.turns_total
+          ? `\n${info.turns_total - info.turns_kept} older turn(s) trimmed to fit` : '');
+    meter.classList.remove('hidden');
+
+    // Mirror into the top bar, which is visible no matter which pane the
+    // user is looking at — the pane-header copy scrolls out of reach as
+    // soon as the conversation gets long, which is exactly when the number
+    // starts to matter.
+    const bar = $('#ctx-bar');
+    if (bar) {
+      $('#ctx-bar-fill').style.width = `${pct.toFixed(1)}%`;
+      $('#ctx-bar-fill').className =
+        `ctx-bar-fill ${pct >= 90 ? 'ctx-critical' : pct >= 70 ? 'ctx-warn' : ''}`.trim();
+      $('#ctx-bar-text').textContent = `${formatTokens(used)}/${formatTokens(total)}`;
+      bar.title = meter.title;
+      bar.classList.remove('hidden');
+    }
+  }
+
   function renderCallChips(toolCalls) {
     let html = '';
     for (const tc of toolCalls || []) {
@@ -826,6 +947,7 @@
     statsEl.textContent = '';
     ctxInfo.classList.add('hidden');
     ctxInfo.innerHTML = '';
+    renderCtxMeter(null);   // keep the previous reading visible while this turn assembles
 
     // Retrieval spans both domains server-side, so either count qualifies.
     const useRag = $('#rag-checkbox').checked && (ragText + ragCode) > 0;
@@ -866,6 +988,7 @@
         }
         if (data.context_info) {
           const ci = data.context_info;
+          renderCtxMeter(ci);
           const parts = [];
           if (ci.rag_chunks) parts.push(`<span class="ctx-rag">${ci.rag_chunks} RAG</span>`);
           if (ci.turns_kept != null && ci.turns_total != null && ci.turns_kept < ci.turns_total) {
@@ -936,6 +1059,12 @@
       abortCtrl = null;
       setGenerating(false);
     }
+  }
+
+  function resetCtxMeter() {
+    lastCtxInfo = null;
+    $('#ctx-meter').classList.add('hidden');
+    $('#ctx-bar').classList.add('hidden');
   }
 
   function setGenerating(on) {

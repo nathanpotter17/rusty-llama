@@ -1332,3 +1332,91 @@ pre.code-block {
   border-top: 1px solid var(--border-subtle);
 }
 .wsb-select { color: var(--rag); border-color: var(--rag-dim); }
+
+
+/* ── Context window meter ─────────────────────────────────── */
+/* Sits in the output pane header: how much of the window this thread is
+   already using, measured server-side with the real tokenizer. */
+.ctx-meter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+.ctx-meter-track {
+  width: 90px;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--border, #2a2a2a);
+  overflow: hidden;
+}
+.ctx-meter-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background: var(--accent, #4a9eff);
+  transition: width 0.25s ease;
+}
+.ctx-meter-fill.ctx-warn { background: #d0a020; }
+.ctx-meter-fill.ctx-critical { background: #d05050; }
+.ctx-meter-label {
+  font-size: 11px;
+  color: var(--text-dim, #888);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Per-file auto-index state ────────────────────────────── */
+.file-index-state {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  white-space: nowrap;
+  color: var(--text-dim, #888);
+  background: var(--border, #2a2a2a);
+}
+.file-index-state.file-state-indexing { color: #d0a020; }
+.file-index-state.file-state-indexed  { color: #4caf50; }
+.file-index-state.file-state-error    { color: #d05050; cursor: help; }
+
+/* ── Top-bar context gauge ────────────────────────────────── */
+/* Same reading as the pane-header meter, kept permanently visible: the
+   header copy scrolls away once a conversation gets long, which is when
+   remaining context starts to matter. */
+.ctx-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--bg-elevated, #1a1a1a);
+  border: 1px solid var(--border, #2a2a2a);
+}
+.ctx-bar-label {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim, #888);
+}
+.ctx-bar-track {
+  width: 56px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border, #2a2a2a);
+  overflow: hidden;
+}
+.ctx-bar-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 2px;
+  background: var(--accent, #4a9eff);
+  transition: width 0.25s ease;
+}
+.ctx-bar-fill.ctx-warn { background: #d0a020; }
+.ctx-bar-fill.ctx-critical { background: #d05050; }
+.ctx-bar-text {
+  font-size: 11px;
+  color: var(--text-dim, #888);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}

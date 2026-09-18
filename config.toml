@@ -5,7 +5,7 @@
 #   "cpu"  — no CUDA GPU; CPU inference
 
 [hardware]
-vram = "4GB"
+vram = "8GB"
 
 [server]
 port = 8090
@@ -32,29 +32,42 @@ cache_reuse = 256        # --cache-reuse: min KV chunk (tokens) to salvage via
 # tools (~1150 tokens of system prefix, one-time per conversation); "4GB" and
 # "cpu" declare the six filesystem tools only (~760 tokens), and the exec
 # tools (run_bash/run_python/save_tool/run_tool) are refused if called.
+#
+# The tier also caps reasoning_effort (see [defaults] below), since the
+# stronger modes spend their budget on thinking tokens the smaller windows
+# cannot hold: "8GB" uncapped, "4GB" capped at medium, "cpu" at low.
 
 [tools]
-enabled = false
+enabled = true
 workspace = ""
 bash = ""
 
 # ── Defaults
 [defaults]
-model = "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+model = "Qwen3.5-9B-abliterated-Q4_K_M.gguf"   # must match a filename in models_dir exactly
 models_dir = "models"
 temperature = 0.7
 top_k = 40
 top_p = 0.9
 repeat_penalty = 1.1
+reasoning_effort = ""   # fallback for models that declare none; "" = leave the
+                        # model on its own built-in default.
 
 # ── Embed Server
 # A second llama-server process dedicated to embeddings. GPU offload and context are derived
 # from the [hardware] tier; only the model, port, and retrieval prefixes are set here.
 
 [embed]
-enabled = false
+enabled = true
 model = "Qwen3-Embedding-0.6B-Q8_0.gguf"
 port = 8078
+gpu_layers = -1          # -1 = follow the [hardware] tier (CPU on 8GB and below).
+                         # Set 99 to embed on the GPU instead: measured on an
+                         # RTX 5070 Laptop that is 24.8 chunks/s vs 2.9 on CPU,
+                         # ~8x faster indexing — but it reserves ~1.4 GiB, which
+                         # drops a 9B Q4 from 32 offloaded layers to 26 and cuts
+                         # generation from 13.3 to 5.4 tok/s. Worth it only if
+                         # you index far more than you chat.
 startup_timeout = 30
 pooling = ""             # auto-detect from GGUF metadata
 query_prefix = "Instruct: Find code relevant to this description\nQuery: "
@@ -80,6 +93,16 @@ min_similarity = 0.25
 hybrid_weight_vector = 0.7
 hybrid_weight_bm25 = 0.3
 chunker_tool = "tools/chunker.py"
+max_chunks_per_file = 200  # runaway guard on chunks from any ONE file, not a
+                           # context control: retrieval injects search_results
+                           # chunks per turn whatever the index size, so a
+                           # bigger index costs no prompt tokens. It bounds
+                           # embed time only, which is async and one-time.
+                           # Measured over 21 real files (median 36 chunks,
+                           # max 328): a cap of 40 indexed only 46% of them
+                           # and kept imports while dropping implementations.
+                           # Anything that trims an ordinary file is too low.
+                           # 0 disables the cap.
 hnsw_m = 16
 hnsw_ef_construction = 150
 hnsw_ef_search = 64
@@ -140,3 +163,35 @@ temperature = 0.3
 top_k = 20
 top_p = 0.85
 repeat_penalty = 1.0
+
+# Qwen 3.8-lineage: five effort modes, each in a thinking and an instruct
+# flavour. reasoning_effort takes "low" | "medium" | "xhigh" | "einstein" |
+# "spoon", with a leading "i" for instruct (thinking suppressed, zero
+# reasoning tokens) — e.g. "ixhigh". Needs the 8GB tier to run unclamped; the
+# smaller tiers clamp it and say so at load.
+#
+# How the tag reaches the model is decided at load from the GGUF's own chat
+# template, read back from llama-server /props:
+#   - templates that read `reasoning_effort` (DavidAU's "plusIQ" Q6/Q8 MTP
+#     quants) get it as chat_template_kwargs;
+#   - every other Qwen3 template gets the `{REASON:xxx}` prompt marker the
+#     model is trained to honour. THIS FILE carries a stock template, so it
+#     takes the marker route.
+# enable_thinking rides chat_template_kwargs either way, so the
+# thinking/instruct split works regardless of template.
+#
+# Sampling below is the vendor's "thinking mode, general tasks" recommendation.
+# Switching to an instruct ("i"-prefixed) effort? Their instruct numbers are
+# temperature = 0.7, top_p = 0.80, top_k = 20.
+[[models]]
+filename = "Qwen3.5-9B-abliterated-Q4_K_M.gguf"
+name = "Qwen3.5 9B Abliterated (Q4_K_M)"
+family = "qwen"
+gpu_layers = 99
+context_size = 32768
+temperature = 1.0
+top_k = 20
+top_p = 0.95
+repeat_penalty = 1.0
+reasoning_effort = "xhigh"
+

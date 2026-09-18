@@ -254,7 +254,10 @@ impl ToolRuntime {
             let decl = serde_json::json!({"type": "function", "function": {
                 "name": "rag_search",
                 "description": "Semantic search over the indexed workspace. Returns the most relevant chunks with their source file. Use when you know WHAT you want but not WHERE it is; grep_files is better once you know the name to look for.",
-                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}});
+                "parameters": {"type": "object", "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "description": "how many chunks to return (default 5, max 20). Start small and ask again with a larger limit only if the first results miss — every chunk you pull costs context."}
+                }, "required": ["query"]}}});
             // After the grep/glob cluster: retrieval is the "know WHAT, not
             // WHERE" complement to grep's "know the name" — adjacency teaches
             // the model they are alternatives, not duplicates.

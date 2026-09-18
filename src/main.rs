@@ -27,6 +27,7 @@ struct FileConfig {
     embed: EmbedCfg,
     rag: RagCfg,
     tools: ToolsCfg,
+    workspace: WorkspaceCfg,
     #[serde(default)]
     models: Vec<ModelEntry>,
 }
@@ -37,6 +38,7 @@ impl Default for FileConfig {
             hardware: HardwareCfg::default(),
             server: ServerCfg::default(),
             llama: LlamaCfg::default(),
+            workspace: WorkspaceCfg::default(),
             defaults: DefaultsCfg::default(),
             embed: EmbedCfg::default(),
             rag: RagCfg::default(),
@@ -56,6 +58,21 @@ struct ToolsCfg {
     enabled: bool,
     workspace: String,
     bash: String,
+}
+
+/// Server-side workspace: a repo directory the server indexes in place. The
+/// manifest (path + per-file mtime/size) persists in data/workspace.json so
+/// the RAG index stays warm across restarts and re-indexing is incremental.
+#[derive(Deserialize, Clone)]
+#[serde(default)]
+struct WorkspaceCfg {
+    path: String,
+    max_file_kb: u64,
+}
+impl Default for WorkspaceCfg {
+    fn default() -> Self {
+        Self { path: String::new(), max_file_kb: 256 }
+    }
 }
 
 /// The single hardware knob. `vram` selects a tier ("4GB" | "8GB" | "cpu")
@@ -114,6 +131,9 @@ struct DefaultsCfg {
     top_k: u32,
     top_p: f32,
     repeat_penalty: f32,
+    /// Fallback reasoning effort for models that declare none. "" = leave the
+    /// model on its own built-in default (Qwen 3.8 ships at "xhigh").
+    reasoning_effort: String,
 }
 impl Default for DefaultsCfg {
     fn default() -> Self {
@@ -121,6 +141,7 @@ impl Default for DefaultsCfg {
             model: String::new(), models_dir: "models".into(),
             ctx: 32768,
             temperature: 0.7, top_k: 40, top_p: 0.9, repeat_penalty: 1.1,
+            reasoning_effort: String::new(),
         }
     }
 }
@@ -152,7 +173,7 @@ impl Default for EmbedCfg {
             binary: String::new(),
             model: String::new(),
             port: 8078,
-            gpu_layers: 99,
+            gpu_layers: -1,   // -1 = follow the [hardware] tier
             context_size: 2048,
             parallel_slots: 2,
             startup_timeout: 60,
@@ -177,6 +198,22 @@ struct RagCfg {
     hybrid_weight_bm25: f32,     // weight for BM25 keyword score in hybrid scoring
     // External chunker tool (empty = use internal chunker only)
     chunker_tool: String,
+    /// Runaway guard on chunks from any ONE file — deliberately high.
+    ///
+    /// It is NOT a context control: retrieval injects `search_results`
+    /// chunks per turn regardless of index size, so a bigger index costs
+    /// nothing in prompt tokens. Nor is it dominance control: MMR reranking
+    /// already penalises near-duplicate neighbours from one source. The only
+    /// real cost it bounds is embed time, which is async and one-time.
+    ///
+    /// Measured over 21 real source files (median 36 chunks, mean 67, max
+    /// 328): a cap of 40 left just 46% of chunks indexed and truncated 9 of
+    /// 21 files — and because trimming keeps the FIRST n chunks in file
+    /// order, what survived was imports and preamble while implementations
+    /// were dropped. 200 indexes 20 of 21 whole at a worst case of ~24s of
+    /// background embedding. Anything that trims an ordinary source file is
+    /// too low. 0 disables the cap.
+    max_chunks_per_file: usize,
     // HNSW graph parameters
     hnsw_m: usize,               // max connections per node per layer (M0 = 2*M for layer 0)
     hnsw_ef_construction: usize, // beam width during index build
@@ -194,9 +231,10 @@ impl Default for RagCfg {
             hybrid_weight_vector: 0.7,
             hybrid_weight_bm25: 0.3,
             chunker_tool: "tools/chunker.py".into(),
+            max_chunks_per_file: 200,
             hnsw_m: 16,
             hnsw_ef_construction: 150,
-            hnsw_ef_search: 64,
+            hnsw_ef_search: 128,
         }
     }
 }
@@ -220,6 +258,11 @@ struct ModelEntry {
     top_p: f32,
     #[serde(default = "def_rp")]
     repeat_penalty: f32,
+    /// One of the ten effort tags (see EFFORT_MODES) — "low".."spoon", with a
+    /// leading "i" for the instruct/no-thinking flavour. "" = don't set one,
+    /// which is correct for every model that has no effort vocabulary.
+    #[serde(default)]
+    reasoning_effort: String,
     // Speculative decoding (per-model — spec capability is a model property).
     #[serde(default)]
     spec_type: String,               // "" = off | "draft-mtp" | "draft-model" | "eagle" | ...
@@ -241,6 +284,323 @@ fn def_rp() -> f32 { 1.1 }
 fn def_spec_nmax() -> u32 { 2 }
 fn def_ngl_draft() -> i32 { 99 }
 
+
+// ── Reasoning effort ────────────────────────────────────────
+//
+// Qwen 3.8-lineage models (Qwen3.5-9B "Defiant Fable" and relatives) expose
+// five effort modes, each available in two flavours: reasoning (thinking
+// block emitted) and instruct (thinking suppressed, zero reasoning tokens).
+// The instruct flavour is spelled with a leading "i" — "ixhigh" is instruct
+// at xhigh power. Ranked weakest → strongest:
+//
+//   low      standard Qwen reasoning, minimum tokens
+//   medium   the model's own unenhanced default
+//   xhigh    standard Qwen maximum
+//   einstein spawns up to ~20 virtual agents; spends far more tokens
+//   spoon    ULTRA research mode, hyper-detailed; spends the most tokens
+//
+// Two delivery channels, because the tag only reaches the model if something
+// in the prompt path carries it:
+//
+//   kwargs — `chat_template_kwargs.reasoning_effort`, for models whose jinja
+//            template actually reads the variable (DavidAU's "plusIQ" Q6/Q8
+//            MTP quants). Detected from /props at load, never assumed.
+//   inline — the `{REASON:xxx}` marker the model was trained to honour
+//            anywhere in the prompt. Used when the template ignores the
+//            kwarg, which is the case for stock Qwen3.5 templates.
+//
+// `enable_thinking` rides the kwargs channel either way: every Qwen3
+// template reads it (verified against build 9870 via /apply-template), so
+// the reasoning/instruct split works even on a stock template that drops the
+// effort tag.
+const EFFORT_MODES: [&str; 5] = ["low", "medium", "xhigh", "einstein", "spoon"];
+
+/// Splits an effort tag into (instruct?, base mode). Returns None for a tag
+/// outside the vocabulary — callers reject rather than silently pass junk
+/// into the prompt. "" is not a tag; it means "don't set an effort at all".
+fn parse_effort(tag: &str) -> Option<(bool, &'static str)> {
+    let t = tag.trim().to_ascii_lowercase();
+    if t.is_empty() { return None; }
+    let (instruct, base) = match t.strip_prefix('i') {
+        Some(rest) if EFFORT_MODES.contains(&rest) => (true, rest.to_string()),
+        _ => (false, t),
+    };
+    EFFORT_MODES.iter().find(|m| **m == base).map(|m| (instruct, *m))
+}
+
+/// Position in EFFORT_MODES; unknown sorts to the top so an unrecognized
+/// ceiling never silently clamps a valid request down.
+fn effort_rank(base: &str) -> usize {
+    EFFORT_MODES.iter().position(|m| *m == base).unwrap_or(EFFORT_MODES.len() - 1)
+}
+
+/// Clamp an effort tag to the hardware tier's ceiling, preserving the
+/// instruct flavour. The stronger modes are not merely slower: einstein and
+/// spoon are documented to spend far more reasoning tokens (22k of output in
+/// the vendor's own spoon example), which a 16k-or-smaller window cannot
+/// hold. Clamping keeps the small tiers usable instead of letting every turn
+/// die on a truncated thinking block. Returns "" for an unusable tag.
+fn clamp_effort(tag: &str, ceiling: &str) -> String {
+    let Some((instruct, base)) = parse_effort(tag) else { return String::new() };
+    let capped = if effort_rank(base) > effort_rank(ceiling) { ceiling } else { base };
+    format!("{}{}", if instruct { "i" } else { "" }, capped)
+}
+
+#[cfg(test)]
+mod auto_index_tests {
+    use super::*;
+
+    #[test]
+    fn ranges_merge_including_touching_spans() {
+        // Touching, not just overlapping: 1-100 then 101-200 is one read, and
+        // reporting it as two makes the model think it missed a line.
+        assert_eq!(merge_ranges(vec![(1,100),(101,200)]), vec![(1,200)]);
+        assert_eq!(merge_ranges(vec![(50,60),(1,10)]), vec![(1,10),(50,60)]);
+        assert_eq!(merge_ranges(vec![(1,50),(20,30)]), vec![(1,50)]);
+        assert_eq!(merge_ranges(vec![]), vec![]);
+    }
+
+    #[test]
+    fn coverage_needs_every_line_not_just_the_endpoints() {
+        let have = vec![(1,100),(200,300)];
+        assert!(covers(&have, (1,50)));
+        assert!(covers(&have, (200,300)));
+        // Spans the hole between 101 and 199 — the endpoints are both held
+        // but the middle is not, and answering "yes" here would suppress a
+        // page the model has never seen.
+        assert!(!covers(&have, (50,250)));
+        assert!(!covers(&have, (150,160)));
+        assert!(!covers(&[], (1,1)));
+    }
+
+    #[test]
+    fn indexed_spans_coalesce_chunker_gaps_but_read_coverage_does_not() {
+        // Real spans from a chunked 340-line file: per-symbol chunks with a
+        // line or two between them. Printed exactly they are 6 fragments.
+        let raw = vec![(1,10),(13,32),(34,36),(38,76),(79,134),(137,137)];
+        assert_eq!(merge_with_tol(raw.clone(), INDEXED_SPAN_GAP_TOL), vec![(1,137)]);
+        // Read coverage must stay exact — bridging a gap here would suppress
+        // a page the model has never been shown.
+        assert_eq!(merge_ranges(raw).len(), 6);
+    }
+
+    #[test]
+    fn gaps_are_the_lines_still_unread() {
+        assert_eq!(gaps(&[(1,100)], 250), vec![(101,250)]);
+        assert_eq!(gaps(&[(50,100)], 200), vec![(1,49),(101,200)]);
+        assert_eq!(gaps(&[(1,200)], 200), vec![]);
+        assert_eq!(gaps(&[], 30), vec![(1,30)]);
+    }
+
+    #[test]
+    fn shown_span_reads_the_output_not_the_arguments() {
+        // The tool caps a page on bytes as well as lines, so what it printed
+        // is the only reliable source for what the model actually saw.
+        let out = "12\tfn main() {\n13\t    todo!();\n14\t}\n\n[showing lines 12-14 of 900]";
+        assert_eq!(shown_span(out), Some((12, 14)));
+        assert_eq!(shown_span("[file is empty]"), None);
+    }
+
+    #[test]
+    fn indexed_spans_parse_both_chunker_source_formats() {
+        let mut rag = RagStore::new(RagCfg::default());
+        let push = |rag: &mut RagStore, source: &str| {
+            rag.chunks.push(VecChunk::new(
+                source.into(), "body".into(), "block".into(),
+                "/w/src/a.rs".into(), "code".into(), vec![0.0],
+            ));
+        };
+        // internal chunker: name:start-end — external: name:kind:symbol:start-end
+        push(&mut rag, "a.rs:1-60");
+        push(&mut rag, "a.rs:function:install:61-120");
+        push(&mut rag, "a.rs:gap:200-210");
+        assert_eq!(indexed_spans(&rag, "/w/src/a.rs"), vec![(1,120),(200,210)]);
+        assert_eq!(indexed_spans(&rag, "/w/src/other.rs"), vec![]);
+    }
+
+    /// The arg shape is the whole feature: normalize_args unwraps the
+    /// arguments object, so anything reaching for `["arguments"]["path"]`
+    /// reads None and auto-indexing silently never happens.
+    #[test]
+    fn read_path_arg_matches_what_normalize_args_produces() {
+        // Wrapped form, as llama-server usually delivers it.
+        let wrapped = tools::normalize_args(&serde_json::json!({
+            "name": "read_file",
+            "arguments": {"file_path": "src/killswitch.rs"},
+        }));
+        assert_eq!(read_path_arg(&wrapped), Some("src/killswitch.rs"));
+
+        // Flattened form, which Qwen-family models emit regularly.
+        let flat = tools::normalize_args(&serde_json::json!({
+            "name": "read_file",
+            "path": "src/engine.rs",
+        }));
+        assert_eq!(read_path_arg(&flat), Some("src/engine.rs"));
+
+        // Arguments as a JSON string, the third shape normalize_args handles.
+        let stringy = tools::normalize_args(&serde_json::json!({
+            "name": "read_file",
+            "arguments": "{\"file_path\": \"src/wg.rs\"}",
+        }));
+        assert_eq!(read_path_arg(&stringy), Some("src/wg.rs"));
+
+        // A call with no path at all must not panic or invent one.
+        let empty = tools::normalize_args(&serde_json::json!({"name": "read_file"}));
+        assert_eq!(read_path_arg(&empty), None);
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    /// A stand-in for the real GGUF: plan_launch reads size and block count
+    /// off disk, so the fixture has to be a file of a known size carrying a
+    /// `*.block_count` key.
+    fn fixture(dir: &std::path::Path, mib: u64, blocks: u32) -> String {
+        let path = dir.join(format!("m{mib}_{blocks}.gguf"));
+        let mut v: Vec<u8> = Vec::new();
+        v.extend(b"GGUF");
+        v.extend(3u32.to_le_bytes());          // version
+        v.extend(0u64.to_le_bytes());          // tensor count
+        v.extend(1u64.to_le_bytes());          // kv count
+        let key = b"test.block_count";
+        v.extend((key.len() as u64).to_le_bytes());
+        v.extend(key);
+        v.extend(4u32.to_le_bytes());          // value type: u32
+        v.extend(blocks.to_le_bytes());
+        v.resize((mib * 1024 * 1024) as usize, 0);
+        fs::write(&path, &v).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// The bug this guards: sizing the offload greedily and only then asking
+    /// what context fits collapses a 32k-capable model to MIN_CTX, because
+    /// the last layer of a full offload eats the whole KV budget. Trading one
+    /// layer back must buy a window many times larger.
+    #[test]
+    fn full_offload_never_starves_the_context_window() {
+        let dir = std::env::temp_dir().join("rusty_plan_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = fixture(&dir, 6512, 32);
+        let preset = HwPreset::from_vram("8GB", true);
+
+        // Free VRAM across the cliff region for a 6512 MiB / 32-layer model.
+        for free in [7500u64, 7400, 7300, 7200, 7100, 7000, 6800, 6500] {
+            let plan = plan_launch(&path, 99, Some(free), 0, 32768, &preset);
+            assert!(
+                plan.ctx >= FA_CTX_THRESHOLD,
+                "free={free} planned a {}-token window (ngl={}) — the offload \
+                 starved the KV cache", plan.ctx, plan.ngl,
+            );
+            // A usable window must come with FA on and quantized KV, or the
+            // window was sized on one policy and launched under another.
+            assert!(plan.flash_attn, "free={free}: ctx {} without flash-attn", plan.ctx);
+            assert_eq!(plan.cache_type, "q8_0", "free={free}: unquantized KV at ctx {}", plan.ctx);
+        }
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The descent must not give away offload it did not need to: when a full
+    /// offload already clears the floor, it stays a full offload.
+    #[test]
+    fn a_comfortable_card_keeps_its_full_offload() {
+        let dir = std::env::temp_dir().join("rusty_plan_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = fixture(&dir, 3000, 32);
+        let preset = HwPreset::from_vram("8GB", true);
+        let plan = plan_launch(&path, -1, Some(8000), 0, 32768, &preset);
+        assert_eq!(plan.ngl, -1, "full offload was traded away needlessly");
+        assert!(plan.ctx >= FA_CTX_THRESHOLD);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Nothing can clear the floor on a tiny card, and the planner must still
+    /// return the best offload it can rather than silently dropping to CPU.
+    #[test]
+    fn a_model_too_big_to_fit_keeps_its_offload_ceiling() {
+        let dir = std::env::temp_dir().join("rusty_plan_tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = fixture(&dir, 6000, 32);
+        let preset = HwPreset::from_vram("4GB", true);
+        let plan = plan_launch(&path, -1, Some(4000), 0, 16384, &preset);
+        assert!(plan.ngl >= 0, "planner fell back past its ceiling");
+        assert!(plan.ctx >= MIN_CTX);
+        let _ = fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod effort_tests {
+    use super::*;
+
+    #[test]
+    fn parses_both_flavours_and_rejects_junk() {
+        assert_eq!(parse_effort("xhigh"), Some((false, "xhigh")));
+        assert_eq!(parse_effort("ixhigh"), Some((true, "xhigh")));
+        assert_eq!(parse_effort(" SPOON "), Some((false, "spoon")));
+        // "einstein" starts with 'i' only after the strip — the strip must not
+        // turn a valid base mode into a bogus instruct tag and vice versa.
+        assert_eq!(parse_effort("einstein"), Some((false, "einstein")));
+        assert_eq!(parse_effort("ieinstein"), Some((true, "einstein")));
+        assert_eq!(parse_effort(""), None);
+        assert_eq!(parse_effort("xhgih"), None);
+        assert_eq!(parse_effort("high"), None);
+    }
+
+    #[test]
+    fn clamps_to_the_tier_ceiling_keeping_the_flavour() {
+        // 8GB is uncapped: the strongest mode survives untouched.
+        assert_eq!(clamp_effort("spoon", "spoon"), "spoon");
+        // 4GB caps at medium; instruct stays instruct through the clamp.
+        assert_eq!(clamp_effort("spoon", "medium"), "medium");
+        assert_eq!(clamp_effort("ispoon", "medium"), "imedium");
+        // Below the ceiling is left alone — clamping is a cap, not a set.
+        assert_eq!(clamp_effort("low", "medium"), "low");
+        assert_eq!(clamp_effort("ilow", "low"), "ilow");
+        // Junk clears the tag rather than reaching the prompt.
+        assert_eq!(clamp_effort("nonsense", "spoon"), "");
+        assert_eq!(clamp_effort("", "spoon"), "");
+    }
+
+    #[test]
+    fn every_tier_ceiling_is_a_real_mode() {
+        // A typo'd ceiling would rank as "strongest" and silently stop
+        // clamping, so the presets are checked against the vocabulary.
+        for tag in ["4GB", "8GB", "cpu", "whatever"] {
+            for gpu in [true, false] {
+                let c = HwPreset::from_vram(tag, gpu).effort_ceiling;
+                assert!(EFFORT_MODES.contains(&c), "{tag}/{gpu} → bogus ceiling {c}");
+            }
+        }
+    }
+}
+
+/// The jinja kwargs for one request, or None when no effort is set.
+/// `enable_thinking` is the half that every Qwen3 template reads, so the
+/// reasoning/instruct split lands even on a stock template; the effort tag
+/// itself is attached only when the loaded template actually reads it.
+fn effort_kwargs(cfg: &RuntimeCfg) -> Option<serde_json::Value> {
+    let (instruct, _) = parse_effort(&cfg.reasoning_effort)?;
+    let mut kw = serde_json::json!({ "enable_thinking": !instruct });
+    if cfg.effort_native {
+        kw["reasoning_effort"] = serde_json::json!(cfg.reasoning_effort);
+    }
+    Some(kw)
+}
+
+/// The in-prompt form of the tag, for templates that drop the kwarg. It is
+/// appended to the SYSTEM message rather than the newest question: the system
+/// block is byte-stable for the life of a conversation, so the marker costs
+/// one prefill and then rides the prefix cache — whereas editing the user's
+/// turn would diverge from the history the client resends next turn and
+/// re-prefill the tail on every request.
+fn effort_marker(cfg: &RuntimeCfg) -> Option<String> {
+    if cfg.effort_native { return None; }
+    parse_effort(&cfg.reasoning_effort)?;
+    Some(format!("\n\n{{REASON:{}}}", cfg.reasoning_effort))
+}
+
 // ── Runtime state ───────────────────────────────────────────
 
 #[derive(Clone)]
@@ -259,6 +619,14 @@ struct RuntimeCfg {
     top_k: u32,
     top_p: f32,
     repeat_penalty: f32,
+    /// Active effort tag, already clamped to the tier ceiling. "" = unset.
+    reasoning_effort: String,
+    /// True when the LOADED model's jinja template actually reads
+    /// `reasoning_effort`, as read back from /props once the server is ready.
+    /// False means the tag has to ride inline as a {REASON:xxx} marker.
+    /// Always false until the probe lands, so a failed probe degrades to the
+    /// channel that works on every Qwen3 template rather than to silence.
+    effort_native: bool,
     cache_type_k: String,
     cache_type_v: String,
     draft_model: String,
@@ -306,6 +674,7 @@ struct Model {
     top_k: u32,
     top_p: f32,
     repeat_penalty: f32,
+    reasoning_effort: String,
     spec_type: String,
     spec_draft_n_max: u32,
     draft_model: String,
@@ -335,6 +704,11 @@ fn discover_models(
                     context_size: k.context_size,
                     temperature: k.temperature, top_k: k.top_k, top_p: k.top_p,
                     repeat_penalty: k.repeat_penalty,
+                    reasoning_effort: if k.reasoning_effort.is_empty() {
+                        defaults.reasoning_effort.clone()
+                    } else {
+                        k.reasoning_effort.clone()
+                    },
                     spec_type: k.spec_type.clone(), spec_draft_n_max: k.spec_draft_n_max,
                     draft_model: k.draft_model.clone(), gpu_layers_draft: k.gpu_layers_draft,
                 }
@@ -347,6 +721,7 @@ fn discover_models(
                     context_size: default_ctx,
                     temperature: defaults.temperature,
                     top_k: defaults.top_k, top_p: defaults.top_p, repeat_penalty: defaults.repeat_penalty,
+                    reasoning_effort: defaults.reasoning_effort.clone(),
                     spec_type: String::new(), spec_draft_n_max: def_spec_nmax(),
                     draft_model: String::new(), gpu_layers_draft: def_ngl_draft(),
                 }
@@ -647,6 +1022,10 @@ fn rag_retrieve(st: &Shared, query: &str, limit: usize) -> Result<Vec<(String, S
 /// The rag_search tool: retrieval as a tool round the model invokes when grep
 /// is not finding it. Runs in the serving layer because it needs the vector
 /// store; ToolRuntime never sees it.
+/// Ceiling on what one rag_search call can pull into the prompt. A model
+/// that asks for 100 chunks would blow the window on a single tool result.
+const RAG_TOOL_MAX_LIMIT: u64 = 20;
+
 fn run_rag_search(st: &Shared, args: &serde_json::Value) -> tools::ToolResult {
     let query = args["query"].as_str().unwrap_or("").trim().to_string();
     if query.is_empty() {
@@ -654,7 +1033,10 @@ fn run_rag_search(st: &Shared, args: &serde_json::Value) -> tools::ToolResult {
             "error: rag_search needs `query` — what you are looking for, in plain words".into(),
         );
     }
-    match rag_retrieve(st, &query, 5) {
+    // The model spends its own context here: start narrow, widen only when
+    // the first answer misses. Clamped so one call cannot eat the window.
+    let limit = args["limit"].as_u64().unwrap_or(5).clamp(1, RAG_TOOL_MAX_LIMIT) as usize;
+    match rag_retrieve(st, &query, limit) {
         // The empty-result wording matters: a model that gets an empty result
         // reads it as a fact about the codebase, not about its own phrasing,
         // and stops looking (same failure the fs search-widening ladder guards).
@@ -1037,9 +1419,40 @@ fn get_embedding(endpoint: &str, text: &str, prefix: &str) -> Result<Vec<f32>, S
     parse_single_embedding(&resp)
 }
 
-/// Send all texts in a single batched request: { "input": [...], "model": "local" }.
-/// Falls back to sequential requests if the server doesn't support batch input.
+/// Chunks per embedding request.
+///
+/// Indexing a repo produces thousands of chunks — a 27-file crate measured
+/// 1019 — and sending them as one request cannot work: the whole corpus has
+/// to finish inside a single socket timeout, with no progress until it does.
+/// A CPU-hosted embedder at ~8 chunks/s needs over two minutes for that one
+/// call, which is exactly how a workspace sync died with EAGAIN. Sub-batching
+/// bounds each request instead, so total corpus size no longer decides
+/// whether indexing succeeds.
+const EMBED_BATCH_CHUNK: usize = 64;
+
+/// Embed every text, in bounded sub-batches.
 fn get_embeddings_batch(endpoint: &str, texts: &[&str], prefix: &str) -> Result<Vec<Vec<f32>>, String> {
+    if texts.is_empty() { return Ok(Vec::new()); }
+    if texts.len() <= EMBED_BATCH_CHUNK {
+        return embed_one_batch(endpoint, texts, prefix);
+    }
+    let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+    let t0 = Instant::now();
+    for group in texts.chunks(EMBED_BATCH_CHUNK) {
+        out.extend(embed_one_batch(endpoint, group, prefix)?);
+        // A multi-minute index with a silent log looks indistinguishable from
+        // a hang, which is what the single-request version actually was.
+        eprintln!("[rag] embedded {}/{} chunks ({:.0}%, {:.0}s elapsed)",
+            out.len(), texts.len(),
+            100.0 * out.len() as f64 / texts.len() as f64,
+            t0.elapsed().as_secs_f64());
+    }
+    Ok(out)
+}
+
+/// One request: { "input": [...], "model": "local" }.
+/// Falls back to sequential requests if the server doesn't support batch input.
+fn embed_one_batch(endpoint: &str, texts: &[&str], prefix: &str) -> Result<Vec<Vec<f32>>, String> {
     if texts.is_empty() { return Ok(Vec::new()); }
     if texts.len() == 1 {
         return get_embedding(endpoint, texts[0], prefix).map(|v| vec![v]);
@@ -1054,7 +1467,10 @@ fn get_embeddings_batch(endpoint: &str, texts: &[&str], prefix: &str) -> Result<
         serde_json::json!({ "input": prefixed, "model": "local" })
     };
     let body_str = req_body.to_string();
-    let resp_body = http_post_json(host, port, &path, &body_str, 120)?;
+    // Budget per item rather than per request: the same batch takes minutes on
+    // a CPU-hosted embedder and seconds on a GPU one.
+    let timeout = 30 + texts.len() as u64 * 4;
+    let resp_body = http_post_json(host, port, &path, &body_str, timeout)?;
     let resp: serde_json::Value = serde_json::from_str(&resp_body)
         .map_err(|e| format!("parse: {e} — body: {}", prefix_at_boundary(&resp_body, 200)))?;
 
@@ -1537,39 +1953,20 @@ impl HnswGraph {
 
 // ── RAG Store (chunks + HNSW) ───────────────────────────────
 
-// ── Workspace: server-side repo walking + incremental indexing ─────────
+// ── Workspace: the directory the agent works in ────────────────
 
-/// File extensions the workspace indexer accepts (mirrors the UI's upload
-/// accept list), plus a few extensionless well-known names.
-const WS_EXTS: &[&str] = &[
-    "ts", "tsx", "js", "jsx", "rs", "c", "cpp", "h", "hpp", "py", "go",
-    "java", "html", "css", "sql", "sh", "bash", "toml", "yaml", "yml",
-    "json", "md", "txt", "rb", "swift", "kt", "cs", "lua", "zig", "asm",
-    "s", "vue", "svelte", "astro", "graphql", "gql", "proto", "cmake",
-    "mk", "xml", "ini", "cfg", "conf", "hbs", "ejs", "pug", "scss",
-    "sass", "less", "styl", "wat",
-];
-const WS_SPECIAL_FILES: &[&str] = &["makefile", "dockerfile", "cmakelists.txt", ".gitignore", ".env"];
-/// Directories the fallback walker skips (git repos use `git ls-files`
-/// instead, which honors .gitignore exactly).
-const WS_SKIP_DIRS: &[&str] = &[
-    ".git", "target", "node_modules", "dist", "build", "out", "__pycache__",
-    ".venv", "venv", "data", "models", ".idea", ".vscode", "bin", "obj",
-    "vendor", ".next", "coverage",
-];
 const WS_MANIFEST_PATH: &str = "data/workspace.json";
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct WorkspaceManifest {
+    /// The directory the agent works in. Persisted so a picked folder
+    /// survives a restart; nothing else about the tree is remembered,
+    /// because nothing walks it any more.
     path: String,
-    /// rel path → (mtime seconds, size bytes) at last successful index.
-    files: std::collections::HashMap<String, (u64, u64)>,
-    last_index_epoch: u64,
 }
 
 struct Workspace {
     manifest: WorkspaceManifest,
-    max_file_kb: u64,
 }
 
 impl Workspace {
@@ -1583,7 +1980,7 @@ impl Workspace {
         if manifest.path.is_empty() && !cfg.path.is_empty() {
             manifest.path = cfg.path.clone();
         }
-        Self { manifest, max_file_kb: cfg.max_file_kb }
+        Self { manifest }
     }
 
     fn save(&self) -> Result<(), String> {
@@ -1593,88 +1990,6 @@ impl Workspace {
         let json = serde_json::to_string(&self.manifest).map_err(|e| e.to_string())?;
         fs::write(WS_MANIFEST_PATH, json).map_err(|e| e.to_string())
     }
-}
-
-fn ws_name_ok(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    if WS_SPECIAL_FILES.contains(&lower.as_str()) {
-        return true;
-    }
-    lower
-        .rsplit_once('.')
-        .is_some_and(|(_, ext)| WS_EXTS.contains(&ext))
-}
-
-/// Walk the workspace, returning relative paths of indexable files. Git
-/// repos go through `git ls-files` (exact .gitignore semantics, including
-/// untracked-but-not-ignored files); everything else gets a recursive walk
-/// with a built-in skip list.
-fn workspace_walk(root: &Path) -> Vec<String> {
-    if root.join(".git").exists() {
-        if let Some(list) = git_ls_files(root) {
-            return list;
-        }
-        eprintln!("[workspace] git ls-files failed — falling back to plain walk");
-    }
-    let mut out = Vec::new();
-    walk_dir(root, root, &mut out, 0);
-    out
-}
-
-fn git_ls_files(root: &Path) -> Option<Vec<String>> {
-    let out = Command::new("git")
-        .args(["-C"])
-        .arg(root)
-        .args(["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    Some(
-        text.split('\0')
-            .filter(|p| !p.is_empty())
-            .filter(|p| {
-                let base = p.rsplit('/').next().unwrap_or(p);
-                ws_name_ok(base)
-            })
-            .map(str::to_string)
-            .collect(),
-    )
-}
-
-fn walk_dir(root: &Path, dir: &Path, out: &mut Vec<String>, depth: usize) {
-    if depth > 16 {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
-        if path.is_dir() {
-            let lower = name.to_lowercase();
-            if name.starts_with('.') || WS_SKIP_DIRS.contains(&lower.as_str()) {
-                continue;
-            }
-            walk_dir(root, &path, out, depth + 1);
-        } else if ws_name_ok(name) {
-            if let Ok(rel) = path.strip_prefix(root) {
-                out.push(rel.to_string_lossy().replace('\\', "/"));
-            }
-        }
-    }
-}
-
-fn ws_file_stat(root: &Path, rel: &str) -> Option<(u64, u64)> {
-    let meta = fs::metadata(root.join(rel)).ok()?;
-    let mtime = meta
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    Some((mtime, meta.len()))
 }
 
 struct RagStore {
@@ -1823,7 +2138,12 @@ impl RagStore {
         // ── Stage 1: Retrieve candidates for hybrid re-ranking + MMR ──
         // Widen retrieval when domain-scoped so the target corpus isn't
         // starved by nearer neighbours from the other domain.
-        let candidate_limit = limit * 6;
+        // Generous on purpose: BM25 re-scoring and MMR can only reorder what
+        // vector search hands them, so a chunk cut here can never be
+        // recovered no matter how well it matches the query's keywords. The
+        // cost is O(terms) per extra candidate on the CPU, against an HNSW
+        // walk that is already O(log n) — cheap next to one embedding call.
+        let candidate_limit = limit * 12;
 
         let raw: Vec<(usize, f32)> = if !self.graph.is_empty()
             && self.graph.len() == self.chunks.len()
@@ -1853,7 +2173,10 @@ impl RagStore {
         // Scope to the requested retrieval domain.
         let candidates: Vec<(usize, f32)> = raw.into_iter()
             .filter(|(id, _)| self.chunks[*id].domain == domain)
-            .take(limit * 3)
+            // Keep the pool wide THROUGH the hybrid stage — trimming to
+            // limit*3 here meant BM25 only ever re-ranked what vector search
+            // already liked, which is most of its value thrown away.
+            .take(limit * 8)
             .collect();
         if candidates.is_empty() { return Vec::new(); }
 
@@ -2346,20 +2669,47 @@ fn llama_args(cfg: &RuntimeCfg, model: &Model) -> Vec<String> {
     args
 }
 
+/// Upper bound on the embed server's batch, independent of its context.
+///
+/// llama-server sizes its logits buffer `vocab x batch x 4` bytes. For
+/// Qwen3-Embedding-0.6B that vocab is 151669, so the buffer is 2.5 GiB at
+/// batch 4096, 1.2 GiB at 2048 and 310 MiB at 512 — against weights of only
+/// 610 MiB. Tying the batch to the context is what made the lazy start die
+/// with ErrorOutOfDeviceMemory.
+///
+/// A chunk does NOT have to fit in one micro-batch: build 9870 splits a long
+/// sequence across micro-batches internally. Verified by embedding a
+/// 1577-token chunk at ubatch 2048 and at 256 — cosine 0.9998. So this is
+/// free to be small, and smaller is also faster (measured on GPU: 15.5
+/// chunks/s at 2048, 24.8 at 512, 27.5 at 256).
+const EMBED_MAX_BATCH: u32 = 512;
+
 /// Launch flags for the dedicated embedding server.
 fn embed_args(model_path: &str, cfg: &EmbedCfg) -> Vec<String> {
-    let ngl = if cfg.gpu_layers < 0 { 99 } else { cfg.gpu_layers };
     let ctx = cfg.context_size.to_string();
+    let batch = cfg.context_size.min(EMBED_MAX_BATCH).to_string();
     let mut args = vec![
         "-m".into(), model_path.to_string(),
         "--port".into(), cfg.port.to_string(),
-        "-ngl".into(), ngl.to_string(),
-        "-c".into(), ctx.clone(),
-        "-ub".into(), ctx,
+        "-c".into(), ctx,
+        // Micro-batch and batch move together: pooling needs the whole
+        // sequence in one micro-batch, and a larger logical batch on top of
+        // that only inflates the logits buffer.
+        "-ub".into(), batch.clone(),
+        "-b".into(), batch,
         "-np".into(), cfg.parallel_slots.to_string(),
         "--host".into(), "127.0.0.1".into(),
         "--embedding".into(),
     ];
+    if cfg.gpu_layers > 0 {
+        args.extend(["-ngl".into(), cfg.gpu_layers.to_string()]);
+    } else {
+        // `-ngl 0` is not enough to keep the embedder off the GPU: the logits
+        // buffer still lands on the Vulkan device and OOMs a card the main
+        // model already owns. `--device none` is what actually pins the whole
+        // thing to the CPU — where, for a 0.6B model, it also runs faster.
+        args.extend(["--device".into(), "none".into()]);
+    }
     if !cfg.pooling.is_empty() { args.extend(["--pooling".into(), cfg.pooling.clone()]); }
     args
 }
@@ -2384,10 +2734,15 @@ fn poll_until_ready(st: &Shared, which: Which, timeout_secs: u64) -> Result<(), 
         let outcome = st.lock().unwrap().server_mut(which).poll_once();
         match outcome {
             PollOutcome::Ready => {
-                let mut s = st.lock().unwrap();
-                let srv = s.server_mut(which);
-                srv.status = ServerStatus::Ready;
-                eprintln!("[{}] ready (pid {:?})", srv.kind, srv.pid);
+                {
+                    let mut s = st.lock().unwrap();
+                    let srv = s.server_mut(which);
+                    srv.status = ServerStatus::Ready;
+                    eprintln!("[{}] ready (pid {:?})", srv.kind, srv.pid);
+                }
+                // The template is only readable once the model is loaded, so
+                // the effort channel is resolved here rather than at spawn.
+                if matches!(which, Which::Llama) { probe_effort_channel(st); }
                 return Ok(());
             }
             PollOutcome::Dead(e) => {
@@ -2397,6 +2752,32 @@ fn poll_until_ready(st: &Shared, which: Which, timeout_secs: u64) -> Result<(), 
             PollOutcome::Pending => std::thread::sleep(Duration::from_millis(700)),
         }
     }
+}
+
+/// Ask the ready server which chat template it actually loaded, and record
+/// whether that template reads `reasoning_effort`. Templates that don't read
+/// it drop the kwarg silently (verified against build 9870 via
+/// /apply-template: an unknown kwarg renders a byte-identical prompt), which
+/// is exactly why this can't be inferred from a successful request — it has
+/// to be read off the template itself.
+fn probe_effort_channel(st: &Shared) {
+    let (port, effort, ready) = {
+        let s = st.lock().unwrap();
+        (s.cfg.llama_port, s.cfg.reasoning_effort.clone(), s.llama.is_ready())
+    };
+    // No effort set, or nothing to ask: leave the flag false, which routes any
+    // later tag down the channel that works on every Qwen3 template.
+    if effort.is_empty() || !ready {
+        st.lock().unwrap().cfg.effort_native = false;
+        return;
+    }
+    let native = http_get("127.0.0.1", port, "/props", 5).ok()
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+        .and_then(|v| v["chat_template"].as_str().map(|t| t.contains("reasoning_effort")))
+        .unwrap_or(false);
+    st.lock().unwrap().cfg.effort_native = native;
+    eprintln!("[llama]   reasoning_effort={effort} via {}",
+        if native { "chat_template_kwargs" } else { "{REASON:} prompt marker" });
 }
 
 /// Background readiness poll. Shared by /api/load and /api/embed/start.
@@ -2440,7 +2821,8 @@ fn ensure_embed_ready(st: &Shared) -> Result<(), String> {
         let mut s = st.lock().unwrap();
         if !s.embed.is_active() {
             let ngl = if embed_cfg.gpu_layers < 0 { 99 } else { embed_cfg.gpu_layers };
-            eprintln!("[embed] lazy-starting {} (ngl={ngl}, ctx={}, port={})",
+            let where_ = if ngl > 0 { "gpu" } else { "cpu" };
+            eprintln!("[embed] starting {} on {where_} (ctx={}, port={})",
                 model_name, embed_cfg.context_size, embed_cfg.port);
             let args = embed_args(&model_path, &embed_cfg);
             s.embed.spawn(&binary, &args, &model_name, embed_cfg.port)?;
@@ -2672,6 +3054,15 @@ impl SystemInfo {
 // buckets, no OOM launches.
 
 const MIN_CTX: u32 = 2048;
+/// CUDA context + compute buffers + fragmentation margin.
+const HEADROOM_MIB: u64 = 512;
+/// Resident footprint reserved for the embed server so a later start doesn't
+/// OOM a model sized to the whole card. Measured on build 9870 at the batch
+/// this code actually launches with (512): ~1.4 GiB, of which 610 MiB is
+/// weights and ~310 MiB the vocab x batch logits buffer. At batch 2048 the
+/// same server takes 2.4 GiB, which is why the batch is capped separately.
+/// Only applied when the embed server actually offloads (embed_ngl > 0).
+const EMBED_RESERVE_MIB: u64 = 1500;
 /// streamer-server's MAX_CTX; llama-server accepts more but nothing we run
 /// wants it.
 const ENGINE_MAX_CTX: u32 = 65536;
@@ -2696,6 +3087,11 @@ struct HwPreset {
     // On a 32k window the full block is noise; on the tighter tiers it is a
     // double-digit percentage of every agentic conversation.
     slim_tools: bool,
+    /// Strongest reasoning effort this tier's context window can absorb (see
+    /// clamp_effort). The enhanced modes trade context for depth — einstein
+    /// fans out to ~20 virtual agents and spoon is documented producing 22k
+    /// of output — so only the 8GB tier's 32k window gets them unclamped.
+    effort_ceiling: &'static str,
 }
 
 impl HwPreset {
@@ -2706,34 +3102,62 @@ impl HwPreset {
             "4gb" | "4" => Self {
                 ctx_default: 16384, ctx_hard_max: 16384, cache_type: "q8_0",
                 parallel_slots: 1, default_ngl: -1, embed_ctx: 2048, embed_parallel: 1, embed_ngl: 0,
-                slim_tools: true,
+                slim_tools: true, effort_ceiling: "medium",
             },
             "8gb" | "8" => Self {
                 ctx_default: 32768, ctx_hard_max: 32768, cache_type: "q8_0",
-                parallel_slots: 1, default_ngl: -1, embed_ctx: 4096, embed_parallel: 2, embed_ngl: 99,
-                slim_tools: false,
+                // embed_ngl: 0 — the embedder runs on CPU here, same as the
+                // tighter tiers. This IS a compromise, and a deliberate one.
+                //
+                // On this box (RTX 5070 Laptop, 24 logical cores), embedding
+                // 128 real code chunks: GPU at batch 512 runs 24.8 chunks/s,
+                // CPU 2.9 — the GPU is an order of magnitude faster, and no
+                // amount of thread tuning closes it (CPU peaks at 2.9 across
+                // batch 256..2048 and 12..24 threads).
+                //
+                // It still loses, because the VRAM it needs comes straight
+                // out of the main model's offload. Reserving 1.4 GiB drops a
+                // 9B Q4 from 32 layers to 26, and that measured 13.26 -> 5.44
+                // tok/s of generation: a 59% cut to every token of every
+                // answer, to speed up work that is bursty, backgrounded, and
+                // already invisible to the user. Set [embed] gpu_layers
+                // explicitly to take the other side of that trade.
+                parallel_slots: 1, default_ngl: -1, embed_ctx: 4096, embed_parallel: 2, embed_ngl: 0,
+                slim_tools: false, effort_ceiling: "spoon",
             },
             "cpu" | "none" => Self {
                 ctx_default: 8192, ctx_hard_max: 16384, cache_type: "q8_0",
                 parallel_slots: 1, default_ngl: 0, embed_ctx: 2048, embed_parallel: 2, embed_ngl: 0,
-                slim_tools: true,
+                slim_tools: true, effort_ceiling: "low",
             },
             _ => {
                 // Unrecognized tag: fall back on GPU presence.
                 if gpu_present {
                     Self { ctx_default: 16384, ctx_hard_max: 32768, cache_type: "q8_0",
                            parallel_slots: 1, default_ngl: -1, embed_ctx: 4096, embed_parallel: 2, embed_ngl: 99,
-                           slim_tools: false }
+                           slim_tools: false, effort_ceiling: "xhigh" }
                 } else {
                     Self { ctx_default: 8192, ctx_hard_max: 16384, cache_type: "q8_0",
                            parallel_slots: 1, default_ngl: 0, embed_ctx: 2048, embed_parallel: 2, embed_ngl: 0,
-                           slim_tools: true }
+                           slim_tools: true, effort_ceiling: "low" }
                 }
             }
         }
     }
 }
 
+
+/// Per-token KV-cache cost (MiB), K+V summed across layers, with a small
+/// margin for context-scaling compute buffers. Realistic for GQA 4-8B models —
+/// deliberately not paranoid, so cards keep the context they can actually hold.
+fn kv_mib_per_token(cache_type: &str) -> f64 {
+    match cache_type {
+        "f16" | "" => 0.065,
+        "q8_0"     => 0.035,
+        "q4_0" | "q4_1" | "q5_0" | "q5_1" => 0.020,
+        _ => 0.035,
+    }
+}
 
 /// On-disk GGUF size (MiB) — the model's total weight footprint.
 fn weight_mib(path: &str) -> u64 {
@@ -2807,6 +3231,23 @@ fn gguf_block_count(path: &str) -> Option<u32> {
 }
 
 
+/// VRAM footprint of the offloaded portion: (weight MiB on GPU, KV scale in
+/// (0,1]). Under partial `-ngl`, only `ngl/block_count` of the weights and KV
+/// live on the GPU; full offload (`ngl < 0`) or unknown layout ⇒ whole model.
+fn vram_footprint(path: &str, ngl: i32) -> (u64, f64) {
+    let file_mib = weight_mib(path);
+    if ngl < 0 { return (file_mib, 1.0); }             // all layers offloaded
+    match gguf_block_count(path) {
+        Some(total) if total > 0 => {
+            let off = (ngl as u32).min(total);
+            let frac = (off as f64 / total as f64).clamp(0.0, 1.0);
+            let weight = ((file_mib as f64) * frac) as u64;
+            (weight, frac.max(1.0 / total as f64))     // ≥ one layer's share
+        }
+        _ => (file_mib, 1.0),                           // unknown: conservative
+    }
+}
+
 /// A complete, self-consistent launch plan. `ngl` is planned too: on tight
 /// tiers, shrinking context alone cannot prevent an OOM when the requested
 /// offload's weights exceed free VRAM — the offload itself must be sized.
@@ -2853,58 +3294,98 @@ fn plan_launch(
         };
     };
 
-    // ── Phase 1: plan the offload.
+    // ── Phase 1: the offload ceiling.
+    // The most layers the weights can occupy while still leaving room for a
+    // minimal f16 window. This is a ceiling, not the answer — see Phase 2.
     let file_mib = weight_mib(model_path);
     let min_kv = (kv_mib_per_token("f16") * MIN_CTX as f64).ceil() as u64;
     let weight_budget = (free as i64) - HEADROOM_MIB as i64 - embed_reserve_mib as i64 - min_kv as i64;
 
-    let ngl = match gguf_block_count(model_path) {
-        Some(total) if total > 0 && file_mib > 0 => {
-            let per_layer = (file_mib as f64 / total as f64).max(1e-6);
-            let fits = ((weight_budget.max(0) as f64) / per_layer) as i64;
-            let fits = fits.clamp(0, total as i64) as u32;
-            let want = if requested_ngl < 0 { total } else { (requested_ngl as u32).min(total) };
-            let eff = want.min(fits);
-            if eff < want {
-                eprintln!("[plan] VRAM caps offload: {want} → {eff} of {total} layers \
-                           ({file_mib} MiB model, {free} MiB free)");
-            }
-            if requested_ngl < 0 && eff == total { -1 } else { eff as i32 }
+    // Size the context for a given offload. `off` is a real layer count;
+    // kv_scale is the fraction of KV that lands on the GPU alongside it.
+    let size_ctx = |ngl: i32, weight: u64, kv_scale: f64| -> LaunchPlan {
+        let budget_mib = (free as i64) - weight as i64 - HEADROOM_MIB as i64 - embed_reserve_mib as i64;
+        if budget_mib <= 0 {
+            // Below MIN_CTX headroom: run the smallest window on f16 KV (FA off).
+            return LaunchPlan { ngl, ctx: MIN_CTX, flash_attn: false, cache_type: "" };
         }
+        let fit = |rate: f64| -> u32 {
+            let per = (rate * kv_scale).max(1e-6);
+            let c = ((budget_mib as f64 / per) as u64 / 1024) * 1024;   // → 1024 boundary
+            (c as u32).clamp(MIN_CTX, hard_max)
+        };
+        // Pass 1: quantized KV (lighter) assuming FA on.
+        let c_quant = fit(kv_mib_per_token(preset.cache_type));
+        if c_quant >= FA_CTX_THRESHOLD {
+            return LaunchPlan { ngl, ctx: c_quant, flash_attn: true, cache_type: preset.cache_type };
+        }
+        // Pass 2: below FA threshold ⇒ FA off ⇒ f16 KV required (heavier).
+        let c_f16 = fit(kv_mib_per_token("f16"));
+        LaunchPlan { ngl, ctx: c_f16, flash_attn: false, cache_type: "" }
+    };
+
+    let Some(total) = gguf_block_count(model_path).filter(|t| *t > 0 && file_mib > 0) else {
         // Layer layout unknown: either the whole model fits, or none of it does.
-        _ => {
-            if (file_mib as i64) <= weight_budget {
-                requested_ngl
-            } else {
-                eprintln!("[plan] model ({file_mib} MiB) exceeds VRAM budget \
-                           ({free} MiB free) and layer layout is unknown — CPU inference");
-                0
-            }
+        let ngl = if (file_mib as i64) <= weight_budget {
+            requested_ngl
+        } else {
+            eprintln!("[plan] model ({file_mib} MiB) exceeds VRAM budget \
+                       ({free} MiB free) and layer layout is unknown — CPU inference");
+            0
+        };
+        let (weight, kv_scale) = vram_footprint(model_path, ngl);
+        return size_ctx(ngl, weight, kv_scale);
+    };
+
+    let per_layer = (file_mib as f64 / total as f64).max(1e-6);
+    let fits = ((weight_budget.max(0) as f64) / per_layer) as i64;
+    let ceiling = fits.clamp(0, total as i64) as u32;
+    let want = if requested_ngl < 0 { total } else { (requested_ngl as u32).min(total) };
+    let max_off = want.min(ceiling);
+    if max_off < want {
+        eprintln!("[plan] VRAM caps offload: {want} → {max_off} of {total} layers \
+                   ({file_mib} MiB model, {free} MiB free)");
+    }
+
+    // ── Phase 2: pick the offload that actually leaves a usable window.
+    //
+    // Sizing the offload greedily and only THEN asking what context fits is
+    // how a 32k-capable model ends up launching at 2048: the last layer or
+    // two of a full offload eats the entire KV budget, and the context
+    // collapses to the floor. The relationship is a cliff, not a slope —
+    // measured on a 6512 MiB / 32-layer model with ~7.2 GiB free, 32 layers
+    // yields 2048 tokens while 31 layers yields 10240. One layer on the CPU
+    // buys 5× the window.
+    //
+    // So walk the offload DOWN from the ceiling and take the first (largest)
+    // one whose context clears ctx_floor. Nothing clears it ⇒ keep the
+    // ceiling, i.e. the previous behaviour — this only ever trades offload
+    // for a window that is actually better, and never silently falls back to
+    // CPU inference.
+    let ctx_floor = FA_CTX_THRESHOLD.min(hard_max);
+    let plan_at = |off: u32| -> LaunchPlan {
+        let frac = (off as f64 / total as f64).clamp(0.0, 1.0);
+        let weight = ((file_mib as f64) * frac) as u64;
+        // ≥ one layer's share: KV never prices at zero while layers are resident.
+        let kv_scale = frac.max(1.0 / total as f64);
+        let ngl = if requested_ngl < 0 && off == total { -1 } else { off as i32 };
+        size_ctx(ngl, weight, kv_scale)
+    };
+
+    let top = plan_at(max_off);
+    if top.ctx >= ctx_floor || max_off == 0 {
+        return top;
+    }
+    for off in (1..max_off).rev() {
+        let p = plan_at(off);
+        if p.ctx >= ctx_floor {
+            eprintln!("[plan] offload {max_off} → {off} of {total} layers: ctx {} → {} \
+                       (a full offload leaves no room for the KV cache)",
+                top.ctx, p.ctx);
+            return p;
         }
-    };
-
-    // ── Phase 2: size the context for the planned offload.
-    let (weight, kv_scale) = vram_footprint(model_path, ngl);
-    let budget_mib = (free as i64) - weight as i64 - HEADROOM_MIB as i64 - embed_reserve_mib as i64;
-    if budget_mib <= 0 {
-        // Below MIN_CTX headroom: run the smallest window on f16 KV (FA off).
-        return LaunchPlan { ngl, ctx: MIN_CTX, flash_attn: false, cache_type: "" };
     }
-
-    let fit = |rate: f64| -> u32 {
-        let per = (rate * kv_scale).max(1e-6);
-        let c = ((budget_mib as f64 / per) as u64 / 1024) * 1024;   // → 1024 boundary
-        (c as u32).clamp(MIN_CTX, hard_max)
-    };
-
-    // Pass 1: quantized KV (lighter) assuming FA on.
-    let c_quant = fit(kv_mib_per_token(preset.cache_type));
-    if c_quant >= FA_CTX_THRESHOLD {
-        return LaunchPlan { ngl, ctx: c_quant, flash_attn: true, cache_type: preset.cache_type };
-    }
-    // Pass 2: below FA threshold ⇒ FA off ⇒ f16 KV required (heavier).
-    let c_f16 = fit(kv_mib_per_token("f16"));
-    LaunchPlan { ngl, ctx: c_f16, flash_attn: false, cache_type: "" }
+    top
 }
 
 /// Flash attention is derived from the planned context, never configured.
@@ -2961,6 +3442,14 @@ fn probe_ram() -> (u64, u64) { (0, 0) }
 // ── Shared state ────────────────────────────────────────────
 
 struct State {
+    /// The directory the agent works in.
+    workspace: Workspace,
+    /// Per-file record of what the model has been shown and what has been
+    /// embedded, keyed by absolute path. Serves two jobs that would otherwise
+    /// each need their own bookkeeping: suppressing re-reads of bytes already
+    /// in context, and telling the model which parts of a file are searchable
+    /// versus still unseen.
+    files: std::collections::HashMap<String, FileLedger>,
     cfg: RuntimeCfg,
     models: Vec<Model>,
     llama: ManagedServer,
@@ -3047,6 +3536,7 @@ struct LoadReq {
     #[serde(default)] top_k: Option<u32>,
     #[serde(default)] top_p: Option<f32>,
     #[serde(default)] repeat_penalty: Option<f32>,
+    #[serde(default)] reasoning_effort: Option<String>,
     #[serde(default)] draft_model: Option<String>,
     #[serde(default)] spec_type: Option<String>,
     #[serde(default)] spec_draft_n_max: Option<u32>,
@@ -3059,6 +3549,9 @@ struct ParamsReq {
     #[serde(default)] top_k: Option<u32>,
     #[serde(default)] top_p: Option<f32>,
     #[serde(default)] repeat_penalty: Option<f32>,
+    /// Effort tag, or "" to clear it. Applies to the NEXT turn — no reload
+    /// needed, since the tag travels in the request, not on the command line.
+    #[serde(default)] reasoning_effort: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3151,7 +3644,10 @@ fn main() {
     // Embed server sizing is preset-derived: a small model, always fully
     // offloaded, with a tier-appropriate context.
     let mut embed_cfg = file_cfg.embed.clone();
-    embed_cfg.gpu_layers = preset.embed_ngl;       // 0 = CPU on tight cards
+    // The tier decides unless the user said otherwise: embedding on the GPU
+    // is far faster but is paid for out of the main model's offload, and only
+    // the person running it knows which they want (see HwPreset).
+    if embed_cfg.gpu_layers < 0 { embed_cfg.gpu_layers = preset.embed_ngl; }
     embed_cfg.context_size = preset.embed_ctx;
     embed_cfg.parallel_slots = preset.embed_parallel;
     let embed_enabled = embed_cfg.enabled && !embed_cfg.model.is_empty();
@@ -3217,6 +3713,8 @@ fn main() {
         top_k: file_cfg.defaults.top_k,
         top_p: file_cfg.defaults.top_p,
         repeat_penalty: file_cfg.defaults.repeat_penalty,
+        reasoning_effort: clamp_effort(&file_cfg.defaults.reasoning_effort, preset.effort_ceiling),
+        effort_native: false,
         cache_type_k: preset.cache_type.into(),
         cache_type_v: preset.cache_type.into(),
         draft_model: String::new(),
@@ -3239,7 +3737,15 @@ fn main() {
     // so a review-only session never pays its VRAM/startup cost.
     if !models.is_empty() && llama_ok {
         let target = if !file_cfg.defaults.model.is_empty() {
-            models.iter().find(|m| m.filename == file_cfg.defaults.model)
+            let found = models.iter().find(|m| m.filename == file_cfg.defaults.model);
+            if found.is_none() {
+                // Silently loading nothing looks identical to a server that
+                // failed to start — name the typo instead.
+                eprintln!("  WARNING: [defaults] model '{}' is not in {}/ — \
+                           no model auto-loaded (filenames are case-sensitive)",
+                    file_cfg.defaults.model, file_cfg.defaults.models_dir);
+            }
+            found
         } else {
             Some(&models[0])
         };
@@ -3254,8 +3760,9 @@ fn main() {
             }
         }
     }
-    if file_cfg.embed.enabled && !file_cfg.embed.model.is_empty() {
-        eprintln!("  embed-server: lazy (starts on first RAG use)");
+    let embed_eager = file_cfg.embed.enabled && !file_cfg.embed.model.is_empty();
+    if embed_eager {
+        eprintln!("  embed-server: starting in background");
     }
 
     let rag = RagStore::new(file_cfg.rag);
@@ -3289,18 +3796,44 @@ fn main() {
 
     let workspace = Workspace::load(&file_cfg.workspace);
     if !workspace.manifest.path.is_empty() {
-        eprintln!(
-            "  workspace: {} ({} files in warm index)",
-            workspace.manifest.path,
-            workspace.manifest.files.len()
-        );
+        eprintln!("  workspace: {}", workspace.manifest.path);
     }
     let shared: Shared = Arc::new(Mutex::new(State {
+        workspace,
+        files: std::collections::HashMap::new(),
         cfg, models, llama, embed, rag,
         tools: tool_runtime,
         tools_workspace: file_cfg.tools.workspace,
         sys_info, tokens_session: 0, requests: 0,
     }));
+    // The autoloaded model blocks on wait_ready rather than going through
+    // poll_until_ready, so its effort channel is resolved here instead. A
+    // no-op when the model failed to start or declares no effort.
+    probe_effort_channel(&shared);
+
+    // Bring the embed server up eagerly, off the critical path.
+    //
+    // It used to wait for the first RAG call, back when it offloaded to the
+    // GPU and holding VRAM through a session that never indexed anything was
+    // pure waste. Pinned to the CPU (`--device none`) it costs no VRAM at
+    // all, so the only thing deferral still bought was a ~25s stall in front
+    // of the user's first query. Paying it here instead means the HTTP server
+    // is already serving while the model loads.
+    //
+    // ensure_embed_ready is idempotent and only spawns when the server is not
+    // already active, so a RAG request arriving mid-start waits on this one
+    // rather than racing a second process onto the same port. A failure here
+    // is not fatal: the status line reports it and the next RAG call retries.
+    if embed_eager {
+        let bg = Arc::clone(&shared);
+        std::thread::spawn(move || {
+            let t0 = Instant::now();
+            match ensure_embed_ready(&bg) {
+                Ok(()) => eprintln!("[embed] ready in {:.1}s", t0.elapsed().as_secs_f64()),
+                Err(e) => eprintln!("[embed] eager start failed: {e} — retrying on first RAG use"),
+            }
+        });
+    }
 
     for stream in listener.incoming().flatten() {
         let st = Arc::clone(&shared);
@@ -3319,6 +3852,21 @@ fn apply_model_params(cfg: &mut RuntimeCfg, m: &Model) {
     cfg.top_k = m.top_k;
     cfg.top_p = m.top_p;
     cfg.repeat_penalty = m.repeat_penalty;
+    let want = m.reasoning_effort.trim();
+    cfg.reasoning_effort = clamp_effort(want, cfg.preset.effort_ceiling);
+    if !want.is_empty() {
+        if cfg.reasoning_effort.is_empty() {
+            eprintln!("[llama]   WARNING: unknown reasoning_effort '{want}' — ignored \
+                       (expected low|medium|xhigh|einstein|spoon, optionally i-prefixed)");
+        } else if !cfg.reasoning_effort.eq_ignore_ascii_case(want) {
+            eprintln!("[llama]   reasoning_effort '{want}' clamped to '{}' — this tier's \
+                       context can't hold a stronger mode's thinking block",
+                cfg.reasoning_effort);
+        }
+    }
+    // Re-resolved by probe_effort_channel once THIS model's server is ready;
+    // the previous model's template says nothing about this one's.
+    cfg.effort_native = false;
     cfg.spec_type = m.spec_type.clone();
     cfg.spec_draft_n_max = m.spec_draft_n_max;
     cfg.draft_model = m.draft_model.clone();
@@ -3390,7 +3938,6 @@ fn serve(mut stream: TcpStream, st: &Shared) {
         // RAG endpoints
         ("GET", "/api/workspace/status") => respond_json(&mut stream, &handle_workspace_status(st)),
         ("POST", "/api/workspace/set")   => respond_json(&mut stream, &handle_workspace_set(st, &body)),
-        ("POST", "/api/workspace/index") => respond_json(&mut stream, &handle_workspace_index(st, &body)),
         ("POST", "/api/workspace/browse") => respond_json(&mut stream, &handle_workspace_browse(&body)),
 
         ("GET", "/api/rag/status")   => respond_json(&mut stream, &handle_rag_status(st)),
@@ -3444,6 +3991,12 @@ fn handle_models(st: &Shared) -> serde_json::Value {
             "ngl": s.cfg.ngl, "ctx": s.cfg.ctx, "flash_attn": s.cfg.flash_attn,
             "temp": s.cfg.temp, "top_k": s.cfg.top_k, "top_p": s.cfg.top_p,
             "repeat_penalty": s.cfg.repeat_penalty,
+            "reasoning_effort": s.cfg.reasoning_effort,
+            // Which channel carries the tag, and how far this tier lets it go —
+            // the UI needs both to explain a clamped or inert selection.
+            "effort_native": s.cfg.effort_native,
+            "effort_ceiling": s.cfg.preset.effort_ceiling,
+            "effort_modes": EFFORT_MODES,
         },
         "embed": s.embed.status_json(),
         "rag": s.rag.status_json(),
@@ -3509,6 +4062,9 @@ fn handle_load(st: &Shared, body: &str) -> serde_json::Value {
     if let Some(v) = req.top_k { cfg.top_k = v; }
     if let Some(v) = req.top_p { cfg.top_p = v; }
     if let Some(v) = req.repeat_penalty { cfg.repeat_penalty = v; }
+    if let Some(v) = req.reasoning_effort {
+        cfg.reasoning_effort = clamp_effort(&v, cfg.preset.effort_ceiling);
+    }
     if let Some(v) = req.draft_model { cfg.draft_model = v; }
     if let Some(v) = req.spec_type { cfg.spec_type = v; }
     if let Some(v) = req.spec_draft_n_max { cfg.spec_draft_n_max = v; }
@@ -3550,7 +4106,24 @@ fn handle_params(st: &Shared, body: &str) -> serde_json::Value {
     if let Some(v) = req.top_k { s.cfg.top_k = v; }
     if let Some(v) = req.top_p { s.cfg.top_p = v; }
     if let Some(v) = req.repeat_penalty { s.cfg.repeat_penalty = v; }
-    serde_json::json!({"ok": true})
+    if let Some(v) = req.reasoning_effort {
+        // "" is a real value here (clear the tag); anything else must parse,
+        // or the caller gets told rather than having their typo dropped into
+        // the prompt as a literal {REASON:xhgih}.
+        if v.trim().is_empty() {
+            s.cfg.reasoning_effort = String::new();
+        } else if parse_effort(&v).is_none() {
+            return serde_json::json!({
+                "error": format!("unknown reasoning_effort '{v}' — expected one of {} \
+                                  (prefix with 'i' for instruct/no-thinking)",
+                    EFFORT_MODES.join(", "))
+            });
+        } else {
+            let ceiling = s.cfg.preset.effort_ceiling;
+            s.cfg.reasoning_effort = clamp_effort(&v, ceiling);
+        }
+    }
+    serde_json::json!({"ok": true, "reasoning_effort": s.cfg.reasoning_effort})
 }
 
 // ── Embed server handlers ───────────────────────────────────
@@ -3625,6 +4198,101 @@ fn handle_embed_prefixes(st: &Shared, body: &str) -> serde_json::Value {
 
 // ── RAG Handlers ────────────────────────────────────────────
 
+// ── Server-side workspace ───────────────────────────────────
+
+fn handle_workspace_status(st: &Shared) -> serde_json::Value {
+    let s = st.lock().unwrap();
+    let code_chunks = s.rag.chunks.iter().filter(|c| c.domain == "code").count();
+    serde_json::json!({
+        "path": s.workspace.manifest.path,
+        // Files the model has read (and therefore made searchable) this
+        // session — nothing is indexed until it asks for it.
+        "auto_indexed": s.files.values().filter(|f| f.indexed).count(),
+        "code_chunks": code_chunks,
+    })
+}
+
+/// Canonical path without Windows' verbatim `\\?\` prefix (unusable in
+/// shell commands and ugly in the UI).
+fn clean_path(p: &Path) -> String {
+    let s = p.to_string_lossy().to_string();
+    s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
+}
+
+#[derive(Deserialize)]
+struct WorkspaceSetReq {
+    path: String,
+}
+
+fn handle_workspace_set(st: &Shared, body: &str) -> serde_json::Value {
+    let req: WorkspaceSetReq = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => return serde_json::json!({"error": e.to_string()}),
+    };
+    let canon = match fs::canonicalize(req.path.trim()) {
+        Ok(p) if p.is_dir() => clean_path(&p),
+        Ok(_) => return serde_json::json!({"error": "path is not a directory"}),
+        Err(e) => return serde_json::json!({"error": format!("bad path: {e}")}),
+    };
+    let mut s = st.lock().unwrap();
+    if s.workspace.manifest.path != canon {
+        // Switching repos: the ledger described the old tree.
+        s.files.clear();
+    }
+    s.workspace.manifest.path = canon.clone();
+    // One workspace, one meaning. This used to set only the manifest path,
+    // while the filesystem tools stayed rooted at [tools] workspace — so
+    // picking a folder in the UI changed nothing about where the model could
+    // actually look, and the fs tools kept refusing against an empty root.
+    s.tools_workspace = canon.clone();
+    if let Err(e) = s.workspace.save() {
+        eprintln!("[workspace] manifest save: {e}");
+    }
+    serde_json::json!({"ok": true, "path": canon})
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct WorkspaceBrowseReq {
+    path: String,
+}
+
+/// Server-side directory listing for the UI's folder picker. Browsers can't
+/// hand over absolute paths, and uploading a repo defeats the point of a
+/// server-side workspace — so the UI navigates the server's own filesystem.
+/// (Same trust level as the agentic tool loop, which already runs shell.)
+fn handle_workspace_browse(body: &str) -> serde_json::Value {
+    let req: WorkspaceBrowseReq = serde_json::from_str(body).unwrap_or_default();
+    let start = if req.path.trim().is_empty() {
+        std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| "/".into())
+    } else {
+        req.path.trim().to_string()
+    };
+    let canon = match fs::canonicalize(&start) {
+        Ok(p) if p.is_dir() => p,
+        _ => return serde_json::json!({"error": format!("not a directory: {start}")}),
+    };
+    let mut dirs: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&canon) {
+        for e in entries.flatten() {
+            let Ok(ft) = e.file_type() else { continue };
+            let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
+            if ft.is_dir() && !name.starts_with('.') {
+                dirs.push(name);
+            }
+        }
+    }
+    dirs.sort_by_key(|a| a.to_lowercase());
+    serde_json::json!({
+        "path": clean_path(&canon),
+        "parent": canon.parent().map(clean_path),
+        "dirs": dirs,
+        "is_git": canon.join(".git").exists(),
+    })
+}
+
 fn handle_rag_status(st: &Shared) -> serde_json::Value {
     let s = st.lock().unwrap();
     let mut status = s.rag.status_json();
@@ -3641,10 +4309,11 @@ fn index_files(st: &Shared, files: &[FileEntry], domain: &str) -> Result<(usize,
     ensure_embed_ready(st)?;
 
     // Phase 1: lock briefly to read config
-    let (endpoint, code_doc_prefix, chunk_size, chunk_overlap, chunker_tool) = {
+    let (endpoint, code_doc_prefix, chunk_size, chunk_overlap, chunker_tool, max_per_file) = {
         let s = st.lock().unwrap();
         (s.cfg.embedding_endpoint(), s.cfg.embed.doc_prefix.clone(),
-         s.rag.cfg.chunk_size, s.rag.cfg.chunk_overlap, s.rag.cfg.chunker_tool.clone())
+         s.rag.cfg.chunk_size, s.rag.cfg.chunk_overlap, s.rag.cfg.chunker_tool.clone(),
+         s.rag.cfg.max_chunks_per_file)
     };
     // Lock released here
 
@@ -3664,6 +4333,34 @@ fn index_files(st: &Shared, files: &[FileEntry], domain: &str) -> Result<(usize,
     if chunks.is_empty() {
         return Err("no chunks produced from files".into());
     }
+
+    // Enforce the per-file ceiling BEFORE embedding: the chunks we drop are
+    // the ones we would otherwise pay to embed and then store. Applied per
+    // file rather than to the batch, so indexing several files together
+    // cannot let one of them consume another's allowance.
+    let chunks = if max_per_file > 0 {
+        let mut kept: Vec<Chunk> = Vec::with_capacity(chunks.len());
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut trimmed: Vec<(String, usize)> = Vec::new();
+        for c in chunks {
+            let n = seen.entry(c.file.clone()).or_insert(0);
+            *n += 1;
+            if *n <= max_per_file {
+                kept.push(c);
+            } else if *n == max_per_file + 1 {
+                trimmed.push((c.file.clone(), 0));
+            }
+        }
+        for (file, _) in &trimmed {
+            let total = seen.get(file).copied().unwrap_or(0);
+            eprintln!("[rag] {file}: {total} chunks exceeds max_chunks_per_file={max_per_file} \
+                       — indexed the first {max_per_file}, {} not indexed",
+                total - max_per_file);
+        }
+        kept
+    } else {
+        chunks
+    };
 
     // Domain-appropriate document embedding prefix.
     let doc_prefix = if domain == "text" { TEXT_DOC_PREFIX } else { code_doc_prefix.as_str() };
@@ -4101,20 +4798,289 @@ fn stream_completion(
 /// System-prompt addendum for agentic mode. The tool DECLARATIONS are
 /// appended by streamer-server itself (per-request `tools` flag); this note
 /// only frames the task and hands the model its workspace root.
+/// What the model has already been shown of a file, and whether it is
+/// embedded. Session-scoped: the RAG store persists across restarts, but a
+/// file may change while the server is down, so a fresh process re-verifies
+/// by hash rather than trusting a remembered one.
+#[derive(Default, Clone)]
+struct FileLedger {
+    /// Content hash at the time of the last read. A file that changes
+    /// invalidates everything below it — the model has to see it again.
+    hash: u64,
+    total_lines: u64,
+    /// 1-based inclusive line ranges already returned to the model,
+    /// kept merged and sorted.
+    read: Vec<(u64, u64)>,
+    indexed: bool,
+}
+
+/// Merge overlapping/adjacent ranges, tolerating gaps of up to `tol` lines.
+///
+/// `tol = 0` is exact coverage, used for what the model has actually been
+/// shown. A larger tolerance is for DISPLAY of indexed spans: the chunker
+/// emits one chunk per symbol and leaves a line or two between them, so exact
+/// spans render as "1-10, 13-32, 34-36, 38-76, …" — a dozen fragments whose
+/// gaps mean nothing to the model and which cost more tokens to print than
+/// the answer they support.
+fn merge_with_tol(mut rs: Vec<(u64, u64)>, tol: u64) -> Vec<(u64, u64)> {
+    if rs.is_empty() { return rs; }
+    rs.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(rs.len());
+    for (a, b) in rs {
+        match out.last_mut() {
+            // `a <= last.1 + 1 + tol` merges touching ranges too: 1-100 and
+            // 101-200 describe one contiguous read, and saying so is the point.
+            Some(last) if a <= last.1.saturating_add(1 + tol) => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
+}
+
+/// Exact merge — no gap is bridged. Used for read coverage, where claiming a
+/// line was shown when it was not would suppress a page the model never saw.
+fn merge_ranges(rs: Vec<(u64, u64)>) -> Vec<(u64, u64)> { merge_with_tol(rs, 0) }
+
+/// Lines between chunks that the chunker simply did not emit a chunk for.
+const INDEXED_SPAN_GAP_TOL: u64 = 6;
+
+/// True when every line in `want` already appears in `have`.
+fn covers(have: &[(u64, u64)], want: (u64, u64)) -> bool {
+    let mut cursor = want.0;
+    for &(a, b) in have {
+        if a > cursor { return false; }
+        if b >= cursor { cursor = b + 1; }
+        if cursor > want.1 { return true; }
+    }
+    cursor > want.1
+}
+
+/// The gaps in `have` within 1..=total — the parts the model has not seen.
+fn gaps(have: &[(u64, u64)], total: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut cursor = 1u64;
+    for &(a, b) in have {
+        if a > cursor { out.push((cursor, a - 1)); }
+        cursor = cursor.max(b + 1);
+    }
+    if cursor <= total { out.push((cursor, total)); }
+    out
+}
+
+fn fmt_ranges(rs: &[(u64, u64)]) -> String {
+    rs.iter()
+        .map(|(a, b)| if a == b { a.to_string() } else { format!("{a}-{b}") })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The 1-based line span a read_file result actually printed.
+///
+/// Taken from the output's own line numbers rather than from the offset/limit
+/// arguments: the tool caps a page on a byte budget as well as a line count,
+/// so what was asked for and what was shown routinely differ.
+fn shown_span(output: &str) -> Option<(u64, u64)> {
+    let nums: Vec<u64> = output
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .filter_map(|(n, _)| n.trim().parse::<u64>().ok())
+        .collect();
+    match (nums.first(), nums.last()) {
+        (Some(a), Some(b)) => Some((*a, *b)),
+        _ => None,
+    }
+}
+
+/// Line spans of this file already embedded in the RAG store.
+///
+/// Both chunkers end a chunk's `source` with `:START-END` (the external one
+/// inserts kind and symbol name before it), so the spans are recoverable from
+/// the store itself — no parallel bookkeeping to drift out of step.
+fn indexed_spans(rag: &RagStore, file: &str) -> Vec<(u64, u64)> {
+    let spans: Vec<(u64, u64)> = rag.chunks.iter()
+        .filter(|c| c.file == file)
+        .filter_map(|c| {
+            let tail = c.source.rsplit(':').next()?;
+            let (a, b) = tail.split_once('-')?;
+            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+        })
+        .collect();
+    merge_with_tol(spans, INDEXED_SPAN_GAP_TOL)
+}
+
+fn hash_str(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// The path a `read_file` call names.
+///
+/// `normalize_args` hands back the arguments object UNWRAPPED — the keys sit
+/// at the top level, not under an "arguments" key — and the fs tools accept
+/// either spelling of the path. Reading the nested shape here silently found
+/// nothing and auto-indexing never fired, with no error to show for it.
+fn read_path_arg(args: &serde_json::Value) -> Option<&str> {
+    args["file_path"].as_str().or_else(|| args["path"].as_str())
+}
+
+/// Post-process a `read_file` result against the session ledger.
+///
+/// Two jobs, both about not spending context twice:
+///
+///  - A re-read of lines already in the transcript is replaced with a
+///    pointer. A paginating model re-reads constantly, and every repeat pays
+///    full price in prompt tokens for bytes the model can already see.
+///  - Whatever IS returned gets a footer saying which parts of the file are
+///    searchable and which have never been read, so the model can choose
+///    `rag_search` or a targeted offset instead of paging blindly.
+///
+/// Returns the output to show. A changed file resets the ledger: the lines
+/// the model saw before are not the lines on disk now.
+fn apply_read_ledger(st: &Shared, root: Option<&Path>, rel: &str, output: String) -> String {
+    let Some(path) = root.map(|r| r.join(rel)) else { return output };
+    let Some(span) = shown_span(&output) else { return output };
+    let key = path.to_string_lossy().to_string();
+    let Ok(content) = fs::read_to_string(&path) else { return output };
+    let hash = hash_str(&content);
+    let total = content.lines().count() as u64;
+
+    let mut s = st.lock().unwrap();
+    let rag_enabled = s.rag.cfg.enabled && s.cfg.embed.enabled;
+    let spans = if rag_enabled { indexed_spans(&s.rag, &key) } else { Vec::new() };
+    let led = s.files.entry(key.clone()).or_default();
+    if led.hash != hash {
+        // Changed on disk since we last looked: nothing remembered applies.
+        *led = FileLedger { hash, total_lines: total, ..Default::default() };
+    }
+    led.total_lines = total;
+
+    let already_seen = covers(&led.read, span);
+    led.read = merge_ranges([led.read.clone(), vec![span]].concat());
+    let unread = gaps(&led.read, total);
+    let read_summary = fmt_ranges(&led.read);
+
+    if already_seen {
+        eprintln!("[rag] read_file {rel}: lines {}-{} already in context — \
+                   sent a pointer instead of {} bytes", span.0, span.1, output.len());
+        // The bytes are already in the transcript above; re-sending them buys
+        // nothing and costs the whole page.
+        let mut note = format!(
+            "[read_file: lines {}-{} of {rel} are unchanged and already in this \
+             conversation above — not repeated here. Read so far: {read_summary} of {total} lines.",
+            span.0, span.1,
+        );
+        if !spans.is_empty() {
+            note.push_str(&format!(
+                " Indexed and searchable with rag_search: lines {}.",
+                fmt_ranges(&spans)
+            ));
+        }
+        if unread.is_empty() {
+            note.push_str(" The whole file has been read.]");
+        } else {
+            note.push_str(&format!(
+                " Not yet read: lines {}. Pass offset={} to continue.]",
+                fmt_ranges(&unread), unread[0].0
+            ));
+        }
+        return note;
+    }
+
+    let mut footer = String::new();
+    if !spans.is_empty() {
+        footer.push_str(&format!(
+            "\n[rag: lines {} of {rel} are indexed — searchable with rag_search]",
+            fmt_ranges(&spans)
+        ));
+    }
+    if !unread.is_empty() {
+        footer.push_str(&format!(
+            "\n[unread: lines {} of {rel} have not been read; offset={} continues]",
+            fmt_ranges(&unread), unread[0].0
+        ));
+    }
+    eprintln!("[rag] read_file {rel}: showed {}-{}, read {}/{total} lines, indexed {}",
+        span.0, span.1,
+        led.read.iter().map(|(a, b)| b - a + 1).sum::<u64>(),
+        if spans.is_empty() { "nothing yet".to_string() } else { fmt_ranges(&spans) });
+    if footer.is_empty() { output } else { output + &footer }
+}
+
+/// Embed a file the model just read, so later turns can retrieve it by
+/// meaning instead of spending tool rounds re-reading it.
+///
+/// Read-triggered rather than bulk: indexing a whole repo up front embeds
+/// thousands of chunks the conversation will never ask about — a 27-file
+/// crate measured 1019 — while the model, which has already grepped and
+/// globbed its way to the handful of files that matter, is the one thing in
+/// the system that actually knows what is relevant.
+///
+/// Off the tool loop, because embedding costs seconds on a CPU-hosted
+/// embedder and the model should not wait on it to finish a turn. The
+/// consequence is deliberate and worth stating: a file read in this turn
+/// becomes searchable for the NEXT one, not the current one. That is the
+/// right trade — the model already has the file's contents in context this
+/// turn; retrieval is what saves it from re-reading later.
+fn spawn_auto_index(st: &Shared, root: Option<&Path>, rel: &str) {
+    let Some(path) = root.map(|r| r.join(rel)) else { return };
+    let key = path.to_string_lossy().to_string();
+    let bg = Arc::clone(st);
+    std::thread::spawn(move || {
+        let Ok(content) = fs::read_to_string(&path) else { return };
+        if content.trim().is_empty() { return; }
+        let hash = hash_str(&content);
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| key.clone());
+
+        // Claim the file before embedding: two tool rounds reading the same
+        // path would otherwise both pass the check and embed it twice.
+        {
+            let mut s = bg.lock().unwrap();
+            if !s.rag.cfg.enabled || !s.cfg.embed.enabled { return; }
+            let led = s.files.entry(key.clone()).or_default();
+            if led.indexed && led.hash == hash { return; }
+            led.hash = hash;
+            led.indexed = true;
+        }
+
+        let lang = ext_lang(&name);
+        let entry = FileEntry { name: key.clone(), content, language: lang.to_string() };
+        match index_files(&bg, std::slice::from_ref(&entry), lang_domain(lang)) {
+            Ok((added, _)) => eprintln!("[rag] auto-indexed {name} ({added} chunks)"),
+            Err(e) => {
+                // Un-claim so a later read retries rather than silently
+                // treating a failed file as indexed for the rest of the session.
+                if let Some(led) = bg.lock().unwrap().files.get_mut(&key) {
+                    led.indexed = false;
+                }
+                eprintln!("[rag] auto-index of {name} failed: {e}");
+            }
+        }
+    });
+}
+
 fn agentic_note(workspace: &str) -> String {
     if workspace.is_empty() {
         "\n\nAgentic mode is on: the runtime appends callable tools to this \
-         message. Use run_bash to inspect any files you need before answering."
+         message, but no workspace directory is set, so the filesystem tools \
+         will refuse. Say so instead of guessing at file contents."
             .to_string()
     } else {
         format!(
             "\n\nAgentic mode is on: the runtime appends callable tools to \
-             this message. The project workspace is at {workspace} — explore \
-             it yourself with run_bash and read only what you need before \
-             answering. Your shell does NOT start in the workspace: prefix \
-             every command with `cd {workspace} && ` (e.g. \
-             `cd {workspace} && grep -rn PATTERN src/`). Cite file paths and \
-             line numbers for every claim about the code."
+             this message. The workspace is {workspace}, and list_dir, \
+             glob_files, grep_files and read_file are all rooted there — pass \
+             paths RELATIVE to it (`src/main.rs`, not `{workspace}/src/main.rs`) \
+             and do not prefix anything with `cd`.\n\n\
+             Work narrow: glob or grep to find the few files that bear on the \
+             question, then read only those. Nothing in the workspace is \
+             indexed until you read it — each file you read becomes \
+             searchable with rag_search from the next turn onward, so in a \
+             long conversation prefer rag_search over reading the same file \
+             again. Cite file paths and line numbers for every claim about \
+             the code."
         )
     }
 }
@@ -4170,6 +5136,12 @@ fn handle_chat_stream(stream: &mut TcpStream, st: &Shared, req: &WriteReq, cfg: 
     if req.agentic {
         let ws = { let s = st.lock().unwrap(); s.workspace.manifest.path.clone() };
         system.push_str(&agentic_note(&ws));
+    }
+    // Effort marker for templates that ignore the kwarg. Like the tool
+    // declaration above, it is stable per conversation — changing the effort
+    // mid-thread costs exactly one re-prefill.
+    if let Some(marker) = effort_marker(&cfg) {
+        system.push_str(&marker);
     }
 
     // ── Pinned code context ──────────────────────────────────
@@ -4372,7 +5344,7 @@ fn handle_chat_stream(stream: &mut TcpStream, st: &Shared, req: &WriteReq, cfg: 
     // ── Non-agentic: one round, exactly as before ──
     let Some(rt) = tool_rt else {
         let messages: Vec<serde_json::Value> = msgs.iter().map(|m| m.msg.clone()).collect();
-        let llama_req = serde_json::json!({
+        let mut llama_req = serde_json::json!({
             "model": "local",
             "messages": messages,
             "max_tokens": max_tokens,
@@ -4385,6 +5357,11 @@ fn handle_chat_stream(stream: &mut TcpStream, st: &Shared, req: &WriteReq, cfg: 
             "cache_prompt": true,
             "stream": true,
         });
+        // Unknown kwargs render a byte-identical prompt on build 9870, so
+        // this is inert against templates that don't read them.
+        if let Some(kw) = effort_kwargs(&cfg) {
+            llama_req["chat_template_kwargs"] = kw;
+        }
         stream_completion(
             stream, st, &cfg.endpoint(), &llama_req,
             serde_json::json!({"rag_chunks": rag_chunks_used, "turns_kept": turns_kept}),
@@ -4430,7 +5407,7 @@ fn handle_chat_stream(stream: &mut TcpStream, st: &Shared, req: &WriteReq, cfg: 
             break;
         }
 
-        let llama_req = serde_json::json!({
+        let mut llama_req = serde_json::json!({
             "model": "local",
             "messages": msgs.iter().map(|m| m.msg.clone()).collect::<Vec<_>>(),
             "max_tokens": reply_budget,
@@ -4446,6 +5423,9 @@ fn handle_chat_stream(stream: &mut TcpStream, st: &Shared, req: &WriteReq, cfg: 
             // KV prefix, where omitting `tools` would re-prefill everything.
             "tool_choice": if final_round { "none" } else { "auto" },
         });
+        if let Some(kw) = effort_kwargs(&cfg) {
+            llama_req["chat_template_kwargs"] = kw;
+        }
 
         let rr = match stream_llama_round(stream, &endpoint, &llama_req) {
             Ok(rr) => rr,
@@ -4551,6 +5531,20 @@ fn handle_chat_stream(stream: &mut TcpStream, st: &Shared, req: &WriteReq, cfg: 
             } else {
                 rt.execute(&c.name, &args, workspace.as_deref())
             };
+            // A successful read is the model telling us this file matters.
+            let result = if c.name == "read_file" && result.ok {
+                match read_path_arg(&args).map(str::to_string) {
+                    Some(rel) => {
+                        let shown =
+                            apply_read_ledger(st, workspace.as_deref(), &rel, result.output);
+                        spawn_auto_index(st, workspace.as_deref(), &rel);
+                        tools::ToolResult { output: shown, ..result }
+                    }
+                    None => result,
+                }
+            } else {
+                result
+            };
             let mut output = sanitize_specials(&result.output);
 
             // Budget the result: free old exchanges first, then cut the
@@ -4653,3 +5647,4 @@ fn send_sse_error(stream: &mut TcpStream, msg: &str) {
 const INDEX: &str = include_str!("index.html");
 const STYLE: &str = include_str!("style.css");
 const SCRIPT: &str = include_str!("app.js");
+
