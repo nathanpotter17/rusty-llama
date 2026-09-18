@@ -36,65 +36,20 @@
   // ── File state ──
 
   let contextFiles = []; // { id, name, content, language, tokens } — sent with prompt
-  let ragFiles = [];     // { id, name, content, language, tokens } — queued for indexing
   let fileIdCounter = 0;
-  let fileDest = 'context'; // 'context' or 'rag'
   let modelCtx = 4096;
   let modelName = '';
   let modelsData = [];
-  let currentMode = 'write';
   let ragIndexed = 0;
   let ragCode = 0;
   let ragText = 0;
   let ragEnabled = false;
   let chatHistory = [];   // client-owned chat thread; server is stateless
 
-  // ── Destination toggle ──
-
-  document.querySelectorAll('.dest-btn').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      document.querySelectorAll('.dest-btn').forEach((b) => b.classList.remove('active'));
-      btn.classList.add('active');
-      fileDest = btn.dataset.dest;
-    });
-  });
-
-  // ── Mode toggle ──
-
-  document.querySelectorAll('.mode-btn').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      document.querySelectorAll('.mode-btn').forEach((b) => b.classList.remove('active'));
-      btn.classList.add('active');
-      currentMode = btn.dataset.mode;
-
-      const writeBtn = $('#write-btn');
-      const descInput = $('#write-desc');
-      document.body.classList.toggle('mode-chat', currentMode === 'chat');
-
-      if (currentMode === 'review') {
-        writeBtn.textContent = 'Review →';
-        descInput.placeholder = 'What should be reviewed? (e.g. "Check for bugs and performance issues")';
-      } else if (currentMode === 'chat') {
-        writeBtn.textContent = 'Send →';
-        descInput.placeholder = 'Ask anything, or discuss a long thread. Enter to send, Shift+Enter for newline.';
-        $('#output-title').textContent = 'Chat';
-        renderChat(null);
-      } else {
-        writeBtn.innerHTML = 'Write &rarr;';
-        descInput.placeholder = 'Describe what you need...';
-      }
-
-      if (currentMode !== 'chat') {
-        $('#output-title').textContent = 'Output';
-        $('#chat-new-btn').classList.add('hidden');
-      }
-      // Agentic exploration only makes sense when the model answers about
-      // existing code (review/chat), not raw generation.
-      $('#agentic-toggle').classList.toggle('hidden', currentMode === 'write');
-      updateRagBadge();
-    });
-  });
+  // One mode: chat with pinned files, RAG, and the Agent toggle covers
+  // everything the old Write/Review modes did (rusty-streamer's approach,
+  // codified here too). Dropped files always become pinned context; the
+  // index is fed by PATH (file or directory), also the streamer convention.
 
   const isAgentic = () =>
     currentMode !== 'write' && $('#agentic-checkbox').checked;
@@ -228,61 +183,22 @@
     const language = extToLang(name);
     const tokens = estimateTokens(content);
     const id = ++fileIdCounter;
-    const entry = { id, name, content, language, tokens };
-    if (fileDest === 'rag') {
-      ragFiles.push(entry);
-    } else {
-      contextFiles.push(entry);
-    }
+    contextFiles.push({ id, name, content, language, tokens });
     renderFileLists();
-    updateBudget();
   }
 
   function removeContextFile(id) {
     contextFiles = contextFiles.filter((f) => f.id !== id);
     renderFileLists();
-    updateBudget();
-  }
-
-  function removeRagFile(id) {
-    ragFiles = ragFiles.filter((f) => f.id !== id);
-    renderFileLists();
-  }
-
-  // ── Relevance scoring ──
-
-  function scoreFile(file, description, targetLang) {
-    let score = 0;
-    if (file.language === targetLang) score += 10;
-    const fnameBase = file.name.replace(/\.[^.]+$/, '').toLowerCase();
-    const descLower = description.toLowerCase();
-    if (fnameBase.length > 2 && descLower.includes(fnameBase)) score += 20;
-    const words = descLower.split(/\s+/).filter((w) => w.length > 3);
-    for (const w of words) {
-      if (file.content.includes(w)) score += 2;
-    }
-    return score;
-  }
-
-  function getSortedFiles(description, targetLang) {
-    return [...contextFiles]
-      .map((f) => ({ ...f, _score: scoreFile(f, description, targetLang) }))
-      .sort((a, b) => b._score - a._score);
   }
 
   // ── Render file lists ──
 
   function renderFileLists() {
     renderFileListInto('#context-file-list', contextFiles, removeContextFile);
-    renderFileListInto('#rag-file-list', ragFiles, removeRagFile);
-
-    // Show/hide sections
     const ctxSection = $('#context-file-section');
-    const ragSection = $('#rag-file-section');
     if (contextFiles.length > 0) { ctxSection.classList.remove('hidden'); }
     else { ctxSection.classList.add('hidden'); }
-    if (ragFiles.length > 0) { ragSection.classList.remove('hidden'); }
-    else { ragSection.classList.add('hidden'); }
   }
 
   function renderFileListInto(selector, files, removeFn) {
@@ -313,50 +229,9 @@
     });
   }
 
-  // ── Budget bar ──
-
-  function updateBudget() {
-    const bar = $('#budget-bar');
-    const fill = $('#budget-fill');
-    const label = $('#budget-label');
-    const detail = $('#budget-detail');
-
-    const totalFileTokens = contextFiles.reduce((s, f) => s + f.tokens, 0);
-    const descTokens = estimateTokens($('#write-desc').value || '');
-    const systemTokens = 80;
-
-    const inputUsed = totalFileTokens + descTokens + systemTokens;
-    const remaining = Math.max(0, modelCtx - inputUsed);
-    const pct = modelCtx > 0 ? Math.min((inputUsed / modelCtx) * 100, 100) : 0;
-
-    if (totalFileTokens === 0) {
-      bar.classList.add('hidden');
-      return;
-    }
-
-    bar.classList.remove('hidden');
-    fill.style.width = pct + '%';
-    fill.classList.remove('warn', 'over');
-
-    if (remaining < 256) {
-      fill.classList.add('over');
-      label.textContent = `${formatTokens(inputUsed)} input · ${formatTokens(remaining)} left for response`;
-      detail.innerHTML = `<span class="budget-over">Context nearly full — files will be truncated or dropped</span>`;
-    } else if (remaining < modelCtx * 0.15) {
-      fill.classList.add('warn');
-      label.textContent = `${formatTokens(inputUsed)} input · ${formatTokens(remaining)} left for response`;
-      detail.textContent = modelName
-        ? `${modelName} · ${formatTokens(modelCtx)} context`
-        : `${formatTokens(modelCtx)} context`;
-    } else {
-      label.textContent = `${formatTokens(inputUsed)} input · ${formatTokens(remaining)} left for response`;
-      detail.textContent = modelName
-        ? `${modelName} · ${formatTokens(modelCtx)} context`
-        : `${formatTokens(modelCtx)} context`;
-    }
-  }
-
-  $('#write-desc').addEventListener('input', updateBudget);
+  // The old write-mode budget bar is gone: the server prices pinned files
+  // with the real tokenizer and reports the outcome in context_info, which
+  // is truth where the bar was a chars-per-token guess.
 
   // ── Drag & drop ──
 
@@ -404,8 +279,8 @@
 
   function updateRagBadge() {
     const badge = $('#rag-badge');
-    const domain = currentMode === 'chat' ? 'text' : 'code';
-    const count = domain === 'text' ? ragText : ragCode;
+    // Retrieval searches both domains, so the badge counts both.
+    const count = ragText + ragCode;
     if (!ragEnabled) {
       badge.textContent = 'RAG off';
       badge.className = 'badge badge-idle';
@@ -413,66 +288,63 @@
     } else if (count > 0) {
       badge.textContent = `RAG ${count}`;
       badge.className = 'badge badge-ready';
-      badge.title = `${count} ${domain} chunks indexed${embedReady ? ' · embed ready' : ' · embed starts on use'}`;
+      badge.title = `${ragCode} code + ${ragText} text chunks indexed${embedReady ? ' · embed ready' : ' · embed starts on use'}`;
     } else {
       badge.textContent = 'RAG 0';
       badge.className = 'badge badge-idle';
-      badge.title = `No ${domain} chunks indexed yet — embed server starts on first use`;
+      badge.title = 'Nothing indexed yet — embed server starts on first use';
     }
   }
 
-  // Index RAG files, then auto-clear the RAG queue
-  $('#rag-index-btn').onclick = async () => {
-    if (ragFiles.length === 0) return;
+  // Index a path (single file or whole directory) — the server walks the
+  // filesystem itself, routes each file to the code or text chunker by
+  // extension, and upserts per file, so re-indexing refreshes in place.
+  async function indexPath() {
+    const input = $('#index-path');
+    const path = input.value.trim();
+    if (!path) return;
 
-    const domain = currentMode === 'chat' ? 'text' : 'code';
-    const btn = $('#rag-index-btn');
+    const btn = $('#index-path-btn');
     const status = $('#rag-index-status');
     btn.disabled = true;
     status.textContent = embedReady ? 'Indexing...' : 'Starting embed server & indexing...';
     status.className = 'rag-index-status rag-indexing';
 
-    const filesPayload = ragFiles.map((f) => ({
-      name: f.name,
-      content: f.content,
-      language: f.language,
-    }));
-
     try {
-      const res = await fetch('/api/rag/index', {
+      const res = await fetch('/api/rag/index_path', {
         method: 'POST',
-        body: JSON.stringify({ files: filesPayload, domain }),
+        body: JSON.stringify({ path }),
       });
       const d = await res.json();
-
-      if (d.error) {
-        status.textContent = d.error;
-        status.className = 'rag-index-status rag-error';
-      } else {
-        if (domain === 'text') ragText = d.chunks_indexed || 0;
-        else ragCode = d.chunks_indexed || 0;
-        embedReady = true;   // lazy start succeeded
-        status.textContent = `${d.chunks_indexed || 0} ${domain} chunks indexed`;
-        status.className = 'rag-index-status rag-success';
-        updateRagBadge();
-        $('#rag-checkbox').checked = true;
-        // Auto-clear RAG file queue — they're in the index now
-        ragFiles = [];
-        renderFileLists();
-      }
+      if (d.error) throw new Error(d.error);
+      ragCode = d.code_total || 0;
+      ragText = d.text_total || 0;
+      embedReady = true;   // lazy start succeeded
+      const skipped = d.skipped ? ` (${d.skipped} skipped)` : '';
+      status.textContent = `${d.files_indexed} files → ${d.chunks_indexed} chunks${skipped} · index: ${ragCode} code / ${ragText} text`;
+      status.className = 'rag-index-status rag-success';
+      updateRagBadge();
+      $('#rag-checkbox').checked = true;
     } catch (e) {
-      status.textContent = String(e);
+      status.textContent = String(e.message || e);
       status.className = 'rag-index-status rag-error';
     } finally {
       btn.disabled = false;
     }
-  };
+  }
+
+  $('#index-path-btn').onclick = indexPath;
+  $('#index-path').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); indexPath(); }
+  });
 
   // Clear RAG index
   $('#rag-clear-btn').onclick = async () => {
     try {
       await fetch('/api/rag/clear', { method: 'POST' });
       ragIndexed = 0;
+      ragCode = 0;
+      ragText = 0;
       updateRagBadge();
       $('#rag-index-status').textContent = '';
       refreshRagSettings();
@@ -640,11 +512,11 @@
         o.textContent = fname.replace('.gguf', '');
         draftSel.appendChild(o);
       }
-      if (d.draft) {
-        draftSel.value = d.draft.model || '';
-        $('#p-draft-max').value = d.draft.max || 10;
-        $('#p-draft-ngl').value = d.draft.ngl ?? 99;
-        updateDraftInfo(d.draft.model, d.draft.max);
+      if (d.spec) {
+        draftSel.value = d.spec.draft_model || '';
+        $('#p-draft-max').value = d.spec.draft_n_max || 2;
+        $('#p-draft-ngl').value = d.spec.gpu_layers_draft ?? 99;
+        updateDraftInfo(d.spec.draft_model, d.spec.draft_n_max);
       }
 
       const activeModel = modelsData.find((m) => m.filename === d.active);
@@ -676,7 +548,6 @@
         embedReady = d.embed.status === 'ready';
       }
       updateRagBadge();
-      updateBudget();
       updateBadge(d.llama);
       updateLlamaStatus(d.llama);
     } catch (e) {
@@ -690,7 +561,7 @@
       el.textContent = 'Speculative decoding disabled. No VRAM used for draft KV cache.';
     } else {
       el.textContent = `Draft: ${draftModel.replace('.gguf', '')}\n`
-        + `Proposes up to ${draftMax || 10} tokens per step.\n`
+        + `Proposes up to ${draftMax || 2} tokens per step.\n`
         + `Note: draft model shares the main context window and allocates its own KV cache.`;
     }
   }
@@ -755,14 +626,16 @@
           model,
           ngl: +$('#p-ngl').value,
           ctx: +$('#p-ctx').value,
-          flash_attn: true,
           temp: +$('#p-temp').value,
           top_k: +$('#p-topk').value,
           top_p: +$('#p-topp').value,
           repeat_penalty: +$('#p-rp').value,
-          draft_model: draftModel,
-          draft_max: +$('#p-draft-max').value || 10,
-          gpu_layers_draft: +$('#p-draft-ngl').value,
+          ...(draftModel ? {
+            spec_type: 'draft-model',
+            draft_model: draftModel,
+            spec_draft_n_max: +$('#p-draft-max').value || 2,
+            gpu_layers_draft: +$('#p-draft-ngl').value,
+          } : {}),
         }),
       }).then((r) => r.json());
 
@@ -777,7 +650,6 @@
       const sel = $('#model-select');
       modelName = sel.options[sel.selectedIndex]?.textContent || model.split('.')[0];
       updateDraftInfo(draftModel, +$('#p-draft-max').value);
-      updateBudget();
 
       pollUntilReady();
     } catch (e) {
@@ -800,7 +672,7 @@
         if (status === 'ready') {
           clearInterval(iv);
           $('#load-btn').disabled = false;
-          if (d.ctx) { modelCtx = d.ctx; updateBudget(); }
+          if (d.ctx) { modelCtx = d.ctx; }
         } else if (status === 'error' || status === 'stopped') {
           clearInterval(iv);
           $('#load-btn').disabled = false;
@@ -841,8 +713,9 @@
         `Requests: ${d.requests}  Tokens: ${d.tokens_session}\nModel: ${d.model || 'none'}`;
       if (d.ctx) {
         modelCtx = d.ctx;
-        updateBudget();
       }
+      // The Agent toggle exists only when the server built a tool runtime.
+      if (d.tools) $('#tools-toggle').classList.toggle('hidden', !d.tools.enabled);
     } catch (_) {}
   }
 
@@ -850,15 +723,10 @@
 
   let abortCtrl = null;
 
-  $('#write-btn').onclick = doWrite;
+  $('#write-btn').onclick = doChat;
   $('#write-desc').addEventListener('keydown', (e) => {
     if (e.key !== 'Enter') return;
-    if (currentMode === 'chat') {
-      if (!e.shiftKey) { e.preventDefault(); doWrite(); }   // Enter sends, Shift+Enter newline
-    } else if (e.ctrlKey || e.metaKey) {
-      e.preventDefault();
-      doWrite();
-    }
+    if (!e.shiftKey) { e.preventDefault(); doChat(); }   // Enter sends, Shift+Enter newline
   });
 
   $('#chat-new-btn').onclick = () => {
@@ -869,8 +737,25 @@
     $('#context-info').classList.add('hidden');
   };
 
-  // Render the chat transcript. Pass a string to append a live streaming
-  // assistant bubble; pass null when idle.
+  // Tool status chips for the round in flight, cleared per turn.
+  let liveToolChips = [];
+
+  // One chip per tool_call on a stored assistant message.
+  function renderCallChips(toolCalls) {
+    let html = '';
+    for (const tc of toolCalls || []) {
+      const fn = tc.function || {};
+      const arg = (fn.arguments || '').slice(0, 60);
+      html += `<div class="tool-chip">🔧 ${esc(fn.name || 'tool')} <code>${esc(arg)}</code></div>`;
+    }
+    return html;
+  }
+
+  // Render the chat transcript from the RAW history objects. The rendering
+  // reads tool_calls/tool messages for display, but the objects themselves
+  // are what gets POSTed back — never strip-then-resend: history that hides
+  // past tool rounds teaches the model that calling tools does nothing.
+  // Pass a string to append a live streaming assistant bubble; null when idle.
   function renderChat(streaming) {
     const output = $('#output');
     $('#chat-new-btn').classList.toggle('hidden', chatHistory.length === 0 && streaming == null);
@@ -880,11 +765,21 @@
     }
     let html = '<div class="chat-transcript">';
     for (const m of chatHistory) {
-      const body = m.role === 'assistant' ? renderReview(m.content) : esc(m.content);
+      if (m.role === 'tool') {
+        html += `<div class="chat-msg chat-tool"><details class="tool-result"><summary>🔧 tool result</summary><pre>${esc(m.content || '')}</pre></details></div>`;
+        continue;
+      }
+      let body = m.role === 'assistant' ? renderReview(m.content || '') : esc(m.content || '');
+      if (m.role === 'assistant' && m.tool_calls) {
+        body = renderCallChips(m.tool_calls) + body;
+      }
       html += `<div class="chat-msg chat-${m.role}"><div class="chat-role">${m.role}</div><div class="chat-body">${body}</div></div>`;
     }
     if (streaming != null) {
-      html += `<div class="chat-msg chat-assistant"><div class="chat-role">assistant</div><div class="chat-body streaming-cursor">${renderReview(streaming)}</div></div>`;
+      const chips = liveToolChips.map((c) =>
+        `<div class="tool-chip ${c.ok ? 'tool-ok' : 'tool-fail'}">🔧 ${esc(c.summary)} → ${esc(c.status)}</div>`
+      ).join('');
+      html += `<div class="chat-msg chat-assistant"><div class="chat-role">assistant</div><div class="chat-body streaming-cursor">${chips}${renderReview(streaming)}</div></div>`;
     }
     html += '</div>';
     output.innerHTML = html;
@@ -932,16 +827,30 @@
     ctxInfo.classList.add('hidden');
     ctxInfo.innerHTML = '';
 
-    const useRag = $('#rag-checkbox').checked && ragText > 0;
+    // Retrieval spans both domains server-side, so either count qualifies.
+    const useRag = $('#rag-checkbox').checked && (ragText + ragCode) > 0;
+    const useTools = !$('#tools-toggle').classList.contains('hidden')
+      && $('#tools-checkbox').checked;
     let assistantText = '';
     let tokenCount = 0;
+    // Set once the server's final `history` event stores the answer — the
+    // synthesized push below is then a duplicate and must not fire.
+    let historyFinal = false;
+    liveToolChips = [];
     const genStart = Date.now();
 
     try {
       const res = await fetch('/api/write', {
         method: 'POST',
         signal: abortCtrl.signal,
-        body: JSON.stringify({ mode: 'chat', messages: chatHistory, use_rag: useRag, agentic: isAgentic() }),
+        body: JSON.stringify({
+          messages: chatHistory,
+          use_rag: useRag,
+          use_tools: useTools,
+          // Context files ride as pinned code context in the (cached) system
+          // prefix — they persist for the whole thread.
+          files: contextFiles.map((f) => ({ name: f.name, content: f.content, language: f.language })),
+        }),
       });
 
       await readSSE(res, (data) => {
@@ -974,20 +883,48 @@
           tokenCount++;
           renderChat(assistantText);
         }
+        // Agentic events. `history` messages are stored VERBATIM and resent
+        // whole next turn — the server's tool round-trip depends on it.
+        if (data.history) {
+          chatHistory.push(data.history);
+          if (data.history.role === 'assistant') {
+            if (data.history.tool_calls) {
+              // Round boundary: this round's text is stored; the next round's
+              // stream starts a fresh bubble.
+              assistantText = '';
+              renderChat('');
+            } else {
+              historyFinal = true;
+            }
+          }
+        }
+        if (data.tool) {
+          liveToolChips.push(data.tool);
+          renderChat(assistantText);
+        }
+        if (data.notice) {
+          ctxInfo.innerHTML += `${ctxInfo.innerHTML ? ' · ' : ''}<span class="ctx-dropped">${esc(data.notice)}</span>`;
+          ctxInfo.classList.remove('hidden');
+        }
         if (data.done) {
           const secs = ((data.elapsed_ms || 0) / 1000).toFixed(1);
           const p = [`${data.tokens || 0} tok`, `${secs}s`];
           if (data.rag_chunks) p.push(`${data.rag_chunks} RAG`);
+          if (data.tool_rounds) p.push(`${data.tool_rounds} tool round${data.tool_rounds === 1 ? '' : 's'}`);
           if (data.turns_kept) p.push(`${data.turns_kept} turns`);
           statsEl.textContent = p.join(' · ');
         }
       });
 
-      if (assistantText) chatHistory.push({ role: 'assistant', content: assistantText });
+      // Abort fallback only: when the final `history` event stored the
+      // answer, pushing the accumulated stream again would duplicate it.
+      if (assistantText && !historyFinal) chatHistory.push({ role: 'assistant', content: assistantText });
+      liveToolChips = [];
       renderChat(null);
     } catch (e) {
       if (e.name === 'AbortError') {
-        if (assistantText) chatHistory.push({ role: 'assistant', content: assistantText });
+        if (assistantText && !historyFinal) chatHistory.push({ role: 'assistant', content: assistantText });
+        liveToolChips = [];
         renderChat(null);
         const secs = ((Date.now() - genStart) / 1000).toFixed(1);
         statsEl.textContent = `${tokenCount} tok · ${secs}s · stopped`;
@@ -1010,208 +947,6 @@
     } else {
       writeBtn.classList.remove('hidden');
       abortBtn.classList.add('hidden');
-    }
-  }
-
-  async function doWrite() {
-    if (currentMode === 'chat') return doChat();
-    const desc = $('#write-desc').value.trim();
-    if (!desc) return;
-
-    if (abortCtrl) abortCtrl.abort();
-    abortCtrl = new AbortController();
-
-    const output = $('#output');
-    const copyBtn = $('#copy-btn');
-    const statsEl = $('#stats');
-    const ctxInfo = $('#context-info');
-    const isReview = currentMode === 'review';
-    const useRag = $('#rag-checkbox').checked && ragCode > 0;
-
-    const loadingLabel = isReview ? 'Reviewing code...' : (useRag ? 'Searching index & writing...' : 'Writing code...');
-    output.innerHTML = `<div class="loading"><div class="spinner"></div>${loadingLabel}</div>`;
-    copyBtn.classList.add('hidden');
-    statsEl.textContent = '';
-    ctxInfo.classList.add('hidden');
-    ctxInfo.innerHTML = '';
-    setGenerating(true);
-
-    const lang = $('#lang-select').value;
-    const sorted = getSortedFiles(desc, lang);
-    const filesPayload = sorted.map((f) => ({
-      name: f.name,
-      content: f.content,
-      language: f.language,
-    }));
-
-    let fullText = '';
-    let started = false;
-    let tokenCount = 0;
-    const genStart = Date.now();
-
-    try {
-      const res = await fetch('/api/write', {
-        method: 'POST',
-        signal: abortCtrl.signal,
-        body: JSON.stringify({
-          description: desc,
-          language: lang,
-          mode: currentMode,
-          files: filesPayload.length > 0 ? filesPayload : undefined,
-          use_rag: useRag,
-          agentic: isAgentic(),
-        }),
-      });
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-
-        let idx;
-        while ((idx = buf.indexOf('\n\n')) !== -1) {
-          const line = buf.slice(0, idx);
-          buf = buf.slice(idx + 2);
-
-          if (!line.startsWith('data: ')) continue;
-          let data;
-          try { data = JSON.parse(line.slice(6)); } catch { continue; }
-
-          if (data.error) {
-            output.innerHTML = `<div class="error-msg">${esc(data.error)}</div>`;
-            setGenerating(false);
-            return;
-          }
-
-          // Handle RAG info event
-          if (data.rag_info) {
-            const ri = data.rag_info;
-            if (ri.error) {
-              console.warn('[rag]', ri.error);
-            } else if (ri.chunks_retrieved) {
-              const sources = (ri.sources || []).map((s) => s.source).join(', ');
-              // Show brief RAG retrieval note in the loading area
-              const loadEl = output.querySelector('.loading');
-              if (loadEl) {
-                loadEl.innerHTML = `<div class="spinner"></div>Retrieved ${ri.chunks_retrieved} chunks from index · generating...`;
-              }
-            }
-            continue;
-          }
-
-          // Handle context_info event
-          if (data.context_info) {
-            const ci = data.context_info;
-            let parts = [];
-            if (ci.rag_chunks) {
-              parts.push(`<span class="ctx-rag">${ci.rag_chunks} RAG</span>`);
-            }
-            if (ci.files_included && ci.files_included.length) {
-              parts.push(`<span class="ctx-included">${ci.files_included.length} files</span>`);
-            }
-            if (ci.files_truncated && ci.files_truncated.length) {
-              parts.push(`<span class="ctx-dropped">${ci.files_truncated.length} truncated</span>`);
-            }
-            if (ci.files_dropped && ci.files_dropped.length) {
-              parts.push(`<span class="ctx-dropped">${ci.files_dropped.length} dropped</span>`);
-            }
-            if (ci.remaining_tokens != null) {
-              parts.push(`${formatTokens(ci.remaining_tokens)} left for response`);
-            }
-            if (parts.length) {
-              ctxInfo.innerHTML = parts.join(' · ');
-              ctxInfo.classList.remove('hidden');
-              const lines = [
-                ...(ci.files_included || []).map((n) => '✓ ' + n),
-                ...(ci.files_truncated || []).map((n) => '⚠ ' + n),
-                ...(ci.files_dropped || []).map((n) => '✗ ' + n),
-              ];
-              if (ci.rag_chunks) lines.unshift(`⚡ ${ci.rag_chunks} RAG chunks retrieved`);
-              ctxInfo.title = lines.join('\n');
-            }
-            continue;
-          }
-
-          if (data.token) {
-            if (!started) {
-              if (isReview) {
-                output.innerHTML = '<div class="review-block streaming-cursor" id="stream-review"></div>';
-              } else {
-                output.innerHTML = '<pre class="code-block streaming-cursor"><code id="stream-code"></code></pre>';
-              }
-              started = true;
-            }
-            fullText += data.token;
-            tokenCount++;
-            if (isReview) {
-              $('#stream-review').innerHTML = renderReview(fullText);
-            } else {
-              $('#stream-code').textContent = fullText;
-            }
-            output.scrollTop = output.scrollHeight;
-          }
-
-          if (data.done) {
-            const cursor = output.querySelector('.streaming-cursor');
-            if (cursor) cursor.classList.remove('streaming-cursor');
-
-            if (isReview && fullText) {
-              const el = $('#stream-review');
-              if (el) el.innerHTML = renderReview(fullText);
-            }
-
-            const secs = ((data.elapsed_ms || 0) / 1000).toFixed(1);
-            let statsParts = [`${data.tokens || 0} tok`, `${secs}s`];
-            if (data.rag_chunks) statsParts.push(`${data.rag_chunks} RAG`);
-            statsEl.textContent = statsParts.join(' · ');
-
-            if (fullText) {
-              copyBtn.classList.remove('hidden');
-              copyBtn.onclick = () => {
-                navigator.clipboard.writeText(fullText);
-                copyBtn.textContent = 'Copied!';
-                setTimeout(() => (copyBtn.textContent = 'Copy'), 1500);
-              };
-            }
-          }
-        }
-      }
-
-      if (!started && !fullText) {
-        output.innerHTML = '<div class="placeholder-msg">No output received</div>';
-      }
-    } catch (e) {
-      if (e.name === 'AbortError') {
-        // User clicked abort — keep partial output and show stats
-        const cursor = output.querySelector('.streaming-cursor');
-        if (cursor) cursor.classList.remove('streaming-cursor');
-
-        if (isReview && fullText) {
-          const el = $('#stream-review');
-          if (el) el.innerHTML = renderReview(fullText);
-        }
-
-        const secs = ((Date.now() - genStart) / 1000).toFixed(1);
-        statsEl.textContent = `${tokenCount} tok · ${secs}s · stopped`;
-
-        if (fullText) {
-          copyBtn.classList.remove('hidden');
-          copyBtn.onclick = () => {
-            navigator.clipboard.writeText(fullText);
-            copyBtn.textContent = 'Copied!';
-            setTimeout(() => (copyBtn.textContent = 'Copy'), 1500);
-          };
-        }
-      } else {
-        output.innerHTML = `<div class="error-msg">Error: ${esc(String(e))}</div>`;
-      }
-    } finally {
-      abortCtrl = null;
-      setGenerating(false);
     }
   }
 
@@ -1254,9 +989,14 @@
 
   // ── Init ──
 
+  document.body.classList.add('mode-chat');
+  renderChat(null);
   (async () => {
     try {
       await refreshModels();
+      // Also picks up whether [tools] is enabled, which shows the Agent
+      // toggle — refreshStatus otherwise only runs from the settings overlay.
+      await refreshStatus();
     } catch (_) {}
   })();
 })();

@@ -602,11 +602,53 @@ body {
   border: 1px solid var(--border);
 }
 
-/* In chat mode the language picker and file budget bar are irrelevant. */
-body.mode-chat #lang-select,
-body.mode-chat .budget-bar {
-  display: none;
+/* ── Path indexing row ── */
+
+.index-path-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 10px;
 }
+.index-path-row .prefix-input {
+  flex: 1;
+  min-width: 0;
+}
+
+/* ── Agentic tool activity ── */
+
+.tool-chip {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 2px 0;
+}
+.tool-chip code {
+  color: var(--text-secondary, inherit);
+}
+.tool-chip.tool-fail {
+  color: var(--orange);
+}
+
+.chat-tool .tool-result summary {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.chat-tool .tool-result pre {
+  font-size: 11px;
+  max-height: 240px;
+  overflow: auto;
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Chat is the only mode; the extension hint is noise next to the browse label. */
 body.mode-chat .drop-hint {
   display: none;
 }

@@ -25,35 +25,17 @@
   <main class="split-pane">
     <div class="pane pane-input">
       <div class="pane-header">
-        <div class="select-wrap">
-          <select id="lang-select">
-            <option value="python">Python</option>
-            <option value="javascript">JavaScript</option>
-            <option value="typescript">TypeScript</option>
-            <option value="rust">Rust</option>
-            <option value="go">Go</option>
-            <option value="java">Java</option>
-            <option value="c++">C++</option>
-            <option value="c">C</option>
-            <option value="html">HTML</option>
-            <option value="sql">SQL</option>
-            <option value="bash">Bash</option>
-          </select>
-        </div>
-        <div class="mode-toggle">
-          <button class="mode-btn active" data-mode="write">Write</button>
-          <button class="mode-btn" data-mode="review">Review</button>
-          <button class="mode-btn" data-mode="chat">Chat</button>
-        </div>
-        <label class="rag-toggle" id="rag-toggle" title="Use RAG: retrieve relevant code chunks from the index before generating">
+        <!-- One mode: chat with pinned files, RAG, and the Agent toggle. -->
+        <label class="rag-toggle" id="rag-toggle" title="Use RAG: retrieve relevant chunks from the index before generating">
           <input type="checkbox" id="rag-checkbox">
           <span class="rag-toggle-label">RAG</span>
         </label>
-        <label class="rag-toggle hidden" id="agentic-toggle" title="Agentic: the model explores the workspace itself with tools (backend must be streamer-server started with --tools)">
-          <input type="checkbox" id="agentic-checkbox">
-          <span class="rag-toggle-label">Agentic</span>
+        <!-- Shown only when the server reports [tools] enabled (see refreshStatus). -->
+        <label class="rag-toggle hidden" id="tools-toggle" title="Agent: let the model run filesystem tools (and rag_search) in the configured workspace">
+          <input type="checkbox" id="tools-checkbox">
+          <span class="rag-toggle-label">Agent</span>
         </label>
-        <button id="write-btn" class="primary-btn">Write &rarr;</button>
+        <button id="write-btn" class="primary-btn">Send &rarr;</button>
         <button id="abort-btn" class="abort-btn hidden" title="Stop generation (keeps partial output)">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
             <rect x="6" y="6" width="12" height="12" rx="1"></rect>
@@ -61,34 +43,20 @@
           Stop
         </button>
       </div>
-      <textarea id="write-desc" class="desc-input" placeholder="Describe what you need..." rows="10" spellcheck="false"></textarea>
+      <textarea id="write-desc" class="desc-input" placeholder="Ask anything, or discuss a long thread. Enter to send, Shift+Enter for newline." rows="10" spellcheck="false"></textarea>
 
-      <!-- File upload zone -->
+      <!-- File upload zone: drops become pinned context. Indexing is by
+           path (file or directory), the rusty-streamer convention. -->
       <div id="file-zone" class="file-zone">
         <div id="drop-area" class="drop-area">
-          <div class="drop-dest-toggle">
-            <button class="dest-btn active" data-dest="context">Context</button>
-            <button class="dest-btn" data-dest="rag">RAG Index</button>
-          </div>
           <svg class="drop-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
             <polyline points="17 8 12 3 7 8"></polyline>
             <line x1="12" y1="3" x2="12" y2="15"></line>
           </svg>
-          <span class="drop-text">Drop files or <label class="file-label" for="file-input">browse</label></span>
+          <span class="drop-text">Drop files or <label class="file-label" for="file-input">browse</label> to pin as context</span>
           <span class="drop-hint">.ts .js .rs .c .cpp .h .py .go .java .html .css .sql .sh .toml .json .md</span>
           <input type="file" id="file-input" multiple accept=".ts,.tsx,.js,.jsx,.rs,.c,.cpp,.h,.hpp,.py,.go,.java,.html,.css,.sql,.sh,.bash,.toml,.yaml,.yml,.json,.md,.txt,.rb,.swift,.kt,.cs,.lua,.zig,.asm,.s,.vue,.svelte,.astro,.graphql,.gql,.proto,.cmake,.mk,.makefile,.dockerfile,.xml,.ini,.cfg,.conf,.env,.gitignore,.hbs,.ejs,.pug,.scss,.sass,.less,.styl,.wasm,.wat">
-        </div>
-
-        <!-- Budget bar (context files only) -->
-        <div id="budget-bar" class="budget-bar hidden">
-          <div class="budget-row">
-            <div class="budget-track">
-              <div id="budget-fill" class="budget-fill"></div>
-            </div>
-            <span id="budget-label" class="budget-label"></span>
-          </div>
-          <div id="budget-detail" class="budget-detail"></div>
         </div>
 
         <!-- Context file list -->
@@ -100,61 +68,29 @@
           <div id="context-file-list" class="file-list"></div>
         </div>
 
-        <!-- RAG file list -->
-        <div id="rag-file-section" class="file-section hidden">
-          <div class="file-section-header">
-            <span class="file-section-label rag-label">RAG</span>
-            <span class="file-section-hint">indexed for semantic search</span>
-            <button id="rag-index-btn" class="small-btn rag-index-btn" title="Index files into vector store">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="11" cy="11" r="8"></circle>
-                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-              </svg>
-              Index
-            </button>
-            <span id="rag-index-status" class="rag-index-status"></span>
-          </div>
-          <div id="rag-file-list" class="file-list"></div>
+        <!-- Path indexing (server walks the filesystem) -->
+        <div class="index-path-row">
+          <input id="index-path" class="prefix-input" type="text" spellcheck="false"
+                 placeholder="Path to a file or directory to index for retrieval">
+          <button id="index-path-btn" class="small-btn rag-index-btn" title="Index the path into the vector store (per-file upsert; re-index to refresh)">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="11" cy="11" r="8"></circle>
+              <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+            </svg>
+            Index
+          </button>
         </div>
-
-        <!-- Server-side workspace -->
-        <div id="workspace-section" class="file-section">
-          <div class="file-section-header">
-            <span class="file-section-label ws-label">Workspace</span>
-            <span class="file-section-hint">server-side repo, indexed in place</span>
-            <button id="workspace-sync-btn" class="small-btn" title="Walk the workspace and (re)index new/changed files — .gitignore respected">Sync</button>
-            <span id="workspace-status" class="rag-index-status"></span>
-          </div>
-          <div class="workspace-row">
-            <input type="text" id="workspace-path" class="workspace-input" placeholder="/path/to/repo (folder on the server machine)" spellcheck="false">
-            <button id="workspace-browse-btn" class="small-btn" title="Browse the server's filesystem for a folder">Browse…</button>
-            <button id="workspace-set-btn" class="small-btn">Set</button>
-          </div>
-          <div id="workspace-browser" class="workspace-browser hidden">
-            <div class="wsb-header">
-              <span id="wsb-path" class="wsb-path"></span>
-              <span id="wsb-git" class="wsb-git hidden">git</span>
-            </div>
-            <div id="wsb-list" class="wsb-list"></div>
-            <div class="wsb-actions">
-              <button id="wsb-select" class="small-btn wsb-select">Use this folder</button>
-              <button id="wsb-cancel" class="small-btn">Cancel</button>
-            </div>
-          </div>
-        </div>
+        <span id="rag-index-status" class="rag-index-status"></span>
       </div>
     </div>
     <div class="pane pane-output">
       <div class="pane-header">
-        <span class="pane-title" id="output-title">Output</span>
+        <span class="pane-title" id="output-title">Chat</span>
         <div id="context-info" class="context-info hidden"></div>
         <button id="chat-new-btn" class="small-btn hidden" title="Clear the conversation thread">New chat</button>
-        <button id="copy-btn" class="small-btn hidden">Copy</button>
         <span id="stats" class="stats"></span>
       </div>
-      <div id="output" class="output-area">
-        <div class="placeholder-msg">Model output will appear here</div>
-      </div>
+      <div id="output" class="output-area"></div>
     </div>
   </main>
 
