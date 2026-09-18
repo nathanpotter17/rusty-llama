@@ -83,9 +83,20 @@ impl Default for WorkspaceCfg {
 #[serde(default)]
 struct HardwareCfg {
     vram: String,
+    /// KV-cache quantization override: "q8_0", "q4_0", "f16", or "" to take
+    /// the tier default. q4_0 roughly halves KV against q8_0, buying context
+    /// at some attention precision.
+    #[serde(default)]
+    kv_cache: String,
+    /// VRAM to leave unclaimed for the driver and the rest of the desktop.
+    /// 0 = use the built-in default. See DEFAULT_HEADROOM_MIB for the trade.
+    #[serde(default)]
+    vram_headroom_mib: u64,
 }
 impl Default for HardwareCfg {
-    fn default() -> Self { Self { vram: "8GB".into() } }
+    fn default() -> Self {
+        Self { vram: "8GB".into(), kv_cache: String::new(), vram_headroom_mib: 0 }
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -263,6 +274,17 @@ struct ModelEntry {
     /// which is correct for every model that has no effort vocabulary.
     #[serde(default)]
     reasoning_effort: String,
+    /// Scales the generic per-token KV estimate for THIS model.
+    ///
+    /// kv_mib_per_token assumes a conventional transformer where every layer
+    /// keeps a growing K/V cache. Hybrid models do not: Qwen3.5 carries
+    /// `ssm.*` metadata (Gated Delta Net), so most of its layers hold a
+    /// constant-size recurrent state instead, and its measured cost is half
+    /// the estimate — 0.0175 MiB/token at q8_0 against an assumed 0.035.
+    /// Left at 1.0 the planner simply under-uses the card; setting it wrong
+    /// in the other direction OOMs the launch, so measure before lowering it.
+    #[serde(default = "def_kv_factor")]
+    kv_factor: f64,
     // Speculative decoding (per-model — spec capability is a model property).
     #[serde(default)]
     spec_type: String,               // "" = off | "draft-mtp" | "draft-model" | "eagle" | ...
@@ -282,6 +304,7 @@ fn def_topk() -> u32 { 40 }
 fn def_topp() -> f32 { 0.9 }
 fn def_rp() -> f32 { 1.1 }
 fn def_spec_nmax() -> u32 { 2 }
+fn def_kv_factor() -> f64 { 1.0 }
 fn def_ngl_draft() -> i32 { 99 }
 
 
@@ -454,6 +477,37 @@ mod auto_index_tests {
 mod plan_tests {
     use super::*;
 
+    /// The measured factor is what stops the planner paying for weight that
+    /// never reaches the card — and the clamp is what stops a bad reading
+    /// turning into an OOM on the next launch.
+    #[test]
+    fn measured_weight_factor_is_used_but_never_trusted_blindly() {
+        let mut c = VramCache::default();
+        // Real numbers from this machine: 6512 MiB on disk, 6016 resident.
+        c.entries.insert("m.gguf".into(), (6016, 32));
+        let f = c.factor("m.gguf", 6512, 32).expect("in-band measurement used");
+        assert!((f - 0.924).abs() < 0.01, "got {f}");
+
+        // A measurement taken while another process was releasing VRAM reads
+        // absurdly low; believing it would over-provision the next launch.
+        c.entries.insert("bad.gguf".into(), (400, 32));
+        assert_eq!(c.factor("bad.gguf", 6512, 32), None);
+
+        // Equally, a wildly high reading is not a reason to under-provision.
+        c.entries.insert("high.gguf".into(), (13000, 32));
+        assert_eq!(c.factor("high.gguf", 6512, 32), None);
+
+        // Partial offload: the measurement was taken at half the layers, so
+        // it is compared against half the file, not the whole of it.
+        c.entries.insert("half.gguf".into(), (3008, 16));
+        let f = c.factor("half.gguf", 6512, 32).expect("scaled by offload");
+        assert!((f - 0.924).abs() < 0.01, "got {f}");
+
+        // Nothing measured yet — caller falls back to the on-disk size.
+        assert_eq!(c.factor("unseen.gguf", 6512, 32), None);
+    }
+
+
     /// A stand-in for the real GGUF: plan_launch reads size and block count
     /// off disk, so the fixture has to be a file of a known size carrying a
     /// `*.block_count` key.
@@ -487,7 +541,7 @@ mod plan_tests {
 
         // Free VRAM across the cliff region for a 6512 MiB / 32-layer model.
         for free in [7500u64, 7400, 7300, 7200, 7100, 7000, 6800, 6500] {
-            let plan = plan_launch(&path, 99, Some(free), 0, 32768, &preset);
+            let plan = plan_launch(&path, 99, Some(free), 0, 32768, 1.0, 1.0, &preset);
             assert!(
                 plan.ctx >= FA_CTX_THRESHOLD,
                 "free={free} planned a {}-token window (ngl={}) — the offload \
@@ -509,7 +563,7 @@ mod plan_tests {
         fs::create_dir_all(&dir).unwrap();
         let path = fixture(&dir, 3000, 32);
         let preset = HwPreset::from_vram("8GB", true);
-        let plan = plan_launch(&path, -1, Some(8000), 0, 32768, &preset);
+        let plan = plan_launch(&path, -1, Some(8000), 0, 32768, 1.0, 1.0, &preset);
         assert_eq!(plan.ngl, -1, "full offload was traded away needlessly");
         assert!(plan.ctx >= FA_CTX_THRESHOLD);
         let _ = fs::remove_file(&path);
@@ -523,7 +577,7 @@ mod plan_tests {
         fs::create_dir_all(&dir).unwrap();
         let path = fixture(&dir, 6000, 32);
         let preset = HwPreset::from_vram("4GB", true);
-        let plan = plan_launch(&path, -1, Some(4000), 0, 16384, &preset);
+        let plan = plan_launch(&path, -1, Some(4000), 0, 16384, 1.0, 1.0, &preset);
         assert!(plan.ngl >= 0, "planner fell back past its ceiling");
         assert!(plan.ctx >= MIN_CTX);
         let _ = fs::remove_file(&path);
@@ -675,6 +729,7 @@ struct Model {
     top_p: f32,
     repeat_penalty: f32,
     reasoning_effort: String,
+    kv_factor: f64,
     spec_type: String,
     spec_draft_n_max: u32,
     draft_model: String,
@@ -709,6 +764,7 @@ fn discover_models(
                     } else {
                         k.reasoning_effort.clone()
                     },
+                    kv_factor: k.kv_factor,
                     spec_type: k.spec_type.clone(), spec_draft_n_max: k.spec_draft_n_max,
                     draft_model: k.draft_model.clone(), gpu_layers_draft: k.gpu_layers_draft,
                 }
@@ -722,6 +778,7 @@ fn discover_models(
                     temperature: defaults.temperature,
                     top_k: defaults.top_k, top_p: defaults.top_p, repeat_penalty: defaults.repeat_penalty,
                     reasoning_effort: defaults.reasoning_effort.clone(),
+                    kv_factor: def_kv_factor(),
                     spec_type: String::new(), spec_draft_n_max: def_spec_nmax(),
                     draft_model: String::new(), gpu_layers_draft: def_ngl_draft(),
                 }
@@ -2742,7 +2799,10 @@ fn poll_until_ready(st: &Shared, which: Which, timeout_secs: u64) -> Result<(), 
                 }
                 // The template is only readable once the model is loaded, so
                 // the effort channel is resolved here rather than at spawn.
-                if matches!(which, Which::Llama) { probe_effort_channel(st); }
+                if matches!(which, Which::Llama) {
+                    record_vram_measurement(st);
+                    probe_effort_channel(st);
+                }
                 return Ok(());
             }
             PollOutcome::Dead(e) => {
@@ -2752,6 +2812,30 @@ fn poll_until_ready(st: &Shared, which: Which, timeout_secs: u64) -> Result<(), 
             PollOutcome::Pending => std::thread::sleep(Duration::from_millis(700)),
         }
     }
+}
+
+/// Turn the free-VRAM delta across a model load into a reusable measurement.
+///
+/// What the card lost between spawn and ready is weights + compute buffers +
+/// the KV cache for the context we asked for. Only the KV part is known, so
+/// subtracting it leaves the non-KV footprint — the number the planner wants
+/// and currently guesses at with the GGUF's on-disk size.
+fn record_vram_measurement(st: &Shared) {
+    let Some((model, ngl, ctx, before)) = st.lock().unwrap().vram_probe.take() else { return };
+    let Some(after) = probe_gpus().iter().map(|g| g.free_mib).max() else { return };
+    if after >= before { return; }   // another process freed memory; unusable
+
+    let mut s = st.lock().unwrap();
+    let kv_rate = kv_mib_per_token(&s.cfg.cache_type_k) * s.models.iter()
+        .find(|m| m.filename == model).map(|m| m.kv_factor).unwrap_or(1.0);
+    let kv_mib = (kv_rate * ctx as f64) as u64;
+    let delta = before - after;
+    let Some(base) = delta.checked_sub(kv_mib).filter(|b| *b > 0) else { return };
+
+    eprintln!("[plan] measured {model}: {delta} MiB resident at ngl={ngl} ctx={ctx} \
+               (KV ~{kv_mib} MiB) → non-KV footprint {base} MiB");
+    s.vram_cache.entries.insert(model, (base, ngl));
+    s.vram_cache.save();
 }
 
 /// Ask the ready server which chat template it actually loaded, and record
@@ -3054,8 +3138,17 @@ impl SystemInfo {
 // buckets, no OOM launches.
 
 const MIN_CTX: u32 = 2048;
-/// CUDA context + compute buffers + fragmentation margin.
-const HEADROOM_MIB: u64 = 512;
+/// VRAM left unclaimed for the graphics driver, the compositor, and whatever
+/// else the desktop does while a model is resident, plus fragmentation
+/// margin. Not a fudge factor for a bad weight estimate — that is measured
+/// now (see VramCache), so this is the real safety budget and nothing else is
+/// silently padding it.
+///
+/// It trades against context steeply: on a hybrid model at q4_0 KV, 1 MiB of
+/// headroom is ~100 tokens of window, so 512 vs 1024 MiB is the difference
+/// between an 87k and a 36k context. Override per machine with
+/// [hardware] vram_headroom_mib.
+const DEFAULT_HEADROOM_MIB: u64 = 1024;
 /// Resident footprint reserved for the embed server so a later start doesn't
 /// OOM a model sized to the whole card. Measured on build 9870 at the batch
 /// this code actually launches with (512): ~1.4 GiB, of which 610 MiB is
@@ -3063,9 +3156,6 @@ const HEADROOM_MIB: u64 = 512;
 /// same server takes 2.4 GiB, which is why the batch is capped separately.
 /// Only applied when the embed server actually offloads (embed_ngl > 0).
 const EMBED_RESERVE_MIB: u64 = 1500;
-/// streamer-server's MAX_CTX; llama-server accepts more but nothing we run
-/// wants it.
-const ENGINE_MAX_CTX: u32 = 65536;
 /// Flash attention engages only at/above this context — below it, FA's
 /// overhead isn't paid for a benefit that doesn't materialize on short prompts.
 const FA_CTX_THRESHOLD: u32 = 8192;
@@ -3073,7 +3163,16 @@ const FA_CTX_THRESHOLD: u32 = 8192;
 #[derive(Clone, Copy)]
 struct HwPreset {
     ctx_default: u32,       // context when a model declares none
-    ctx_hard_max: u32,      // upper sanity bound regardless of spare VRAM
+    /// Upper sanity bound only — NOT a budget. Real free VRAM decides the
+    /// window, and on every tier it binds far below this; the bound exists so
+    /// a bad reading cannot ask the engine for something absurd. It sat at
+    /// 32768 on the 8GB tier and silently became the binding constraint once
+    /// the KV estimate was corrected, which is exactly the failure a sanity
+    /// bound should not cause. `ctx_default` still governs when there is no
+    /// GPU reading at all.
+    ctx_hard_max: u32,
+    /// VRAM held back from the model; see DEFAULT_HEADROOM_MIB.
+    headroom_mib: u64,
     cache_type: &'static str, // KV-cache quantization for both K and V
     parallel_slots: u32,    // main-server slots
     default_ngl: i32,       // gpu_layers fallback for undeclared/discovered models
@@ -3100,12 +3199,12 @@ impl HwPreset {
             // 4GB: a 7B only fits partially — keep the small embed model on CPU
             // so its VRAM isn't stolen from the main model's KV cache.
             "4gb" | "4" => Self {
-                ctx_default: 16384, ctx_hard_max: 16384, cache_type: "q8_0",
+                ctx_default: 16384, ctx_hard_max: 524288, cache_type: "q8_0",
                 parallel_slots: 1, default_ngl: -1, embed_ctx: 2048, embed_parallel: 1, embed_ngl: 0,
-                slim_tools: true, effort_ceiling: "medium",
+                slim_tools: true, effort_ceiling: "medium", headroom_mib: DEFAULT_HEADROOM_MIB,
             },
             "8gb" | "8" => Self {
-                ctx_default: 32768, ctx_hard_max: 32768, cache_type: "q8_0",
+                ctx_default: 32768, ctx_hard_max: 524288, cache_type: "q8_0",
                 // embed_ngl: 0 — the embedder runs on CPU here, same as the
                 // tighter tiers. This IS a compromise, and a deliberate one.
                 //
@@ -3122,24 +3221,29 @@ impl HwPreset {
                 // answer, to speed up work that is bursty, backgrounded, and
                 // already invisible to the user. Set [embed] gpu_layers
                 // explicitly to take the other side of that trade.
+                // ctx_hard_max is a sanity bound, not a budget: the planner
+                // sizes context against real free VRAM and almost always
+                // lands far below this. It sat at 32768 and was the binding
+                // constraint for a hybrid-attention model whose KV is cheap
+                // enough to hold six figures of context on 8GB.
                 parallel_slots: 1, default_ngl: -1, embed_ctx: 4096, embed_parallel: 2, embed_ngl: 0,
-                slim_tools: false, effort_ceiling: "spoon",
+                slim_tools: false, effort_ceiling: "spoon", headroom_mib: DEFAULT_HEADROOM_MIB,
             },
             "cpu" | "none" => Self {
-                ctx_default: 8192, ctx_hard_max: 16384, cache_type: "q8_0",
+                ctx_default: 8192, ctx_hard_max: 524288, cache_type: "q8_0",
                 parallel_slots: 1, default_ngl: 0, embed_ctx: 2048, embed_parallel: 2, embed_ngl: 0,
-                slim_tools: true, effort_ceiling: "low",
+                slim_tools: true, effort_ceiling: "low", headroom_mib: DEFAULT_HEADROOM_MIB,
             },
             _ => {
                 // Unrecognized tag: fall back on GPU presence.
                 if gpu_present {
-                    Self { ctx_default: 16384, ctx_hard_max: 32768, cache_type: "q8_0",
+                    Self { ctx_default: 16384, ctx_hard_max: 524288, cache_type: "q8_0",
                            parallel_slots: 1, default_ngl: -1, embed_ctx: 4096, embed_parallel: 2, embed_ngl: 99,
-                           slim_tools: false, effort_ceiling: "xhigh" }
+                           slim_tools: false, effort_ceiling: "xhigh", headroom_mib: DEFAULT_HEADROOM_MIB }
                 } else {
-                    Self { ctx_default: 8192, ctx_hard_max: 16384, cache_type: "q8_0",
+                    Self { ctx_default: 8192, ctx_hard_max: 524288, cache_type: "q8_0",
                            parallel_slots: 1, default_ngl: 0, embed_ctx: 2048, embed_parallel: 2, embed_ngl: 0,
-                           slim_tools: true, effort_ceiling: "low" }
+                           slim_tools: true, effort_ceiling: "low", headroom_mib: DEFAULT_HEADROOM_MIB }
                 }
             }
         }
@@ -3248,6 +3352,65 @@ fn vram_footprint(path: &str, ngl: i32) -> (u64, f64) {
     }
 }
 
+/// Measured non-KV VRAM footprint of a model, keyed by filename.
+///
+/// The planner's weight estimate is the GGUF's ON-DISK size, which
+/// overstates what actually lands on the GPU — measured on a 6512 MiB file,
+/// the resident footprint was ~6036 MiB. That 476 MiB of phantom weight is
+/// context the card could have held (~47k tokens at q4_0) but was never
+/// offered. It is not headroom: the planner reserves headroom_mib separately
+/// for the driver and the rest of the desktop, and this does not touch it.
+///
+/// So the first successful load measures the real thing — free VRAM before
+/// the spawn minus free VRAM once the server is ready, less the KV cache that
+/// launch asked for — and every later plan for that model uses the
+/// measurement instead of the file size.
+const VRAM_CACHE_PATH: &str = "data/model_vram.json";
+
+#[derive(Default, Serialize, Deserialize, Clone)]
+struct VramCache {
+    /// filename → (non-KV MiB resident, the offload it was measured at).
+    entries: std::collections::HashMap<String, (u64, i32)>,
+}
+
+impl VramCache {
+    fn load() -> Self {
+        fs::read_to_string(VRAM_CACHE_PATH).ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self) {
+        if let Some(dir) = Path::new(VRAM_CACHE_PATH).parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        if let Ok(j) = serde_json::to_string(self) {
+            let _ = fs::write(VRAM_CACHE_PATH, j);
+        }
+    }
+
+    /// Correction factor for this model: measured resident over what the
+    /// on-disk estimate predicted at the SAME offload. Applied to every
+    /// candidate offload in the descent, so one measurement calibrates the
+    /// whole search rather than only the point it was taken at.
+    ///
+    /// Clamped, and deliberately so: a measurement taken while another
+    /// process was releasing VRAM reads low, and an over-confident factor
+    /// turns into an OOM on the next launch. Outside the band the file size
+    /// is used unchanged.
+    fn factor(&self, model: &str, file_mib: u64, total_layers: u32) -> Option<f64> {
+        let (base, ngl) = *self.entries.get(model)?;
+        if file_mib == 0 || base == 0 { return None; }
+        let frac = if ngl < 0 { 1.0 } else {
+            (ngl as f64 / total_layers.max(1) as f64).clamp(0.0, 1.0)
+        };
+        let predicted = file_mib as f64 * frac;
+        if predicted < 1.0 { return None; }
+        let f = base as f64 / predicted;
+        (0.6..=1.2).contains(&f).then_some(f)
+    }
+}
+
 /// A complete, self-consistent launch plan. `ngl` is planned too: on tight
 /// tiers, shrinking context alone cannot prevent an OOM when the requested
 /// offload's weights exceed free VRAM — the offload itself must be sized.
@@ -3276,6 +3439,8 @@ fn plan_launch(
     free_vram_mib: Option<u64>,
     embed_reserve_mib: u64,
     model_max_ctx: u32,   // 0 = model didn't declare one
+    kv_factor: f64,       // per-model scale on the generic KV estimate
+    weight_factor: f64,   // measured resident / on-disk, 1.0 when unmeasured
     preset: &HwPreset,
 ) -> LaunchPlan {
     let hard_max = if model_max_ctx > 0 {
@@ -3297,20 +3462,21 @@ fn plan_launch(
     // ── Phase 1: the offload ceiling.
     // The most layers the weights can occupy while still leaving room for a
     // minimal f16 window. This is a ceiling, not the answer — see Phase 2.
-    let file_mib = weight_mib(model_path);
-    let min_kv = (kv_mib_per_token("f16") * MIN_CTX as f64).ceil() as u64;
-    let weight_budget = (free as i64) - HEADROOM_MIB as i64 - embed_reserve_mib as i64 - min_kv as i64;
+    // The on-disk size, corrected by any measurement we have for this model.
+    let file_mib = (weight_mib(model_path) as f64 * weight_factor) as u64;
+    let min_kv = (kv_mib_per_token("f16") * kv_factor * MIN_CTX as f64).ceil() as u64;
+    let weight_budget = (free as i64) - preset.headroom_mib as i64 - embed_reserve_mib as i64 - min_kv as i64;
 
     // Size the context for a given offload. `off` is a real layer count;
     // kv_scale is the fraction of KV that lands on the GPU alongside it.
     let size_ctx = |ngl: i32, weight: u64, kv_scale: f64| -> LaunchPlan {
-        let budget_mib = (free as i64) - weight as i64 - HEADROOM_MIB as i64 - embed_reserve_mib as i64;
+        let budget_mib = (free as i64) - weight as i64 - preset.headroom_mib as i64 - embed_reserve_mib as i64;
         if budget_mib <= 0 {
             // Below MIN_CTX headroom: run the smallest window on f16 KV (FA off).
             return LaunchPlan { ngl, ctx: MIN_CTX, flash_attn: false, cache_type: "" };
         }
         let fit = |rate: f64| -> u32 {
-            let per = (rate * kv_scale).max(1e-6);
+            let per = (rate * kv_scale * kv_factor).max(1e-6);
             let c = ((budget_mib as f64 / per) as u64 / 1024) * 1024;   // → 1024 boundary
             (c as u32).clamp(MIN_CTX, hard_max)
         };
@@ -3333,7 +3499,8 @@ fn plan_launch(
                        ({free} MiB free) and layer layout is unknown — CPU inference");
             0
         };
-        let (weight, kv_scale) = vram_footprint(model_path, ngl);
+        let (raw_weight, kv_scale) = vram_footprint(model_path, ngl);
+        let weight = (raw_weight as f64 * weight_factor) as u64;
         return size_ctx(ngl, weight, kv_scale);
     };
 
@@ -3444,6 +3611,13 @@ fn probe_ram() -> (u64, u64) { (0, 0) }
 struct State {
     /// The directory the agent works in.
     workspace: Workspace,
+    /// Measured non-KV VRAM per model, so the planner stops paying for the
+    /// gap between a GGUF's on-disk size and what actually lands on the card.
+    vram_cache: VramCache,
+    /// Free VRAM sampled just before the current model was spawned, with the
+    /// launch it was spawned for: (model, ngl, ctx, free_before_mib).
+    /// Consumed once the server reports ready.
+    vram_probe: Option<(String, i32, u32, u64)>,
     /// Per-file record of what the model has been shown and what has been
     /// embedded, keyed by absolute path. Serves two jobs that would otherwise
     /// each need their own bookkeeping: suppressing re-reads of bytes already
@@ -3638,7 +3812,25 @@ fn main() {
     // needs the preset's default ngl/context for models with no [[models]] entry.
     let sys = SystemInfo::probe();
     let gpu_present = !sys.gpus.is_empty();
-    let preset = HwPreset::from_vram(&file_cfg.hardware.vram, gpu_present);
+    let mut preset = HwPreset::from_vram(&file_cfg.hardware.vram, gpu_present);
+    match file_cfg.hardware.kv_cache.trim() {
+        "" => {}
+        "f16" => preset.cache_type = "",      // "" means f16, i.e. no flags
+        t @ ("q8_0" | "q4_0" | "q4_1" | "q5_0" | "q5_1") => {
+            // Leaked via the preset so every downstream consumer (planner,
+            // launch flags, the FA/KV legality coupling) sees one value.
+            preset.cache_type = match t {
+                "q8_0" => "q8_0", "q4_0" => "q4_0", "q4_1" => "q4_1",
+                "q5_0" => "q5_0", _ => "q5_1",
+            };
+        }
+        other => eprintln!("  WARNING: [hardware] kv_cache '{other}' is not a \
+                            known type — using the tier default"),
+    }
+    if file_cfg.hardware.vram_headroom_mib > 0 {
+        preset.headroom_mib = file_cfg.hardware.vram_headroom_mib;
+    }
+    let preset = preset;
     let free_vram = sys.free_vram_mib();
 
     // Embed server sizing is preset-derived: a small model, always fully
@@ -3732,6 +3924,11 @@ fn main() {
     let mut llama = ManagedServer::new("llama", cfg.llama_port);
     let embed = ManagedServer::new("embed", file_cfg.embed.port);
 
+    // Measurements from previous runs: a model loaded before plans against
+    // what it actually occupied rather than its on-disk size.
+    let boot_vram_cache = VramCache::load();
+    let mut boot_probe: Option<(String, i32, u32, u64)> = None;
+
     // Auto-load main model. The embed server is NOT started here — it is
     // lazy-loaded on first RAG use (indexing or a retrieval-backed request)
     // so a review-only session never pays its VRAM/startup cost.
@@ -3751,12 +3948,14 @@ fn main() {
         };
         if let Some(m) = target {
             apply_model_params(&mut cfg, m);
-            plan_and_apply_launch(&mut cfg, m);
+            plan_and_apply_launch(&mut cfg, m, &boot_vram_cache);
             eprintln!("[llama] starting {} (ngl={}, ctx={}, fa={})",
                 m.name, if cfg.ngl < 0 { 99 } else { cfg.ngl }, cfg.ctx,
                 if cfg.flash_attn { "on" } else { "off" });
+            let free_before = probe_gpus().iter().map(|g| g.free_mib).max();
             if llama.spawn(&cfg.llama_binary, &llama_args(&cfg, m), &m.filename, cfg.llama_port).is_ok() {
                 llama.wait_ready(cfg.startup_timeout);
+                boot_probe = free_before.map(|b| (m.filename.clone(), cfg.ngl, cfg.ctx, b));
             }
         }
     }
@@ -3800,6 +3999,8 @@ fn main() {
     }
     let shared: Shared = Arc::new(Mutex::new(State {
         workspace,
+        vram_cache: boot_vram_cache,
+        vram_probe: boot_probe,
         files: std::collections::HashMap::new(),
         cfg, models, llama, embed, rag,
         tools: tool_runtime,
@@ -3809,6 +4010,9 @@ fn main() {
     // The autoloaded model blocks on wait_ready rather than going through
     // poll_until_ready, so its effort channel is resolved here instead. A
     // no-op when the model failed to start or declares no effort.
+    // The boot model blocks on wait_ready rather than going through
+    // poll_until_ready, so its measurement is banked here.
+    record_vram_measurement(&shared);
     probe_effort_channel(&shared);
 
     // Bring the embed server up eagerly, off the critical path.
@@ -3877,11 +4081,18 @@ fn apply_model_params(cfg: &mut RuntimeCfg, m: &Model) {
 /// override) against real free VRAM, and write the result into cfg.
 /// Offload, context, flash-attn and KV quantization come back coupled and
 /// legal. Only reserve embed VRAM when the embed server offloads to GPU.
-fn plan_and_apply_launch(cfg: &mut RuntimeCfg, m: &Model) {
+fn plan_and_apply_launch(cfg: &mut RuntimeCfg, m: &Model, cache: &VramCache) {
     let embed_reserve =
         if cfg.embed_enabled && cfg.preset.embed_ngl > 0 { EMBED_RESERVE_MIB } else { 0 };
+    let layers = gguf_block_count(&m.path).unwrap_or(0);
+    let wf = cache.factor(&m.filename, weight_mib(&m.path), layers).unwrap_or(1.0);
+    if wf != 1.0 {
+        eprintln!("[plan] {} measured at {:.0}% of its on-disk size — planning against that",
+            m.filename, wf * 100.0);
+    }
     let plan = plan_launch(
-        &m.path, cfg.ngl, cfg.free_vram_mib, embed_reserve, m.context_size, &cfg.preset,
+        &m.path, cfg.ngl, cfg.free_vram_mib, embed_reserve, m.context_size,
+        m.kv_factor, wf, &cfg.preset,
     );
     cfg.ngl = plan.ngl;
     cfg.ctx = plan.ctx;
@@ -4047,7 +4258,7 @@ fn handle_load(st: &Shared, body: &str) -> serde_json::Value {
     // ngl override lands BEFORE planning — ctx/FA/KV are computed for the
     // offload that will actually launch.
     if let Some(v) = req.ngl { cfg.ngl = v; }
-    plan_and_apply_launch(&mut cfg, &model);
+    plan_and_apply_launch(&mut cfg, &model, &{ st.lock().unwrap().vram_cache.clone() });
     // Manual ctx is advisory: it may only lower the planned figure, never push
     // past what real VRAM can hold. Flash-attn re-derives from the result.
     if let Some(v) = req.ctx {
@@ -4075,8 +4286,10 @@ fn handle_load(st: &Shared, body: &str) -> serde_json::Value {
         if cfg.flash_attn { "on" } else { "off" });
 
     // Spawn the new model (embed server untouched). The old one is already stopped.
+    let free_before = probe_gpus().iter().map(|g| g.free_mib).max();
     let status = {
         let mut s = st.lock().unwrap();
+        s.vram_probe = free_before.map(|b| (model.filename.clone(), cfg.ngl, cfg.ctx, b));
         if let Err(e) = s.llama.spawn(&cfg.llama_binary, &llama_args(&cfg, &model), &model.filename, cfg.llama_port) {
             s.cfg.active_model.clear();
             return serde_json::json!({"error": e});

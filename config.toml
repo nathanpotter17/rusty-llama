@@ -6,6 +6,17 @@
 
 [hardware]
 vram = "8GB"
+vram_headroom_mib = 0    # VRAM to leave unclaimed for the GPU driver and the
+                         # rest of the desktop; 0 = built-in default (1024).
+                         # It trades against context steeply — roughly 100
+                         # tokens of window per MiB at q4_0 on this model, so
+                         # 512 here would roughly double the context at the
+                         # cost of half the safety margin.
+kv_cache = "q4_0"        # KV-cache quantization: "q8_0" | "q4_0" | "f16" | ""
+                         # ("" = tier default, q8_0). Measured on this box with
+                         # the 9B: q8_0 costs 0.0175 MiB/token, q4_0 0.0094 —
+                         # q4_0 roughly doubles the context that fits. Needle
+                         # recall over a ~21k-token prompt was 3/3 on both.
 
 [server]
 port = 8090
@@ -188,7 +199,16 @@ filename = "Qwen3.5-9B-abliterated-Q4_K_M.gguf"
 name = "Qwen3.5 9B Abliterated (Q4_K_M)"
 family = "qwen"
 gpu_layers = 99
-context_size = 32768
+context_size = 262144    # the model's real ceiling, straight from the GGUF
+                         # (qwen35.context_length). This is a bound, not a
+                         # request: the planner sizes the window against free
+                         # VRAM and lands far below it.
+kv_factor = 0.5          # MEASURED, not guessed. This is a hybrid attention/SSM
+                         # model (the GGUF carries qwen35.ssm.* keys), so most
+                         # layers hold constant-size recurrent state rather than
+                         # a growing KV cache, and it costs half what the generic
+                         # per-token estimate assumes. Do not copy this to a
+                         # conventional transformer — it would OOM the launch.
 temperature = 1.0
 top_k = 20
 top_p = 0.95
