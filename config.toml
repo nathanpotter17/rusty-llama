@@ -6,12 +6,20 @@
 
 [hardware]
 vram = "8GB"
-vram_headroom_mib = 0    # VRAM to leave unclaimed for the GPU driver and the
-                         # rest of the desktop; 0 = built-in default (1024).
-                         # It trades against context steeply — roughly 100
-                         # tokens of window per MiB at q4_0 on this model, so
-                         # 512 here would roughly double the context at the
-                         # cost of half the safety margin.
+vram_headroom_mib = 512  # VRAM left for everything that is NOT this model.
+                         # 0 = built-in default (1024); floor is 64.
+                         #
+                         # It does not protect the model: llama.cpp preallocates
+                         # weights, KV and compute buffers at load, so once the
+                         # server is up its footprint is static. Verified by
+                         # starting a second GPU process against 157 MiB free —
+                         # the newcomer died, the resident model kept answering.
+                         # So size this to what ELSE wants the GPU afterwards.
+                         #
+                         # This desktop idles at 223 MiB with a 2 MiB swing, so
+                         # 512 covers a browser comfortably. ~100 tokens of
+                         # context per MiB at q4_0: 128 -> 133k, 512 -> 87k,
+                         # 1024 -> 38k.
 kv_cache = "q4_0"        # KV-cache quantization: "q8_0" | "q4_0" | "f16" | ""
                          # ("" = tier default, q8_0). Measured on this box with
                          # the 9B: q8_0 costs 0.0175 MiB/token, q4_0 0.0094 —
@@ -203,11 +211,16 @@ context_size = 262144    # the model's real ceiling, straight from the GGUF
                          # (qwen35.context_length). This is a bound, not a
                          # request: the planner sizes the window against free
                          # VRAM and lands far below it.
-kv_factor = 0.5          # MEASURED, not guessed. This is a hybrid attention/SSM
-                         # model (the GGUF carries qwen35.ssm.* keys), so most
-                         # layers hold constant-size recurrent state rather than
-                         # a growing KV cache, and it costs half what the generic
-                         # per-token estimate assumes. Do not copy this to a
+kv_factor = 0.7          # MEASURED, not guessed, and BACKEND-SPECIFIC.
+                         # This is a hybrid attention/SSM model (the GGUF carries
+                         # qwen35.ssm.* keys), so most layers hold constant-size
+                         # recurrent state rather than a growing KV cache and it
+                         # costs well under the generic per-token estimate.
+                         # Measured at two contexts on each backend:
+                         #   CUDA   0.0137 MiB/token -> factor 0.68 (use 0.7)
+                         #   Vulkan 0.0094 MiB/token -> factor 0.47 (use 0.5)
+                         # CUDA's KV is ~46% pricier per token. Re-measure if you
+                         # change backend. Do not copy either number to a
                          # conventional transformer — it would OOM the launch.
 temperature = 1.0
 top_k = 20

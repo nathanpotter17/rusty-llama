@@ -1420,3 +1420,39 @@ pre.code-block {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+
+/* ── Bulk workspace index ─────────────────────────────────── */
+.bulk-gpu-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-dim, #888);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.bulk-bar { margin-top: 8px; }
+.bulk-track {
+  height: 5px;
+  border-radius: 3px;
+  background: var(--border, #2a2a2a);
+  overflow: hidden;
+}
+.bulk-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background: var(--accent, #4a9eff);
+  transition: width 0.3s ease;
+}
+.bulk-fill.bulk-error { background: #d05050; }
+.bulk-detail {
+  display: block;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-dim, #888);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

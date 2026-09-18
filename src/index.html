@@ -93,6 +93,18 @@
             <button id="workspace-browse-btn" class="small-btn" title="Browse the server's filesystem for a folder">Browse…</button>
             <button id="workspace-set-btn" class="small-btn">Set</button>
           </div>
+          <div class="workspace-row" style="margin-top:6px">
+            <button id="bulk-index-btn" class="small-btn" title="Walk the whole workspace and embed every indexable file, so semantic search works before you ask anything. Uses the GPU embedder (~13x faster), which needs the model unloaded for the duration — it is reloaded automatically when the index finishes.">Index entire workspace</button>
+            <label class="bulk-gpu-label" title="Embed on the GPU. ~13x faster, but the main model is unloaded while it runs.">
+              <input type="checkbox" id="bulk-gpu" checked>
+              <span>GPU embedder</span>
+            </label>
+            <span id="bulk-status" class="rag-index-status"></span>
+          </div>
+          <div id="bulk-bar" class="bulk-bar hidden">
+            <div class="bulk-track"><div id="bulk-fill" class="bulk-fill"></div></div>
+            <span id="bulk-detail" class="bulk-detail"></span>
+          </div>
           <div id="workspace-browser" class="workspace-browser hidden">
             <div class="wsb-header">
               <span id="wsb-path" class="wsb-path"></span>

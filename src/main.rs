@@ -2011,6 +2011,104 @@ impl HnswGraph {
 // ── RAG Store (chunks + HNSW) ───────────────────────────────
 
 // ── Workspace: the directory the agent works in ────────────────
+//
+// Two ways in, and they are not redundant. The agent reads what it decides is
+// relevant and that gets indexed as a side effect — right for day-to-day work,
+// where a question touches a handful of files. Bulk indexing walks the whole
+// tree up front: wrong as a default (a 27-file crate is 1000 chunks the
+// conversation will never ask about) but the only option when you want a
+// 150k-line repo searchable before you have asked anything at all.
+
+/// File extensions the workspace indexer accepts (mirrors the UI's upload
+/// accept list), plus a few extensionless well-known names.
+const WS_EXTS: &[&str] = &[
+    "ts", "tsx", "js", "jsx", "rs", "c", "cpp", "h", "hpp", "py", "go",
+    "java", "html", "css", "sql", "sh", "bash", "toml", "yaml", "yml",
+    "json", "md", "txt", "rb", "swift", "kt", "cs", "lua", "zig", "asm",
+    "s", "vue", "svelte", "astro", "graphql", "gql", "proto", "cmake",
+    "mk", "xml", "ini", "cfg", "conf", "hbs", "ejs", "pug", "scss",
+    "sass", "less", "styl", "wat",
+];
+const WS_SPECIAL_FILES: &[&str] = &["makefile", "dockerfile", "cmakelists.txt", ".gitignore", ".env"];
+/// Directories the fallback walker skips (git repos use `git ls-files`
+/// instead, which honors .gitignore exactly).
+const WS_SKIP_DIRS: &[&str] = &[
+    ".git", "target", "node_modules", "dist", "build", "out", "__pycache__",
+    ".venv", "venv", "data", "models", ".idea", ".vscode", "bin", "obj",
+    "vendor", ".next", "coverage",
+];
+fn ws_name_ok(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    if WS_SPECIAL_FILES.contains(&lower.as_str()) {
+        return true;
+    }
+    lower
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| WS_EXTS.contains(&ext))
+}
+
+/// Walk the workspace, returning relative paths of indexable files. Git
+/// repos go through `git ls-files` (exact .gitignore semantics, including
+/// untracked-but-not-ignored files); everything else gets a recursive walk
+/// with a built-in skip list.
+fn workspace_walk(root: &Path) -> Vec<String> {
+    if root.join(".git").exists() {
+        if let Some(list) = git_ls_files(root) {
+            return list;
+        }
+        eprintln!("[workspace] git ls-files failed — falling back to plain walk");
+    }
+    let mut out = Vec::new();
+    walk_dir(root, root, &mut out, 0);
+    out
+}
+
+fn git_ls_files(root: &Path) -> Option<Vec<String>> {
+    let out = Command::new("git")
+        .args(["-C"])
+        .arg(root)
+        .args(["ls-files", "--cached", "--others", "--exclude-standard", "-z"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Some(
+        text.split('\0')
+            .filter(|p| !p.is_empty())
+            .filter(|p| {
+                let base = p.rsplit('/').next().unwrap_or(p);
+                ws_name_ok(base)
+            })
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+fn walk_dir(root: &Path, dir: &Path, out: &mut Vec<String>, depth: usize) {
+    if depth > 16 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        if path.is_dir() {
+            let lower = name.to_lowercase();
+            if name.starts_with('.') || WS_SKIP_DIRS.contains(&lower.as_str()) {
+                continue;
+            }
+            walk_dir(root, &path, out, depth + 1);
+        } else if ws_name_ok(name) {
+            if let Ok(rel) = path.strip_prefix(root) {
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+}
+
+
 
 const WS_MANIFEST_PATH: &str = "data/workspace.json";
 
@@ -2570,7 +2668,23 @@ impl ManagedServer {
     /// child once its buffer fills).
     fn spawn(&mut self, binary: &str, args: &[String], model: &str, port: u16) -> Result<(), String> {
         self.stop();
-        let child = Command::new(binary)
+        let mut cmd = Command::new(binary);
+        // Load ggml's shared libraries from beside the binary.
+        //
+        // A llama.cpp built from source carries a DT_RUNPATH pointing at its
+        // build tree, so a binary copied into models/ keeps loading libraries
+        // from wherever it was compiled — and silently breaks if that tree is
+        // deleted. DT_RUNPATH (unlike the older DT_RPATH) is searched AFTER
+        // LD_LIBRARY_PATH, so setting it here wins without patching the ELF,
+        // and makes models/ self-contained.
+        if let Some(dir) = Path::new(binary).parent().filter(|d| !d.as_os_str().is_empty()) {
+            let mut path = dir.to_string_lossy().to_string();
+            if let Ok(existing) = std::env::var("LD_LIBRARY_PATH") {
+                if !existing.is_empty() { path.push(':'); path.push_str(&existing); }
+            }
+            cmd.env("LD_LIBRARY_PATH", path);
+        }
+        let child = cmd
             .args(args)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -2812,6 +2926,124 @@ fn poll_until_ready(st: &Shared, which: Which, timeout_secs: u64) -> Result<(), 
             PollOutcome::Pending => std::thread::sleep(Duration::from_millis(700)),
         }
     }
+}
+
+#[derive(Clone, Serialize)]
+struct BulkStatus {
+    phase: String,      // "walking" | "embedding" | "restoring" | "done" | "error"
+    files_total: usize,
+    files_done: usize,
+    chunks: usize,
+    skipped: usize,
+    message: String,
+    running: bool,
+}
+
+/// Bulk-index the whole workspace, on the GPU embedder.
+///
+/// Deliberately a button and not a default. Read-triggered indexing is right
+/// for a conversation — the model knows which files matter — but it cannot
+/// make a repo searchable BEFORE the first question, and on a 150k-line
+/// codebase that is the difference between the agent grepping blind and
+/// having semantic search from the first turn.
+///
+/// The GPU embedder is ~13x the CPU one (24.8 vs 1.9 chunks/s measured), which
+/// is what makes this practical at all: ~9000 chunks is 6 minutes on the GPU
+/// against 80 on the CPU. It needs ~1.4 GiB, and a resident main model leaves
+/// nowhere near that, so this unloads the model for the duration and puts it
+/// back afterwards. That is acceptable precisely because it is a pre-prompt
+/// operation — nothing is mid-conversation when you press it.
+fn spawn_bulk_index(st: &Shared, full: bool, use_gpu: bool) {
+    let bg = Arc::clone(st);
+    std::thread::spawn(move || {
+        let set = |phase: &str, msg: String, f_done: usize, f_total: usize,
+                   chunks: usize, skipped: usize, running: bool| {
+            bg.lock().unwrap().bulk = Some(BulkStatus {
+                phase: phase.into(), files_total: f_total, files_done: f_done,
+                chunks, skipped, message: msg, running,
+            });
+        };
+        let fail = |msg: String| {
+            bg.lock().unwrap().bulk = Some(BulkStatus {
+                phase: "error".into(), files_total: 0, files_done: 0, chunks: 0,
+                skipped: 0, message: msg, running: false,
+            });
+        };
+
+        let (root, active_model) = {
+            let s = bg.lock().unwrap();
+            (s.workspace.manifest.path.clone(), s.cfg.active_model.clone())
+        };
+        if root.is_empty() { return fail("no workspace set".into()); }
+        let rootp = Path::new(&root);
+        if !rootp.is_dir() { return fail(format!("workspace missing: {root}")); }
+
+        set("walking", "walking the workspace…".into(), 0, 0, 0, 0, true);
+        let walked = workspace_walk(rootp);
+        if walked.is_empty() { return fail("no indexable files found".into()); }
+
+        // Free the card, then bring the embedder up on it.
+        let restore_model = if use_gpu && !active_model.is_empty() {
+            set("embedding", "unloading the model to free VRAM for the GPU embedder…".into(),
+                0, walked.len(), 0, 0, true);
+            { let mut s = bg.lock().unwrap(); s.llama.stop(); s.cfg.active_model.clear(); }
+            std::thread::sleep(Duration::from_secs(2));
+            Some(active_model)
+        } else { None };
+        if use_gpu {
+            let mut s = bg.lock().unwrap();
+            s.embed.stop();
+            s.cfg.embed.gpu_layers = 99;
+        }
+
+        let mut chunks_total = 0usize;
+        let mut skipped = 0usize;
+        // One file per call: progress stays per-file, and a file that fails to
+        // read or embed costs only itself.
+        for (i, rel) in walked.iter().enumerate() {
+            set("embedding", format!("{rel}"), i, walked.len(), chunks_total, skipped, true);
+            let Ok(content) = fs::read_to_string(rootp.join(rel)) else { skipped += 1; continue };
+            if content.trim().is_empty() { skipped += 1; continue; }
+            let abs = rootp.join(rel).to_string_lossy().to_string();
+            let lang = ext_lang(rel);
+            let entry = FileEntry { name: abs, content, language: lang.to_string() };
+            match index_files(&bg, std::slice::from_ref(&entry), lang_domain(lang)) {
+                Ok((added, _)) => chunks_total += added,
+                Err(e) => { skipped += 1; eprintln!("[bulk] {rel}: {e}"); }
+            }
+        }
+
+        // Put the card back the way it was.
+        set("restoring", "restoring the model…".into(), walked.len(), walked.len(),
+            chunks_total, skipped, true);
+        if use_gpu {
+            {
+                let mut s = bg.lock().unwrap();
+                s.embed.stop();
+                s.cfg.embed.gpu_layers = s.cfg.preset.embed_ngl;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            // Back on the CPU where it belongs between bulk runs — and left
+            // RUNNING, so the first search after an index does not pay a cold
+            // start (or worse, fail if it cannot restart).
+            if let Err(e) = ensure_embed_ready(&bg) {
+                eprintln!("[bulk] embed server did not come back on CPU: {e}");
+            }
+        }
+        if let Some(model) = restore_model {
+            let body = serde_json::json!({"model": model}).to_string();
+            let r = handle_load(&bg, &body);
+            if let Some(e) = r["error"].as_str() {
+                return fail(format!("indexed {chunks_total} chunks, but reloading \
+                                     the model failed: {e}"));
+            }
+        }
+        let _ = full;   // a full re-walk is the only mode; kept for the API shape
+        set("done", format!("{} files, {chunks_total} chunks indexed", walked.len() - skipped),
+            walked.len(), walked.len(), chunks_total, skipped, false);
+        eprintln!("[bulk] done: {} files, {chunks_total} chunks, {skipped} skipped",
+            walked.len() - skipped);
+    });
 }
 
 /// Turn the free-VRAM delta across a model load into a reusable measurement.
@@ -3148,6 +3380,14 @@ const MIN_CTX: u32 = 2048;
 /// headroom is ~100 tokens of window, so 512 vs 1024 MiB is the difference
 /// between an 87k and a 36k context. Override per machine with
 /// [hardware] vram_headroom_mib.
+///
+/// What it does NOT protect is the model. llama.cpp preallocates weights, KV
+/// and compute buffers at load, so once a server is up its footprint is
+/// static — measured here by starting a second GPU consumer against 157 MiB
+/// of free VRAM: the newcomer failed to allocate and died, the resident model
+/// kept answering. The headroom is therefore a budget for everything that
+/// comes AFTER the model: a browser, a video call, the embed server on GPU.
+/// Size it to what else this machine needs, not to what the model needs.
 const DEFAULT_HEADROOM_MIB: u64 = 1024;
 /// Resident footprint reserved for the embed server so a later start doesn't
 /// OOM a model sized to the whole card. Measured on build 9870 at the batch
@@ -3614,6 +3854,9 @@ struct State {
     /// Measured non-KV VRAM per model, so the planner stops paying for the
     /// gap between a GGUF's on-disk size and what actually lands on the card.
     vram_cache: VramCache,
+    /// Progress of a bulk workspace index, polled by the UI. Present only
+    /// while one is running or immediately after it finished.
+    bulk: Option<BulkStatus>,
     /// Free VRAM sampled just before the current model was spawned, with the
     /// launch it was spawned for: (model, ngl, ctx, free_before_mib).
     /// Consumed once the server reports ready.
@@ -3828,7 +4071,17 @@ fn main() {
                             known type — using the tier default"),
     }
     if file_cfg.hardware.vram_headroom_mib > 0 {
-        preset.headroom_mib = file_cfg.hardware.vram_headroom_mib;
+        // Floor, not a suggestion: free VRAM is sampled BEFORE the load, and
+        // anything the desktop claims in between comes out of this margin. A
+        // value below ~64 MiB leaves no room for that race, never mind
+        // fragmentation.
+        const MIN_HEADROOM_MIB: u64 = 64;
+        if file_cfg.hardware.vram_headroom_mib < MIN_HEADROOM_MIB {
+            eprintln!("  WARNING: [hardware] vram_headroom_mib {} is below the \
+                       {MIN_HEADROOM_MIB} MiB floor — using the floor",
+                file_cfg.hardware.vram_headroom_mib);
+        }
+        preset.headroom_mib = file_cfg.hardware.vram_headroom_mib.max(MIN_HEADROOM_MIB);
     }
     let preset = preset;
     let free_vram = sys.free_vram_mib();
@@ -4001,6 +4254,7 @@ fn main() {
         workspace,
         vram_cache: boot_vram_cache,
         vram_probe: boot_probe,
+        bulk: None,
         files: std::collections::HashMap::new(),
         cfg, models, llama, embed, rag,
         tools: tool_runtime,
@@ -4150,6 +4404,8 @@ fn serve(mut stream: TcpStream, st: &Shared) {
         ("GET", "/api/workspace/status") => respond_json(&mut stream, &handle_workspace_status(st)),
         ("POST", "/api/workspace/set")   => respond_json(&mut stream, &handle_workspace_set(st, &body)),
         ("POST", "/api/workspace/browse") => respond_json(&mut stream, &handle_workspace_browse(&body)),
+        ("POST", "/api/workspace/bulk")   => respond_json(&mut stream, &handle_bulk_start(st, &body)),
+        ("GET",  "/api/workspace/bulk")   => respond_json(&mut stream, &handle_bulk_status(st)),
 
         ("GET", "/api/rag/status")   => respond_json(&mut stream, &handle_rag_status(st)),
         ("POST", "/api/rag/index")   => respond_json(&mut stream, &handle_rag_index(st, &body)),
@@ -4506,6 +4762,41 @@ fn handle_workspace_browse(body: &str) -> serde_json::Value {
     })
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct BulkReq {
+    full: bool,
+    /// Embed on the GPU. Default true — it is ~13x faster, and the whole
+    /// point of this path is getting a large repo indexed in minutes.
+    gpu: Option<bool>,
+}
+
+fn handle_bulk_start(st: &Shared, body: &str) -> serde_json::Value {
+    let req: BulkReq = serde_json::from_str(body).unwrap_or_default();
+    {
+        let s = st.lock().unwrap();
+        if s.bulk.as_ref().is_some_and(|b| b.running) {
+            return serde_json::json!({"error": "a bulk index is already running"});
+        }
+        if s.workspace.manifest.path.is_empty() {
+            return serde_json::json!({"error": "set a workspace first"});
+        }
+        if !s.cfg.embed.enabled || s.cfg.embed.model.is_empty() {
+            return serde_json::json!({"error": "embed server not configured"});
+        }
+    }
+    let gpu = req.gpu.unwrap_or(true);
+    spawn_bulk_index(st, req.full, gpu);
+    serde_json::json!({"ok": true, "gpu": gpu})
+}
+
+fn handle_bulk_status(st: &Shared) -> serde_json::Value {
+    match &st.lock().unwrap().bulk {
+        Some(b) => serde_json::to_value(b).unwrap_or(serde_json::json!({})),
+        None => serde_json::json!({"phase": "idle", "running": false}),
+    }
+}
+
 fn handle_rag_status(st: &Shared) -> serde_json::Value {
     let s = st.lock().unwrap();
     let mut status = s.rag.status_json();
@@ -4758,6 +5049,15 @@ fn handle_rag_search(st: &Shared, body: &str) -> serde_json::Value {
 
     if !has_chunks {
         return serde_json::json!({"ok": true, "results": []});
+    }
+
+    // Retrieval needs the embedder to vectorise the query, just as indexing
+    // needs it for chunks — but only indexing ever started it. Anything that
+    // stopped the server (a bulk index switching it between GPU and CPU, a
+    // crash, an explicit stop) left search failing with a raw
+    // "connection refused" until the next index happened to revive it.
+    if let Err(e) = ensure_embed_ready(st) {
+        return serde_json::json!({"error": e});
     }
 
     // Domain-appropriate query prefix.

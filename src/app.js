@@ -83,10 +83,14 @@
       const d = await (await fetch('/api/workspace/status')).json();
       if (d.path) {
         $('#workspace-path').value = d.path;
-        // Nothing is indexed until the model reads it, so the number worth
-        // showing is what it has chosen to look at — not a corpus size.
-        $('#workspace-status').textContent = d.auto_indexed
-          ? `${d.auto_indexed} file(s) read & indexed · ${d.code_chunks} chunks`
+        // Two ways content gets in, and the line has to reflect both: files
+        // the model chose to read, and a bulk walk that never touches the
+        // read ledger. Reporting only the former read "nothing indexed yet"
+        // with a thousand chunks in the store.
+        $('#workspace-status').textContent = d.code_chunks
+          ? (d.auto_indexed
+              ? `${d.code_chunks} chunks · ${d.auto_indexed} read by the agent`
+              : `${d.code_chunks} chunks indexed`)
           : 'ready — nothing indexed yet';
         $('#workspace-status').className = 'rag-index-status';
       }
@@ -166,6 +170,75 @@
     $('#workspace-browser').classList.add('hidden');
     $('#workspace-set-btn').click();
   });
+
+  // ── Bulk workspace index ──
+  //
+  // Pre-prompt only: it unloads the model so the GPU embedder has room, then
+  // reloads it. The button stays disabled for the duration so a second click
+  // cannot start a competing walk.
+  let bulkPoll = null;
+
+  $('#bulk-index-btn').onclick = async () => {
+    const gpu = $('#bulk-gpu').checked;
+    const path = $('#workspace-path').value.trim();
+    if (!path) { setBulk('error', 'set a workspace first'); return; }
+    const warn = gpu
+      ? `Index the entire workspace on the GPU?\n\n${path}\n\nThe model is unloaded while this runs and reloaded when it finishes. On a large repo this can take several minutes.`
+      : `Index the entire workspace on the CPU?\n\n${path}\n\nThis is ~13x slower than the GPU embedder but leaves the model loaded.`;
+    if (!confirm(warn)) return;
+    $('#bulk-index-btn').disabled = true;
+    const d = await fetch('/api/workspace/bulk', {
+      method: 'POST', body: JSON.stringify({ gpu }),
+    }).then((r) => r.json());
+    if (d.error) { setBulk('error', d.error); $('#bulk-index-btn').disabled = false; return; }
+    if (gpu) updateBadge({ status: 'stopped' });
+    pollBulk();
+  };
+
+  function setBulk(phase, msg, pct) {
+    const st = $('#bulk-status');
+    st.textContent = msg;
+    st.className = 'rag-index-status ' +
+      (phase === 'error' ? 'rag-error' : phase === 'done' ? 'rag-success' : 'rag-indexing');
+    const bar = $('#bulk-bar');
+    if (pct == null) { bar.classList.add('hidden'); return; }
+    bar.classList.remove('hidden');
+    $('#bulk-fill').style.width = `${pct.toFixed(1)}%`;
+    $('#bulk-fill').className = `bulk-fill ${phase === 'error' ? 'bulk-error' : ''}`.trim();
+  }
+
+  function pollBulk() {
+    clearInterval(bulkPoll);
+    bulkPoll = setInterval(async () => {
+      let d;
+      try { d = await fetch('/api/workspace/bulk').then((r) => r.json()); }
+      catch (_) { return; }
+      const pct = d.files_total ? (d.files_done / d.files_total) * 100 : 0;
+      if (d.phase === 'embedding') {
+        setBulk(d.phase, `${d.files_done}/${d.files_total} files · ${d.chunks} chunks`, pct);
+        $('#bulk-detail').textContent = d.message;
+      } else if (d.running) {
+        setBulk(d.phase, d.message, pct);
+        $('#bulk-detail').textContent = '';
+      }
+      if (!d.running) {
+        clearInterval(bulkPoll);
+        bulkPoll = null;
+        $('#bulk-index-btn').disabled = false;
+        $('#bulk-detail').textContent = '';
+        if (d.phase === 'error') setBulk('error', d.message, null);
+        else if (d.phase === 'done') {
+          setBulk('done', `${d.message}${d.skipped ? ` (${d.skipped} skipped)` : ''}`, null);
+          $('#rag-checkbox').checked = true;
+        }
+        // The model was reloaded and the index grew — resync both badges.
+        refreshModels();
+        refreshWorkspace();
+        await refreshRagCounts();
+        updateRagBadge();
+      }
+    }, 1000);
+  }
 
   function addFile(name, content) {
     const language = extToLang(name);
